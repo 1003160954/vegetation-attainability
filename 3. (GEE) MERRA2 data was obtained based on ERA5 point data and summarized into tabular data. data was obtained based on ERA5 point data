@@ -1,0 +1,269 @@
+// ============================================================
+// FAST CSV EXPORT: all years, all cities, robust version
+//
+// Input asset:
+//   projects/ee-abao9474/assets/merra2_match_points_dedup_for_gee
+//
+// Output:
+//   one WIDE CSV per year
+//   one row = one unique MERRA spatial cell in that year
+//   columns = date-specific variables
+//
+// Robust improvements:
+//   - skip empty years
+//   - skip empty date windows
+//   - avoid Invalid numInputs: 0
+//   - print diagnostics for each year
+// ============================================================
+
+
+// -------------------------
+// 0) USER SETTINGS
+// -------------------------
+var POINTS_ASSET  = 'projects/ee-abao9474/assets/merra2_match_points_dedup_for_gee';
+var EXPORT_FOLDER = 'GEE_MERRA2_WIDECSV_ALLYEARS';
+
+var START_YEAR = 2002;
+var END_YEAR   = 2025;
+
+var WINDOW_DAYS = 8;
+
+// for testing:
+// e.g. [2002], [2018], [2002,2003]
+// set to null to run all years
+var TEST_YEARS = null;
+
+// MERRA-2 collections
+var MERRA_SLV = ee.ImageCollection('NASA/GSFC/MERRA/slv/2');
+var MERRA_RAD = ee.ImageCollection('NASA/GSFC/MERRA/rad/2');
+var MERRA_LND = ee.ImageCollection('NASA/GSFC/MERRA/lnd/2');
+var MERRA_FLX = ee.ImageCollection('NASA/GSFC/MERRA/flx/2');
+
+
+// -------------------------
+// 1) Load asset
+// expected fields:
+//   cell_id, date, merra_ix, merra_iy, merra_lon, merra_lat
+// -------------------------
+var raw = ee.FeatureCollection(POINTS_ASSET);
+
+var pts = raw.map(function(f) {
+  var lon = ee.Number.parse(f.get('merra_lon'));
+  var lat = ee.Number.parse(f.get('merra_lat'));
+  return ee.Feature(ee.Geometry.Point([lon, lat]), f.toDictionary());
+});
+
+print('All dedup rows:', pts.size());
+print('Example feature:', pts.first());
+
+
+// -------------------------
+// 2) Helpers
+// -------------------------
+function esat_kPa(tc) {
+  return tc.expression(
+    '0.6108 * exp((17.27 * T) / (T + 237.3))',
+    {T: tc}
+  );
+}
+
+// build one 8-day image for one start date
+function buildMERRA8dayImage(dateStr) {
+  var start = ee.Date(dateStr);
+  var end   = start.advance(WINDOW_DAYS, 'day');
+
+  var slv = MERRA_SLV.filterDate(start, end);
+  var rad = MERRA_RAD.filterDate(start, end);
+  var lnd = MERRA_LND.filterDate(start, end);
+  var flx = MERRA_FLX.filterDate(start, end);
+
+  var nslv = slv.size();
+  var nrad = rad.size();
+  var nlnd = lnd.size();
+  var nflx = flx.size();
+
+  // require at least one image in every needed collection
+  var ok = nslv.gt(0).and(nrad.gt(0)).and(nlnd.gt(0)).and(nflx.gt(0));
+
+  var img = ee.Image(ee.Algorithms.If(ok, (function() {
+
+    var t2mC = slv.select('T2M')
+      .mean()
+      .subtract(273.15)
+      .rename('T2M_C');
+
+    var td2mC = slv.select('T2MDEW')
+      .mean()
+      .subtract(273.15)
+      .rename('TD_C');
+
+    var u10 = slv.select('U10M').mean();
+    var v10 = slv.select('V10M').mean();
+    var wind = u10.pow(2).add(v10.pow(2)).sqrt()
+      .rename('WIND10M_MS');
+
+    var vpd = esat_kPa(t2mC).subtract(esat_kPa(td2mC))
+      .max(0)
+      .rename('VPD_kPa');
+
+    // SWGDN: W/m² hourly mean flux
+    // 8-day accumulated MJ m^-2
+    var ssrd = rad.select('SWGDN')
+      .sum()
+      .multiply(3600.0)
+      .divide(1e6)
+      .rename('SSRD_MJm2');
+
+    // PRECTOTCORR: mm/s
+    // 8-day accumulated mm
+    var tp = flx.select('PRECTOTCORR')
+      .sum()
+      .multiply(3600.0)
+      .rename('TP_mm');
+
+    var swvl1 = lnd.select('GWETTOP')
+      .mean()
+      .rename('SWVL1_m3m3');
+
+    var stl1 = lnd.select('TSOIL1')
+      .mean()
+      .subtract(273.15)
+      .rename('STL1_C');
+
+    return t2mC.addBands([
+      td2mC, vpd, wind, ssrd, tp, swvl1, stl1
+    ]);
+
+  })(), null));
+
+  return img;
+}
+
+
+// give each 8-day image date-specific band names
+function buildTaggedImage(dateStr) {
+  dateStr = ee.String(dateStr);
+  var img = buildMERRA8dayImage(dateStr);
+
+  // if img is null, return null
+  return ee.Algorithms.If(
+    img,
+    (function() {
+      img = ee.Image(img);
+      var bands = img.bandNames();
+      var newBands = bands.map(function(b) {
+        b = ee.String(b);
+        return b.cat('__').cat(dateStr);
+      });
+      return img.rename(newBands).set('date', dateStr);
+    })(),
+    null
+  );
+}
+
+
+// build wide table for one year
+function buildOneYearWideTable(year) {
+  var yearStr = ee.Number(year).format();
+
+  // filter this year using date string prefix
+  var ptsYear = pts.filter(ee.Filter.stringStartsWith('date', yearStr));
+  var nPts = ptsYear.size();
+
+  print('Year', year, 'date+cell rows:', nPts);
+
+  // all unique dates in this year
+  var dateList = ee.List(ptsYear.aggregate_array('date')).distinct().sort();
+  var nDates = dateList.size();
+
+  print('Year', year, 'unique dates:', nDates);
+  print('Year', year, 'first 5 dates:', dateList.slice(0, 5));
+
+  // unique spatial cells only
+  var spatialCells = ptsYear.distinct(['merra_ix', 'merra_iy']);
+  var nCells = spatialCells.size();
+
+  print('Year', year, 'unique spatial cells:', nCells);
+
+  // if no points or no dates -> return empty collection
+  var out = ee.FeatureCollection(ee.Algorithms.If(
+    nPts.gt(0).and(nDates.gt(0)).and(nCells.gt(0)),
+    (function() {
+      // build per-date images
+      var imgList = dateList.map(function(d) {
+        return buildTaggedImage(d);
+      });
+
+      // remove nulls
+      imgList = imgList.removeAll([null]);
+
+      var nImgs = imgList.size();
+      print('Year', year, 'valid images after null removal:', nImgs);
+
+      // if no valid images -> empty FC
+      return ee.FeatureCollection(ee.Algorithms.If(
+        nImgs.gt(0),
+        (function() {
+          var imgCol = ee.ImageCollection.fromImages(imgList);
+          var bigImg = imgCol.toBands();
+
+          var bandNames = bigImg.bandNames();
+          var cleanBandNames = bandNames.map(function(b) {
+            b = ee.String(b);
+            return b.split('_').slice(1).join('_');
+          });
+          bigImg = bigImg.rename(cleanBandNames);
+
+          var nBands = bigImg.bandNames().size();
+          print('Year', year, 'band count:', nBands);
+
+          // if somehow still no bands -> empty FC
+          return ee.FeatureCollection(ee.Algorithms.If(
+            nBands.gt(0),
+            bigImg.sampleRegions({
+              collection: spatialCells,
+              scale: 70000,
+              geometries: false,
+              tileScale: 2
+            }),
+            ee.FeatureCollection([])
+          ));
+        })(),
+        ee.FeatureCollection([])
+      ));
+    })(),
+    ee.FeatureCollection([])
+  ));
+
+  print('Year', year, 'output rows (lazy):', out.size());
+  return out;
+}
+
+
+// -------------------------
+// 3) Create export tasks
+// -------------------------
+var years;
+if (TEST_YEARS !== null) {
+  years = TEST_YEARS;
+} else {
+  years = [];
+  for (var y = START_YEAR; y <= END_YEAR; y++) {
+    years.push(y);
+  }
+}
+
+years.forEach(function(y) {
+  var sampled = buildOneYearWideTable(y);
+
+  Export.table.toDrive({
+    collection: sampled,
+    description: 'MERRA2_wide_' + y,
+    folder: EXPORT_FOLDER,
+    fileNamePrefix: 'MERRA2_wide_' + y,
+    fileFormat: 'CSV'
+  });
+});
+
+print('✅ Tasks created for years:', years);
+print('Start them in the Tasks tab in small batches.');
