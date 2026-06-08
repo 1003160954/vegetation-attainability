@@ -1,3 +1,636 @@
+# ============================================================
+# Global Urban Cooling - Full pipeline (EVI baseline = 0.05)
+# ============================================================
+
+import os
+import re
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from tqdm.auto import tqdm
+
+from sklearn.model_selection import GroupKFold, KFold
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import xgboost as xgb
+
+# ============================================================
+# 0) USER SETTINGS
+# ============================================================
+DATA_PATH = Path("/content/drive/MyDrive/Second_research/derived_datasets/GlobalUrbanCooling_dataset_v2.parquet")
+SAVE_DIR = "/content/drive/MyDrive/Second_research/derived_datasets"
+CITY_META_PATH = "/content/drive/MyDrive/Second_research/城市100.xlsx"
+
+OUT_DATA_NAME = "GlobalUrbanCooling_dataset_v3_EVI005.parquet"
+
+# 反事实基线
+EVI_BASELINE = 0.05
+
+# cooling_efficiency 仅在 ΔEVI 足够大时计算
+MIN_DEVI_FOR_EFFICIENCY = 0.02
+
+# 是否只保留核心 NTL 区域（若有 is_core_ntl）
+USE_CORE_ONLY = False
+
+# 可选下采样（默认不采样）
+PIX_FRAC  = 1.0
+TIME_FRAC = 1.0
+RNG_SEED  = 42
+
+# ============================================================
+# 1) LOAD DATASET
+# ============================================================
+dataset = pd.read_parquet(DATA_PATH)
+print("Loaded dataset:", dataset.shape)
+print(dataset.head())
+
+# ============================================================
+# 2) BASIC TIME FIELDS
+# ============================================================
+dataset = dataset.copy()
+dataset["date"] = pd.to_datetime(dataset["date"], errors="coerce")
+dataset = dataset.dropna(subset=["date"]).reset_index(drop=True)
+
+dataset["Year"]  = dataset["date"].dt.year
+dataset["Month"] = dataset["date"].dt.month
+dataset["DOY"]   = dataset["date"].dt.dayofyear
+
+print("\nDataset rows:", len(dataset))
+print("Year range:", dataset["Year"].min(), "→", dataset["Year"].max())
+
+# ============================================================
+# 3) FEATURE WHITELIST
+# ============================================================
+target_col = "LST"
+id_cols = {"city","date","Year","Month","DOY","pix_x","pix_y"}
+
+BASE_FEATURES = [
+    "EVI","LAI","DEM","LC","DIST_WATER_km",
+    "T2M_C","TD_C","VPD_kPa","WIND10M_MS","SSRD_MJm2","TP_mm","SWVL1_m3m3","STL1_C"
+]
+feature_cols = [c for c in BASE_FEATURES if c in dataset.columns]
+
+missing = [c for c in BASE_FEATURES if c not in dataset.columns]
+print("\nUsing features:", feature_cols)
+if missing:
+    print("[WARN] missing features (not found in dataset):", missing)
+
+if target_col not in dataset.columns:
+    raise ValueError(f"❌ Missing target column: {target_col}")
+
+# ============================================================
+# 4) YEARLY FINITE CHECK
+# ============================================================
+def _finite_ratio(s: pd.Series) -> float:
+    v = s.to_numpy()
+    return float(np.isfinite(v).mean()) if len(v) else np.nan
+
+rows = []
+for y, g in dataset.groupby("Year"):
+    row = {"Year": int(y), "n_rows": int(len(g))}
+    for c in [target_col] + feature_cols:
+        row[f"{c}_finite_ratio"] = _finite_ratio(g[c]) if c in g.columns else np.nan
+    rows.append(row)
+
+nan_by_year = pd.DataFrame(rows).sort_values("Year").reset_index(drop=True)
+show_cols = ["Year","n_rows"] + [f"{c}_finite_ratio" for c in ([target_col] + feature_cols)]
+show_cols = [c for c in show_cols if c in nan_by_year.columns]
+
+print("\n=== Per-year finite ratio (target + selected features) ===")
+print(nan_by_year[show_cols].to_string(index=False))
+
+# ============================================================
+# 5) BUILD dataset_fe
+#    - keep key cols finite first
+#    - per-pixel fill on features
+#    - keep all features finite
+# ============================================================
+dataset_fe = dataset.copy()
+
+must_first = [target_col, "EVI", "T2M_C", "VPD_kPa"]
+must_first = [c for c in must_first if c in dataset_fe.columns]
+for c in must_first:
+    dataset_fe = dataset_fe[np.isfinite(dataset_fe[c])].reset_index(drop=True)
+
+if len(dataset_fe) == 0:
+    raise ValueError("❌ After minimal validity filter, dataset becomes empty.")
+
+if not all(c in dataset_fe.columns for c in ["pix_y","pix_x"]):
+    raise ValueError("❌ Missing pix_y/pix_x; cannot do per-pixel filling.")
+
+dataset_fe = dataset_fe.sort_values(["pix_y","pix_x","date"]).reset_index(drop=True)
+
+def fill_by_pixel_transform(df, cols):
+    g = df.groupby(["pix_y","pix_x"], sort=False)
+    for c in cols:
+        df[c] = g[c].transform(lambda s: s.ffill())
+        df[c] = g[c].transform(lambda s: s.bfill())
+        df[c] = g[c].transform(lambda s: s.interpolate(method="linear", limit_direction="both"))
+    return df
+
+dataset_fe = fill_by_pixel_transform(dataset_fe, feature_cols)
+
+for c in feature_cols:
+    dataset_fe = dataset_fe[np.isfinite(dataset_fe[c])].reset_index(drop=True)
+dataset_fe = dataset_fe[np.isfinite(dataset_fe[target_col])].reset_index(drop=True)
+
+print("\nAfter ALL-feature finite (with per-pixel transform filling):")
+print("Rows:", len(dataset_fe))
+print("Year range:", dataset_fe["Year"].min(), "→", dataset_fe["Year"].max())
+if len(dataset_fe) == 0:
+    raise ValueError("❌ After ALL-feature finite filter, dataset is empty.")
+
+# ============================================================
+# 6) WINSORIZE CONTINUOUS VARIABLES
+# ============================================================
+wins_cols = [target_col] + [c for c in feature_cols if c != "LC"]
+for c in wins_cols:
+    v = dataset_fe[c].to_numpy(dtype=float)
+    if np.isfinite(v).sum() < 10:
+        continue
+    lo, hi = np.nanpercentile(v, [0.1, 99.9])
+    dataset_fe[c] = dataset_fe[c].clip(lo, hi)
+
+# ============================================================
+# 7) SAFE DEDUP
+# ============================================================
+dataset_fe = dataset_fe.drop_duplicates(subset=["date","pix_y","pix_x"]).reset_index(drop=True)
+
+# ============================================================
+# 8) TIME SPLIT (80/20 by date)
+# ============================================================
+unique_dates = np.array(sorted(dataset_fe["date"].dt.normalize().unique()))
+if unique_dates.size < 5:
+    raise ValueError(f"Not enough unique dates after filtering: {unique_dates.size}.")
+
+cut_idx = int(len(unique_dates) * 0.8)
+cut_date = unique_dates[cut_idx]
+
+mask_train = dataset_fe["date"] < cut_date
+mask_test  = ~mask_train
+
+print("\nTime-split cutoff:", pd.to_datetime(cut_date).date(),
+      "| Train n=", int(mask_train.sum()), "Test n=", int(mask_test.sum()))
+
+# ============================================================
+# 9) BUILD MATRIX
+# ============================================================
+X_all = dataset_fe[feature_cols].to_numpy(dtype=float)
+y_all = dataset_fe[target_col].to_numpy(dtype=float)
+
+finite_mask = np.isfinite(X_all).all(axis=1) & np.isfinite(y_all)
+dataset_fe = dataset_fe.loc[finite_mask].reset_index(drop=True)
+
+mask_train = dataset_fe["date"] < cut_date
+mask_test  = ~mask_train
+
+X_all = dataset_fe[feature_cols].to_numpy(dtype=np.float32)
+y_all = dataset_fe[target_col].to_numpy(dtype=np.float32)
+
+X_train = X_all[mask_train.to_numpy()]
+y_train = y_all[mask_train.to_numpy()]
+X_test  = X_all[mask_test.to_numpy()]
+y_test  = y_all[mask_test.to_numpy()]
+
+print("\n✅ dataset_fe shape:", dataset_fe.shape)
+print("✅ features:", len(feature_cols))
+print("✅ example features:", feature_cols)
+print("✅ Train:", X_train.shape, "Test:", X_test.shape)
+
+# ============================================================
+# 10) REBUILD train table for robust modeling
+# ============================================================
+df0 = dataset_fe.copy()
+
+req_cols = {"pix_x","pix_y","date","LST"}
+missing_req = sorted(list(req_cols - set(df0.columns)))
+if missing_req:
+    raise ValueError(f"dataset missing required columns: {missing_req}")
+
+df0["date"] = pd.to_datetime(df0["date"], errors="coerce")
+df0 = df0.dropna(subset=["date","LST","pix_x","pix_y"]).reset_index(drop=True)
+df0 = df0.sort_values(["pix_y","pix_x","date"]).reset_index(drop=True)
+
+unique_dates = np.array(sorted(df0["date"].dt.normalize().unique()))
+if unique_dates.size < 10:
+    raise ValueError(f"Not enough unique dates: {unique_dates.size}")
+
+cut_idx  = int(unique_dates.size * 0.8)
+cut_date = unique_dates[cut_idx]
+
+mask_train = df0["date"].dt.normalize() < cut_date
+mask_test  = ~mask_train
+
+print("\nTime-split cutoff (robust model):", pd.to_datetime(cut_date).date(),
+      "| Train n=", int(mask_train.sum()), "Test n=", int(mask_test.sum()))
+
+BASE_FEATURES2 = [
+    "EVI","LAI","DIST_WATER_km",
+    "T2M_C","TD_C","VPD_kPa","WIND10M_MS","SSRD_MJm2","TP_mm","SWVL1_m3m3","STL1_C",
+    "DEM","LC",
+]
+feature_cols = [c for c in BASE_FEATURES2 if c in df0.columns and pd.api.types.is_numeric_dtype(df0[c])]
+
+if len(feature_cols) == 0:
+    raise ValueError("No usable feature columns found from BASE_FEATURES2.")
+
+use_cols = ["LST","date","pix_x","pix_y"] + feature_cols
+data2 = df0[use_cols].copy()
+
+finite_mask = np.isfinite(data2["LST"].to_numpy())
+for c in feature_cols:
+    finite_mask &= np.isfinite(data2[c].to_numpy())
+
+data2 = data2.loc[finite_mask].reset_index(drop=True)
+
+unique_dates = np.array(sorted(data2["date"].dt.normalize().unique()))
+cut_idx  = int(unique_dates.size * 0.8)
+cut_date = unique_dates[cut_idx]
+mask_train = data2["date"].dt.normalize() < cut_date
+mask_test  = ~mask_train
+
+X_all = data2[feature_cols].to_numpy(dtype=np.float32)
+y_all = data2["LST"].to_numpy(dtype=np.float32)
+
+X_train, y_train = X_all[mask_train.to_numpy()], y_all[mask_train.to_numpy()]
+X_test,  y_test  = X_all[mask_test.to_numpy()],  y_all[mask_test.to_numpy()]
+
+print(f"\nX_train: {X_train.shape} X_test: {X_test.shape} | features: {len(feature_cols)}")
+print("Feature cols:", feature_cols)
+
+# ============================================================
+# 11) SPATIAL GROUPS
+# ============================================================
+def make_spatial_groups(df_train, n_splits=5):
+    for gx, gy in [(5,5), (4,4), (3,3), (2,2)]:
+        bx = pd.qcut(df_train["pix_x"], q=min(gx, df_train["pix_x"].nunique()),
+                     labels=False, duplicates="drop")
+        by = pd.qcut(df_train["pix_y"], q=min(gy, df_train["pix_y"].nunique()),
+                     labels=False, duplicates="drop")
+        groups = (by.astype(int)*1000 + bx.astype(int)).to_numpy()
+        if np.unique(groups).size >= n_splits:
+            return groups
+    return None
+
+df_train_xy = data2.loc[mask_train, ["pix_x","pix_y"]].copy().reset_index(drop=True)
+groups = make_spatial_groups(df_train_xy, n_splits=5)
+
+if groups is not None:
+    print(f"[CV] Using GroupKFold with {np.unique(groups).size} spatial groups.")
+    splitter = GroupKFold(n_splits=5)
+    split_iter = list(splitter.split(X_train, y_train, groups))
+else:
+    print("[CV] Fallback to KFold (insufficient spatial groups).")
+    splitter = KFold(n_splits=5, shuffle=True, random_state=42)
+    split_iter = list(splitter.split(X_train, y_train))
+
+# ============================================================
+# 12) POSITIVE SAMPLE WEIGHTS
+# ============================================================
+train_df_for_w = data2.loc[mask_train, :].reset_index(drop=True)
+
+def safe_positive_weights(df, t2m_col="T2M_C", vpd_col="VPD_kPa"):
+    if (t2m_col not in df.columns) or (vpd_col not in df.columns):
+        return np.ones(len(df), dtype=np.float32)
+
+    t2m = df[t2m_col].to_numpy(dtype=np.float64)
+    vpd = df[vpd_col].to_numpy(dtype=np.float64)
+
+    t2m_med = np.nanmedian(t2m[np.isfinite(t2m)]) if np.isfinite(t2m).any() else 0.0
+    vpd_med = np.nanmedian(vpd[np.isfinite(vpd)]) if np.isfinite(vpd).any() else 0.0
+    t2m = np.where(np.isfinite(t2m), t2m, t2m_med)
+    vpd = np.where(np.isfinite(vpd), vpd, vpd_med)
+
+    thr_t2m = np.nanpercentile(t2m, 90)
+    thr_vpd = np.nanpercentile(vpd, 80)
+
+    def softplus_stable(x):
+        x = np.clip(x, -60, 60)
+        return np.log1p(np.exp(x))
+
+    zT = 0.2*(t2m - thr_t2m)
+    zV = 0.2*(vpd - thr_vpd)
+
+    w = 1.0 + 0.8*softplus_stable(zT) + 0.6*softplus_stable(zV)
+    w = np.asarray(w, dtype=np.float64)
+    w = np.where(np.isfinite(w), w, 1.0)
+    w = np.clip(w, 1e-3, np.nanpercentile(w, 99))
+    return w.astype(np.float32)
+
+sw = safe_positive_weights(train_df_for_w)
+assert sw.shape[0] == X_train.shape[0]
+assert np.all(sw > 0), f"Found non-positive weights: min={sw.min()}"
+print("[Weights] min/max:", float(sw.min()), float(sw.max()), "finite:", bool(np.isfinite(sw).all()))
+
+# ============================================================
+# 13) MONOTONE CONSTRAINTS
+# ============================================================
+mono = [0]*len(feature_cols)
+name2idx = {n:i for i,n in enumerate(feature_cols)}
+for nm, sgn in [("EVI",-1), ("T2M_C",+1), ("STL1_C",+1), ("VPD_kPa",+1)]:
+    if nm in name2idx:
+        mono[name2idx[nm]] = sgn
+mono_str = "(" + ",".join(str(s) for s in mono) + ")"
+
+# ============================================================
+# 14) XGBOOST PARAMS
+# ============================================================
+params = dict(
+    n_estimators=1500,
+    max_depth=8,
+    learning_rate=0.02,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_lambda=1.0,
+    n_jobs=-1,
+    objective="reg:squarederror",
+    random_state=42,
+    tree_method="hist",
+    eval_metric="rmse",
+    monotone_constraints=mono_str
+)
+
+# ============================================================
+# 15) CV
+# ============================================================
+cv_rmse, cv_r2 = [], []
+for fold, (tr_idx, va_idx) in enumerate(tqdm(split_iter, desc="CV folds", unit="fold"), start=1):
+    model = xgb.XGBRegressor(**params)
+    model.fit(
+        X_train[tr_idx], y_train[tr_idx],
+        sample_weight=sw[tr_idx],
+        eval_set=[(X_train[va_idx], y_train[va_idx])],
+        verbose=False
+    )
+    pred_va = model.predict(X_train[va_idx])
+    cv_rmse.append(float(np.sqrt(mean_squared_error(y_train[va_idx], pred_va))))
+    cv_r2.append(float(r2_score(y_train[va_idx], pred_va)))
+
+print("\n[CV] RMSE mean±std:", float(np.mean(cv_rmse)), float(np.std(cv_rmse)))
+print("[CV] R2   mean±std:", float(np.mean(cv_r2)),   float(np.std(cv_r2)))
+
+# ============================================================
+# 16) FINAL TRAIN + TEST
+# ============================================================
+final = xgb.XGBRegressor(**params)
+print("\n[Final] Training...")
+final.fit(
+    X_train, y_train,
+    sample_weight=sw,
+    eval_set=[(X_test, y_test)],
+    verbose=True
+)
+
+pred_test = final.predict(X_test)
+rmse  = float(np.sqrt(mean_squared_error(y_test, pred_test)))
+mae   = float(mean_absolute_error(y_test, pred_test))
+r2    = float(r2_score(y_test, pred_test))
+print(f"[Test] RMSE={rmse:.3f}  MAE={mae:.3f}  R2={r2:.3f}")
+
+thr_test = np.nanpercentile(y_test, 95)
+mask_tail = (y_test >= thr_test)
+if mask_tail.any():
+    rmse_tail = float(np.sqrt(mean_squared_error(y_test[mask_tail], pred_test[mask_tail])))
+    print(f"[Test] Tail-RMSE (>=95th pct): {rmse_tail:.3f} (n={int(mask_tail.sum())})")
+
+# ============================================================
+# 17) COUNTERFACTUAL COOLING (EVI -> 0.05)
+#     cooling_strength_pred
+#     cooling_efficiency = cooling_strength_pred / (EVI - 0.05)
+# ============================================================
+if "EVI" in feature_cols:
+    evi_idx = feature_cols.index("EVI")
+
+    X_obs = X_all.copy()
+    X_ref = X_all.copy()
+    X_ref[:, evi_idx] = np.float32(EVI_BASELINE)
+
+    pred_obs = final.predict(X_obs).astype(np.float32)
+    pred_ref = final.predict(X_ref).astype(np.float32)
+
+    out = data2.copy()
+    out["LST_pred_obs"] = pred_obs
+    out["LST_pred_ref"] = pred_ref
+    out["EVI_baseline_used"] = np.float32(EVI_BASELINE)
+
+    # 冷却强度：低植被参考状态 - 观测状态
+    out["cooling_strength_pred"] = (
+        out["LST_pred_ref"] - out["LST_pred_obs"]
+    ).astype(np.float32)
+
+    out["cooling_strength_obs"] = (
+        out["LST_pred_ref"] - out["LST"].to_numpy(dtype=np.float32)
+    ).astype(np.float32)
+
+    # ΔEVI
+    dEVI = out["EVI"].to_numpy(dtype=np.float32) - np.float32(EVI_BASELINE)
+    out["dEVI_ref"] = dEVI.astype(np.float32)
+
+    # cooling_efficiency 仅在 ΔEVI 足够大时计算
+    out["cooling_efficiency"] = np.where(
+        dEVI >= MIN_DEVI_FOR_EFFICIENCY,
+        out["cooling_strength_pred"].to_numpy(dtype=np.float32) / dEVI,
+        np.nan
+    ).astype(np.float32)
+
+    daily_pred = out.groupby(out["date"].dt.normalize())["cooling_strength_pred"].mean().sort_index()
+    print("\nDaily series:", len(daily_pred), "days")
+    print("Cooling (pred) mean=%.3f, std=%.3f" % (daily_pred.mean(), daily_pred.std()))
+    print("Baseline EVI used:", EVI_BASELINE)
+    print("Valid cooling_efficiency fraction: %.4f" % np.isfinite(out["cooling_efficiency"]).mean())
+
+else:
+    raise ValueError("[Skip] EVI not in features; cannot do counterfactual.")
+
+# out 是后续可视化/年度统计主表
+dataset = out.copy()
+
+# ============================================================
+# 18) OPTIONAL: FILL FOR ALL ROWS AND UPDATE dataset
+#     (与原来逻辑一致，但改成 EVI=0.05)
+# ============================================================
+assert "dataset" in globals(), "❌ 没有 dataset"
+assert "final" in globals(), "❌ 没有训练好的模型 final（XGBoost）"
+
+df = pd.read_parquet(DATA_PATH).copy()
+df["date"] = pd.to_datetime(df["date"], errors="coerce")
+df = df.dropna(subset=["date", "pix_x", "pix_y", "LST"]).reset_index(drop=True)
+
+if "feature_cols" in globals() and isinstance(feature_cols, (list, tuple)) and len(feature_cols) > 0:
+    FEATS = list(feature_cols)
+else:
+    drop_cols = {"LST","date","pix_x","pix_y","Year","Month","DOY","city"}
+    FEATS = [c for c in df.columns
+             if (c not in drop_cols) and pd.api.types.is_numeric_dtype(df[c])]
+
+if "EVI" not in FEATS:
+    raise ValueError("❌ 特征里必须包含 EVI。")
+
+missing_feats = [c for c in FEATS if c not in df.columns]
+if missing_feats:
+    raise ValueError(f"❌ dataset 缺少训练特征列：{missing_feats[:20]} ...")
+
+if USE_CORE_ONLY and ("is_core_ntl" in df.columns):
+    df = df[df["is_core_ntl"] == 1].reset_index(drop=True)
+
+rng = np.random.default_rng(RNG_SEED)
+
+if TIME_FRAC < 1.0:
+    uniq_dates = np.array(sorted(df["date"].dt.normalize().unique()))
+    k = max(1, int(np.floor(len(uniq_dates) * TIME_FRAC)))
+    pick = rng.choice(uniq_dates, size=k, replace=False)
+    df = df[df["date"].dt.normalize().isin(pick)].reset_index(drop=True)
+
+if PIX_FRAC < 1.0:
+    uniq_pix = df[["pix_y","pix_x"]].drop_duplicates().reset_index(drop=True)
+    k = max(1, int(np.floor(len(uniq_pix) * PIX_FRAC)))
+    pick = uniq_pix.sample(n=k, random_state=RNG_SEED)
+    df = df.merge(pick, on=["pix_y","pix_x"], how="inner").reset_index(drop=True)
+
+X = df[FEATS].to_numpy(dtype=np.float32)
+nan_mask = ~np.isfinite(X)
+df["n_nan_feat"] = nan_mask.sum(axis=1).astype(np.int16)
+df["nan_feat_ratio"] = (df["n_nan_feat"] / X.shape[1]).astype(np.float32)
+
+fill_values = None
+if ("dataset_fe" in globals()) and ("mask_train" in globals()):
+    try:
+        train_df_fill = dataset_fe.loc[mask_train, FEATS].copy()
+        fill_values = np.nanmedian(train_df_fill.to_numpy(dtype=np.float32), axis=0)
+    except Exception:
+        fill_values = None
+
+if fill_values is None:
+    fill_values = np.nanmedian(X, axis=0)
+
+fill_values = np.where(np.isfinite(fill_values), fill_values, 0.0).astype(np.float32)
+
+X_filled = X.copy()
+rows_nan, cols_nan = np.where(~np.isfinite(X_filled))
+if len(rows_nan) > 0:
+    X_filled[rows_nan, cols_nan] = fill_values[cols_nan]
+
+df["is_predictable"] = np.isfinite(X_filled).all(axis=1).astype(np.int8)
+print("\nPredictable ratio after fill:", float(df["is_predictable"].mean()), "| rows:", len(df))
+
+# 反事实：EVI -> 0.05
+evi_idx = FEATS.index("EVI")
+
+X_obs_full = X_filled
+X_ref_full = X_filled.copy()
+X_ref_full[:, evi_idx] = np.float32(EVI_BASELINE)
+
+pred_obs_full = final.predict(X_obs_full).astype(np.float32)
+pred_ref_full = final.predict(X_ref_full).astype(np.float32)
+
+df["LST_pred_obs"] = pred_obs_full
+df["LST_pred_ref"] = pred_ref_full
+df["EVI_baseline_used"] = np.float32(EVI_BASELINE)
+
+df["cooling_strength_pred"] = (pred_ref_full - pred_obs_full).astype(np.float32)
+
+dEVI_full = df["EVI"].to_numpy(dtype=np.float32) - np.float32(EVI_BASELINE)
+df["dEVI_ref"] = dEVI_full.astype(np.float32)
+
+df["cooling_efficiency"] = np.where(
+    dEVI_full >= MIN_DEVI_FOR_EFFICIENCY,
+    df["cooling_strength_pred"].to_numpy(np.float32) / dEVI_full,
+    np.nan
+).astype(np.float32)
+
+print("\nCooling strength summary:")
+print(df["cooling_strength_pred"].describe(percentiles=[0.05, 0.5, 0.95]))
+print("\nCooling efficiency summary:")
+print(df["cooling_efficiency"].describe(percentiles=[0.05, 0.5, 0.95]))
+print("\nMissing-feature ratio summary:")
+print(df["nan_feat_ratio"].describe(percentiles=[0.05, 0.5, 0.95]))
+
+dataset = df
+print("\n✅ dataset updated with EVI=0.05 baseline")
+print("Columns added:", [
+    "n_nan_feat","nan_feat_ratio","is_predictable",
+    "LST_pred_obs","LST_pred_ref","EVI_baseline_used",
+    "cooling_strength_pred","dEVI_ref","cooling_efficiency"
+])
+
+# ============================================================
+# 19) SAVE FINAL DATASET
+# ============================================================
+os.makedirs(SAVE_DIR, exist_ok=True)
+out_path = os.path.join(SAVE_DIR, OUT_DATA_NAME)
+
+dataset.to_parquet(out_path, index=False)
+
+print("\n✅ Dataset saved to:", out_path)
+print("Rows:", len(dataset), "| Columns:", len(dataset.columns))
+
+# ============================================================
+# 20) RELOAD CHECK
+# ============================================================
+dataset = pd.read_parquet(out_path)
+print("\nReloaded dataset:", dataset.shape)
+print(dataset.head())
+
+# ============================================================
+# 21) MERGE CITY LATITUDE
+# ============================================================
+CITY_COL_META = "City"
+LAT_COL_META  = "Lat"
+CITY_COL_DATASET = "city"
+
+def normalize_city_name(x):
+    if not isinstance(x, str):
+        return None
+    x = x.lower()
+    x = re.sub(r"[^a-z]", "", x)
+    return x if x else None
+
+city_meta = pd.read_excel(CITY_META_PATH)
+
+need_cols_meta = [CITY_COL_META, LAT_COL_META]
+miss_meta = [c for c in need_cols_meta if c not in city_meta.columns]
+if miss_meta:
+    raise ValueError(f"❌ 城市表缺少列：{miss_meta}\n现有列名：{city_meta.columns.tolist()}")
+
+city_meta = city_meta[[CITY_COL_META, LAT_COL_META]].copy()
+city_meta[CITY_COL_META] = city_meta[CITY_COL_META].astype(str)
+city_meta[LAT_COL_META]  = pd.to_numeric(city_meta[LAT_COL_META], errors="coerce")
+city_meta = city_meta.dropna(subset=[CITY_COL_META, LAT_COL_META]).reset_index(drop=True)
+
+city_meta["city_key"] = city_meta[CITY_COL_META].apply(normalize_city_name)
+city_meta = city_meta.dropna(subset=["city_key"]).drop_duplicates("city_key")
+
+print("\n✅ city_meta loaded:", city_meta.shape)
+print("Example keys:", city_meta["city_key"].head(5).tolist())
+
+dataset = dataset.copy()
+dataset[CITY_COL_DATASET] = dataset[CITY_COL_DATASET].astype(str)
+dataset["city_key"] = dataset[CITY_COL_DATASET].apply(normalize_city_name)
+
+dataset = dataset.merge(
+    city_meta[["city_key", LAT_COL_META]],
+    on="city_key",
+    how="left",
+    validate="many_to_one"
+).rename(columns={LAT_COL_META: "lat"})
+
+miss_ratio = dataset["lat"].isna().mean()
+print(f"✅ merged lat into dataset. Missing lat ratio: {miss_ratio:.2%}")
+
+if miss_ratio > 0:
+    bad = dataset.loc[dataset["lat"].isna(), CITY_COL_DATASET].dropna().unique()[:30]
+    print("⚠️ 未匹配到纬度的城市（前30个）：")
+    print(bad)
+
+print("Done. dataset now has column: lat")
+
+# 保存带纬度的最终版本
+out_path_lat = os.path.join(SAVE_DIR, OUT_DATA_NAME.replace(".parquet", "_with_lat.parquet"))
+dataset.to_parquet(out_path_lat, index=False)
+
+print("\n✅ Dataset with latitude saved to:", out_path_lat)
+print("Rows:", len(dataset), "| Columns:", len(dataset.columns))
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
