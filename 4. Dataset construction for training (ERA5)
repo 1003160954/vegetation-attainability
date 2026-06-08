@@ -1,0 +1,594 @@
+import os
+from google.colab import drive
+import rasterio
+import matplotlib.pyplot as plt
+
+# Mount Google Drive
+drive.mount('/content/drive')
+!pip -q install catboost
+!pip -q install rasterio rioxarray xarray
+!pip -q install xgboost shap
+
+# ============================================================
+# Multi-city dataset builder (Global-ready, minimal features)
+# - Folder: ROOT_DATA/<CityFolder>/*.tif
+# - Auto-detect filenames (city prefix may vary)
+# - NTL used ONLY as mask (not a feature). Can be disabled.
+# - Features kept ONLY:
+#   EVI, LAI, ERA climate vars, DEM, LC (yearly class), DIST_WATER_km
+# - No derived features (no lag/roll/nan_ratio/etc.)
+# ============================================================
+
+import os, re, glob
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.warp import reproject, Resampling
+from scipy.ndimage import distance_transform_edt
+from tqdm import tqdm
+
+# =========================
+# 1) Config (只改这里)
+# =========================
+ROOT_DATA = "/content/drive/MyDrive/Second_research/data"
+
+N_CITIES  = 106
+CITY_LIST = None    # 若不想指定，设为 None
+
+RANDOM_SEED = 42
+TIME_FRAC   = 0.70
+PIX_FRAC    = 0.70
+
+# ---- NTL mask (only mask, not feature) ----
+USE_NTL_MASK      = True
+NTL_START_YEAR    = 2013
+YEAR_FALLBACK     = 2025
+CORE_TOP_P        = 0.80   # keep top (1-CORE_TOP_P) brightest; e.g. 0.80 -> top 20%
+CORE_TOP_P_PRE    = 0.60   # stricter for pre-NTL years (top 40% if 0.60; you can raise to be stricter)
+NTL_AGG           = "mean" # mean/median
+
+ERA_KEYS = ["T2M_C","TD_C","VPD_kPa","WIND10M_MS","SSRD_MJm2","TP_mm","SWVL1_m3m3","STL1_C"]
+WATER_CLASS = 17
+
+SAVE_PER_CITY_CSV = False
+OUT_DIR = "/content/drive/MyDrive/Second_research/derived_datasets"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# =========================
+# 2) Regex helpers
+# =========================
+DATE8_RE   = re.compile(r".*_(\d{8})$")     # ..._YYYYMMDD
+YM_RE      = re.compile(r".*_(\d{6})$")     # ..._YYYYMM
+LCYEAR_RE  = re.compile(r"^LC_(\d{4})$")    # LC_YYYY
+DEMYEAR_RE = re.compile(r".*_(\d{8})$")     # DEM_YYYYMMDD (if repeated)
+
+def _date8_from_desc(d):
+    m = DATE8_RE.match(d or "")
+    if not m:
+        return None
+    return pd.to_datetime(m.group(1), format="%Y%m%d", errors="coerce")
+
+def _ym_from_desc(d):
+    if d is None:
+        return None
+    m = YM_RE.match(d) or re.search(r"(\d{6})", d)
+    if not m:
+        return None
+    ym = m.group(1)
+    return pd.to_datetime(ym + "15", format="%Y%m%d", errors="coerce")
+
+# =========================
+# 3) IO: read 8-day stack by prefix
+# =========================
+def read_8day_stack_by_prefix(tif_path, prefix):
+    """
+    band desc: PREFIX_YYYYMMDD
+    return arr[T,H,W], dates[T] normalized, profile(dict)
+    """
+    with rasterio.open(tif_path) as src:
+        desc = list(src.descriptions) if src.descriptions else []
+        idx, dates = [], []
+        for b, d in enumerate(desc, start=1):
+            if not d:
+                continue
+            if not d.startswith(prefix + "_"):
+                continue
+            dt = _date8_from_desc(d)
+            if dt is None or pd.isna(dt):
+                continue
+            idx.append(b)
+            dates.append(dt.normalize())
+
+        if len(idx) == 0:
+            return None, None, None
+
+        arr = src.read(idx).astype(np.float32)
+        nodata = src.nodata
+        if nodata is not None:
+            arr[arr == nodata] = np.nan
+
+        prof = {
+            "crs": src.crs, "transform": src.transform,
+            "width": src.width, "height": src.height,
+            "bounds": src.bounds
+        }
+    return arr, dates, prof
+
+def reproject_stack_to_target(arr_THW, src_prof, tgt_prof, resampling):
+    if arr_THW is None:
+        return None
+    # same grid
+    if (str(src_prof["crs"]) == str(tgt_prof["crs"]) and
+        src_prof["width"] == tgt_prof["width"] and
+        src_prof["height"] == tgt_prof["height"] and
+        tuple(np.round(np.array(src_prof["transform"]), 12)) == tuple(np.round(np.array(tgt_prof["transform"]), 12))):
+        return arr_THW
+
+    out = np.full((arr_THW.shape[0], tgt_prof["height"], tgt_prof["width"]), np.nan, np.float32)
+    for t in range(arr_THW.shape[0]):
+        reproject(
+            source=arr_THW[t],
+            destination=out[t],
+            src_transform=src_prof["transform"],
+            src_crs=src_prof["crs"],
+            dst_transform=tgt_prof["transform"],
+            dst_crs=tgt_prof["crs"],
+            resampling=resampling
+        )
+    return out
+
+def align_to_ref_dates(arr_THW, dates, ref_dates):
+    mp = {pd.Timestamp(d).normalize(): i for i, d in enumerate(dates)}
+    out = np.full((len(ref_dates), arr_THW.shape[1], arr_THW.shape[2]), np.nan, np.float32)
+    for t, d in enumerate(ref_dates):
+        j = mp.get(pd.Timestamp(d).normalize(), None)
+        if j is not None:
+            out[t] = arr_THW[j]
+    return out
+
+# =========================
+# 4) NTL monthly -> yearly mask (mask only)
+# =========================
+def read_monthly_stack_anyprefix(tif_path):
+    with rasterio.open(tif_path) as src:
+        desc = list(src.descriptions) if src.descriptions else []
+        idx, dates = [], []
+        for b, d in enumerate(desc, start=1):
+            dt = _ym_from_desc(d)
+            if dt is None or pd.isna(dt):
+                continue
+            idx.append(b)
+            dates.append(dt.normalize())
+
+        if len(idx) == 0:
+            return None, None, None
+
+        arr = src.read(idx).astype(np.float32)
+        nodata = src.nodata
+        if nodata is not None:
+            arr[arr == nodata] = np.nan
+
+        prof = {
+            "crs": src.crs, "transform": src.transform,
+            "width": src.width, "height": src.height,
+            "bounds": src.bounds
+        }
+    return arr, dates, prof
+
+def ntl_yearly_map(month_arr_MHW, month_dates, year, agg="mean"):
+    idx = [i for i, d in enumerate(month_dates) if pd.Timestamp(d).year == int(year)]
+    if len(idx) == 0:
+        return None
+    A = month_arr_MHW[idx]
+    if agg == "median":
+        return np.nanmedian(A, axis=0).astype(np.float32)
+    return np.nanmean(A, axis=0).astype(np.float32)
+
+def ntl_threshold_from_map(ntl2d, top_p):
+    v = ntl2d[np.isfinite(ntl2d)]
+    if v.size < 10:
+        return None
+    q = 100.0 * (1.0 - float(top_p))
+    return float(np.nanpercentile(v, q))
+
+def build_ntl_core_mask_by_year(month_arr_MHW, month_dates, ref_dates,
+                                ntl_start_year=2013, fallback_year=2025,
+                                core_top_p=0.80, core_top_p_pre=0.60,
+                                agg="mean"):
+    years = sorted(set(int(pd.Timestamp(d).year) for d in ref_dates))
+    th_by_year = {}
+
+    fb_map = ntl_yearly_map(month_arr_MHW, month_dates, fallback_year, agg=agg)
+    fb_thr = ntl_threshold_from_map(fb_map, core_top_p_pre) if fb_map is not None else None
+
+    for y in years:
+        if y >= int(ntl_start_year):
+            y_map = ntl_yearly_map(month_arr_MHW, month_dates, y, agg=agg)
+            if y_map is None:
+                th_by_year[y] = fb_thr
+            else:
+                thr = ntl_threshold_from_map(y_map, core_top_p)
+                th_by_year[y] = thr if thr is not None else fb_thr
+        else:
+            th_by_year[y] = fb_thr
+
+    T = len(ref_dates)
+    H, W = month_arr_MHW.shape[1], month_arr_MHW.shape[2]
+    mask_THW = np.zeros((T, H, W), dtype=bool)
+
+    for t, d in enumerate(ref_dates):
+        y = int(pd.Timestamp(d).year)
+        thr = th_by_year.get(y, fb_thr)
+        if thr is None:
+            mask_THW[t] = np.isfinite(month_arr_MHW[0])
+            continue
+
+        if y >= int(ntl_start_year):
+            y_map = ntl_yearly_map(month_arr_MHW, month_dates, y, agg=agg)
+            use_map = y_map if y_map is not None else fb_map
+        else:
+            use_map = fb_map
+
+        if use_map is None:
+            mask_THW[t] = np.isfinite(month_arr_MHW[0])
+        else:
+            mask_THW[t] = np.isfinite(use_map) & (use_map >= thr)
+
+    return mask_THW, th_by_year
+
+# =========================
+# 5) DEM (static 2D)
+# =========================
+def read_dem_static_2d(dem_tif, tgt_prof):
+    """
+    DEM tif may have many bands (repeated by date) or single band.
+    We just take band-1 as static (assume same values).
+    """
+    with rasterio.open(dem_tif) as src:
+        arr = src.read(1).astype(np.float32)
+        nodata = src.nodata
+        if nodata is not None:
+            arr[arr == nodata] = np.nan
+        src_prof = {
+            "crs": src.crs, "transform": src.transform,
+            "width": src.width, "height": src.height,
+            "bounds": src.bounds
+        }
+
+    out = np.full((tgt_prof["height"], tgt_prof["width"]), np.nan, np.float32)
+    reproject(
+        source=arr,
+        destination=out,
+        src_transform=src_prof["transform"],
+        src_crs=src_prof["crs"],
+        dst_transform=tgt_prof["transform"],
+        dst_crs=tgt_prof["crs"],
+        resampling=Resampling.bilinear
+    )
+    return out.astype(np.float32)
+
+# =========================
+# 6) LC yearly class (static-by-year)
+# =========================
+def read_lc_stack(LC_TIF):
+    with rasterio.open(LC_TIF) as src:
+        desc = list(src.descriptions) if src.descriptions else []
+        band_ids, years = [], []
+        for b, d in enumerate(desc, start=1):
+            if d and LCYEAR_RE.match(d):
+                band_ids.append(b)
+                years.append(int(d.split("_")[1]))
+        if len(band_ids) == 0:
+            raise ValueError("LC stack has no bands like LC_YYYY")
+        lc = src.read(band_ids).astype(np.float32)  # [Y,H,W]
+        nodata = src.nodata
+        if nodata is not None:
+            lc[lc == nodata] = np.nan
+        prof = {
+            "crs": src.crs, "transform": src.transform,
+            "width": src.width, "height": src.height,
+            "bounds": src.bounds
+        }
+    return lc, years, prof
+
+def reproject_lc_to_target(lc_YHW, lc_prof, tgt_prof):
+    Y = lc_YHW.shape[0]
+    out = np.full((Y, tgt_prof["height"], tgt_prof["width"]), np.nan, np.float32)
+    for i in range(Y):
+        reproject(
+            source=lc_YHW[i],
+            destination=out[i],
+            src_transform=lc_prof["transform"],
+            src_crs=lc_prof["crs"],
+            dst_transform=tgt_prof["transform"],
+            dst_crs=tgt_prof["crs"],
+            resampling=Resampling.nearest
+        )
+    return out
+
+def choose_lc_for_year(lc_years, y):
+    """return nearest available LC year index"""
+    ys = np.array(lc_years, dtype=int)
+    return int(np.argmin(np.abs(ys - int(y))))
+
+# =========================
+# 7) DIST_WATER_km from LC water class
+# =========================
+def build_dist_water_km_from_LC_stack(lc_YHW_tgt, water_class, tgt_prof):
+    water = (np.isfinite(lc_YHW_tgt) & (lc_YHW_tgt == float(water_class))).any(axis=0).astype(np.uint8)
+    dist_pix = distance_transform_edt(water == 0)
+
+    t = tgt_prof["transform"]
+    deg_x, deg_y = abs(t.a), abs(t.e)
+    lat_c = (tgt_prof["bounds"].top + tgt_prof["bounds"].bottom) / 2.0
+    km_per_deg_lat = 110.574
+    km_per_deg_lon = 111.320 * np.cos(np.deg2rad(lat_c))
+    km_x = deg_x * km_per_deg_lon
+    km_y = deg_y * km_per_deg_lat
+    dist_km = dist_pix * np.sqrt((km_x**2 + km_y**2) / 2.0)
+    return dist_km.astype(np.float32)
+
+# =========================
+# 8) File discovery
+# =========================
+def pick_one(patterns):
+    for p in patterns:
+        xs = sorted(glob.glob(p))
+        if xs:
+            return xs[0]
+    return None
+
+def discover_city_files(city_dir):
+    LST_TIF = pick_one([os.path.join(city_dir, "*_LST_8day_0p1deg_2002_2025.tif"),
+                        os.path.join(city_dir, "*_LST_8day_0p1deg_2002_2025.tiff")])
+    EVI_TIF = pick_one([os.path.join(city_dir, "*_EVI_8day_0p1deg_2002_2025.tif"),
+                        os.path.join(city_dir, "*_EVI_8day_0p1deg_2002_2025.tiff")])
+    LAI_TIF = pick_one([os.path.join(city_dir, "*_LAI_8day_0p1deg_2002_2025.tif"),
+                        os.path.join(city_dir, "*_LAI_8day_0p1deg_2002_2025.tiff")])
+    DEM_TIF = pick_one([os.path.join(city_dir, "*_DEM_8day_0p1deg_2002_2025.tif"),
+                        os.path.join(city_dir, "*_DEM_8day_0p1deg_2002_2025.tiff"),
+                        os.path.join(city_dir, "*_DEM*.tif"),
+                        os.path.join(city_dir, "*_DEM*.tiff")])
+    LC_TIF  = pick_one([os.path.join(city_dir, "*_MODIS_LC_STACK_2002_2025_0p1deg.tif"),
+                        os.path.join(city_dir, "*_MODIS_LC_STACK_2002_2025_0p1deg.tiff")])
+
+    ERA_FILES = sorted(glob.glob(os.path.join(city_dir, "*_ERA5Lmain_8day_0p1deg_*.tif"))) + \
+                sorted(glob.glob(os.path.join(city_dir, "*_ERA5Lmain_8day_0p1deg_*.tiff")))
+
+    NTL_TIF = pick_one([os.path.join(city_dir, "*NTL*monthly*.tif"),
+                        os.path.join(city_dir, "*NTL*monthly*.tiff"),
+                        os.path.join(city_dir, "*NTL*.tif"),
+                        os.path.join(city_dir, "*NTL*.tiff")])
+
+    return LST_TIF, EVI_TIF, LAI_TIF, DEM_TIF, LC_TIF, ERA_FILES, NTL_TIF
+
+# =========================
+# 9) Build one city
+# =========================
+def build_city_dataset(city_name, city_dir):
+    rng = np.random.default_rng(RANDOM_SEED)
+
+    LST_TIF, EVI_TIF, LAI_TIF, DEM_TIF, LC_TIF, ERA_FILES, NTL_TIF = discover_city_files(city_dir)
+    if any(x is None for x in [LST_TIF, EVI_TIF, LAI_TIF, DEM_TIF, LC_TIF]) or len(ERA_FILES) == 0:
+        return None, {"city": city_name, "status": "skip_missing_files",
+                      "LST": bool(LST_TIF), "EVI": bool(EVI_TIF), "LAI": bool(LAI_TIF),
+                      "DEM": bool(DEM_TIF), "LC": bool(LC_TIF), "ERA_n": len(ERA_FILES),
+                      "NTL": bool(NTL_TIF)}
+
+    # (1) LSTD as ref time
+    LSTD, ref_dates, tgt_prof = read_8day_stack_by_prefix(LST_TIF, "LSTD")
+    if LSTD is None or ref_dates is None:
+        return None, {"city": city_name, "status": "skip_no_LSTD"}
+
+    # (2) EVI/LAI align
+    EVI, evi_dates, evi_prof = read_8day_stack_by_prefix(EVI_TIF, "EVI")
+    LAI, lai_dates, lai_prof = read_8day_stack_by_prefix(LAI_TIF, "LAI")
+    if EVI is None or LAI is None:
+        return None, {"city": city_name, "status": "skip_no_EVI_or_LAI"}
+
+    EVI = align_to_ref_dates(reproject_stack_to_target(EVI, evi_prof, tgt_prof, Resampling.bilinear), evi_dates, ref_dates)
+    LAI = align_to_ref_dates(reproject_stack_to_target(LAI, lai_prof, tgt_prof, Resampling.bilinear), lai_dates, ref_dates)
+
+    # (3) DEM 2D
+    DEM = read_dem_static_2d(DEM_TIF, tgt_prof)
+
+    # (4) LC stack to target + distance water
+    lc_YHW, lc_years, lc_prof = read_lc_stack(LC_TIF)
+    lc_YHW_tgt = reproject_lc_to_target(lc_YHW, lc_prof, tgt_prof)
+    DIST_WATER_km = build_dist_water_km_from_LC_stack(lc_YHW_tgt, WATER_CLASS, tgt_prof)
+
+    # (5) ERA merge & align
+    ERA = {k: None for k in ERA_KEYS}
+    for k in ERA_KEYS:
+        arr_all, dates_all = [], []
+        for fp in ERA_FILES:
+            arr, dates, prof = read_8day_stack_by_prefix(fp, k)
+            if arr is None:
+                continue
+            arr = reproject_stack_to_target(arr, prof, tgt_prof, Resampling.bilinear)
+            arr_all.append(arr)
+            dates_all.extend(dates)
+        if len(arr_all) == 0:
+            ERA[k] = None
+        else:
+            arr_all = np.concatenate(arr_all, axis=0)
+            ERA[k] = align_to_ref_dates(arr_all, dates_all, ref_dates)
+
+    # require key ERA vars
+    if ERA.get("T2M_C") is None or ERA.get("VPD_kPa") is None:
+        return None, {"city": city_name, "status": "skip_no_T2M_or_VPD"}
+
+    # (6) optional NTL mask
+    if USE_NTL_MASK:
+        if NTL_TIF is None:
+            return None, {"city": city_name, "status": "skip_no_NTL"}
+        m_arr, m_dates, m_prof = read_monthly_stack_anyprefix(NTL_TIF)
+        if m_arr is None:
+            return None, {"city": city_name, "status": "skip_NTL_no_YYYYMM"}
+        m_arr = reproject_stack_to_target(m_arr, m_prof, tgt_prof, Resampling.average)
+        ntl_mask_THW, ntl_thr_by_year = build_ntl_core_mask_by_year(
+            month_arr_MHW=m_arr, month_dates=m_dates, ref_dates=ref_dates,
+            ntl_start_year=NTL_START_YEAR, fallback_year=YEAR_FALLBACK,
+            core_top_p=CORE_TOP_P, core_top_p_pre=CORE_TOP_P_PRE, agg=NTL_AGG
+        )
+    else:
+        ntl_mask_THW = None
+        ntl_thr_by_year = {}
+
+    # (7) GLOBAL DROP timesteps (only key vars)
+    def frame_has_any_finite(A):
+        return np.isfinite(A).reshape(A.shape[0], -1).any(axis=1)
+
+    keep = frame_has_any_finite(LSTD) & frame_has_any_finite(EVI) & frame_has_any_finite(LAI)
+    keep &= frame_has_any_finite(ERA["T2M_C"]) & frame_has_any_finite(ERA["VPD_kPa"])
+    if ntl_mask_THW is not None:
+        keep &= np.any(ntl_mask_THW.reshape(len(ref_dates), -1), axis=1)  # at least some core pixels exist that year
+
+    LSTD = LSTD[keep]; EVI = EVI[keep]; LAI = LAI[keep]
+    for k in ERA_KEYS:
+        if ERA.get(k) is not None:
+            ERA[k] = ERA[k][keep]
+    if ntl_mask_THW is not None:
+        ntl_mask_THW = ntl_mask_THW[keep]
+    ref_dates = [d for i, d in enumerate(ref_dates) if keep[i]]
+
+    T, H, W = LSTD.shape
+    if T < 10:
+        return None, {"city": city_name, "status": "skip_too_few_timesteps", "T": int(T)}
+
+    # (8) TIME sampling
+    t_all = np.arange(T)
+    t_keep_n = max(1, int(np.floor(T * TIME_FRAC)))
+    t_sel = np.sort(rng.choice(t_all, size=t_keep_n, replace=False))
+
+    # (9) PIX sampling
+    if ntl_mask_THW is not None:
+        core_union = np.any(ntl_mask_THW[t_sel], axis=0)
+        cand = np.where(core_union.ravel())[0]
+    else:
+        cand = np.where(np.isfinite(LSTD[0]).ravel())[0]  # any grid
+    if cand.size == 0:
+        return None, {"city": city_name, "status": "skip_empty_mask"}
+
+    pix_keep_n = max(1, int(np.floor(cand.size * PIX_FRAC)))
+    pix_sel = np.sort(rng.choice(cand, size=pix_keep_n, replace=False))
+
+    yy, xx = np.divmod(pix_sel, W)
+    dem_sel  = DEM.ravel()[pix_sel].astype(np.float32)
+    dist_sel = DIST_WATER_km.ravel()[pix_sel].astype(np.float32)
+
+    # (10) Build sampled (t,pix)
+    t_rep = np.repeat(t_sel, pix_sel.size)
+    p_rep = np.tile(pix_sel, t_sel.size)
+
+    date_str = np.array([pd.Timestamp(ref_dates[i]).strftime("%Y-%m-%d") for i in t_sel], dtype=object)
+    date_rep = np.repeat(date_str, pix_sel.size)
+
+    def take_tp(A):
+        Af = A.reshape(T, -1)
+        return Af[t_rep, p_rep].astype(np.float32)
+
+    # LC per sample-year: pick nearest LC year band, then take pixel
+    lc_idx_for_t = np.array([choose_lc_for_year(lc_years, pd.Timestamp(ref_dates[i]).year) for i in t_rep], dtype=int)
+    lc_flat = lc_YHW_tgt.reshape(lc_YHW_tgt.shape[0], -1)
+    LC_vals = lc_flat[lc_idx_for_t, p_rep].astype(np.float32)
+
+    out = pd.DataFrame({
+        "city": city_name,
+        "date": date_rep,
+        "pix_y": np.tile(yy.astype(np.int16), t_sel.size),
+        "pix_x": np.tile(xx.astype(np.int16), t_sel.size),
+
+        "LST": take_tp(LSTD),
+        "EVI": take_tp(EVI),
+        "LAI": take_tp(LAI),
+
+        "DEM": np.tile(dem_sel, t_sel.size),
+        "LC":  LC_vals,  # yearly class
+
+        "DIST_WATER_km": np.tile(dist_sel, t_sel.size),
+    })
+
+    for k in ERA_KEYS:
+        out[k] = take_tp(ERA[k]) if ERA.get(k) is not None else np.nan
+
+    if ntl_mask_THW is not None:
+        mask_val = ntl_mask_THW.reshape(T, -1)[t_rep, p_rep]
+        out["is_core_ntl"] = mask_val.astype(np.int8)
+        out = out[out["is_core_ntl"] == 1].reset_index(drop=True)
+    else:
+        out["is_core_ntl"] = 1
+
+    out = out.dropna(subset=["LST"]).reset_index(drop=True)
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["date"]).reset_index(drop=True)
+    out["Year"]  = out["date"].dt.year.astype(np.int16)
+    out["Month"] = out["date"].dt.month.astype(np.int8)
+    out["DOY"]   = out["date"].dt.dayofyear.astype(np.int16)
+
+    meta = {
+        "city": city_name,
+        "status": "ok",
+        "T_full": int(T),
+        "T_sel": int(t_sel.size),
+        "pix_cand": int(cand.size),
+        "pix_sel": int(pix_sel.size),
+        "rows": int(len(out)),
+    }
+    return out, meta
+
+# =========================
+# 10) Run multiple cities
+# =========================
+def list_city_folders(root_dir):
+    xs = [d for d in os.listdir(root_dir) if os.path.isdir(os.path.join(root_dir, d))]
+    return sorted(xs)
+
+all_cities = list_city_folders(ROOT_DATA)
+if CITY_LIST is not None:
+    cities = [c for c in CITY_LIST if c in all_cities]
+else:
+    cities = all_cities[:int(N_CITIES)]
+
+print(f"Found {len(all_cities)} city folders. Will process {len(cities)} cities.")
+print("Example:", cities[:10])
+
+datasets, metas = [], []
+for city in tqdm(cities, desc="Cities", unit="city"):
+    city_dir = os.path.join(ROOT_DATA, city)
+    df_city, meta = build_city_dataset(city, city_dir)
+    metas.append(meta)
+    if df_city is None or len(df_city) == 0:
+        continue
+    if SAVE_PER_CITY_CSV:
+        df_city.to_csv(os.path.join(OUT_DIR, f"{city}_sampled_dataset.csv"), index=False)
+    datasets.append(df_city)
+
+meta_df = pd.DataFrame(metas)
+print("\n=== City processing summary ===")
+display(meta_df.fillna(""))
+
+if len(datasets) == 0:
+    raise ValueError("No city datasets produced. Check meta_df for skip reasons.")
+
+dataset = pd.concat(datasets, ignore_index=True)
+print("\n✅ Global dataset built")
+print("dataset shape:", dataset.shape)
+print("cities:", dataset["city"].nunique(), "| year range:", int(dataset["Year"].min()), "→", int(dataset["Year"].max()))
+print("Columns:", dataset.columns.tolist())
+print(dataset.head())
+
+# ================== Save final dataset ==================
+import os
+
+SAVE_DIR = "/content/drive/MyDrive/Second_research/derived_datasets"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+out_path = os.path.join(SAVE_DIR, "GlobalUrbanCooling_dataset_v2.parquet")
+
+# 推荐 parquet：体积小、读写快、类型不乱
+dataset.to_parquet(out_path, index=False)
+
+print("✅ Dataset saved to:", out_path)
+print("Rows:", len(dataset), "| Columns:", len(dataset.columns))
