@@ -1,0 +1,974 @@
+# -*- coding: utf-8 -*-
+import pandas as pd
+import numpy as np
+
+IN_CSV  = "/content/drive/MyDrive/Second_research/derived_datasets/merra2_match_points.csv"
+OUT_CSV = "/content/drive/MyDrive/Second_research/derived_datasets/merra2_match_points_dedup_for_gee.csv"
+
+df = pd.read_csv(IN_CSV)
+df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+# ------------------------------------------------------------
+# MERRA-2 native grid approximation:
+#   lon step = 0.625 degree
+#   lat step = 0.5 degree
+# ------------------------------------------------------------
+LON_RES = 0.625
+LAT_RES = 0.5
+
+# grid indices
+df["merra_ix"] = np.floor((df["lon"] + 180.0) / LON_RES).astype(int)
+df["merra_iy"] = np.floor((df["lat"] +  90.0) / LAT_RES).astype(int)
+
+# grid cell centers
+df["merra_lon"] = -180.0 + (df["merra_ix"] + 0.5) * LON_RES
+df["merra_lat"] =  -90.0 + (df["merra_iy"] + 0.5) * LAT_RES
+
+# deduplicate by date + MERRA cell
+dedup = (
+    df[["date", "merra_ix", "merra_iy", "merra_lon", "merra_lat"]]
+    .drop_duplicates()
+    .reset_index(drop=True)
+)
+
+dedup["cell_id"] = np.arange(len(dedup), dtype=int)
+
+# reorder
+dedup = dedup[["cell_id", "date", "merra_ix", "merra_iy", "merra_lon", "merra_lat"]]
+
+print("Original rows:", len(df))
+print("Unique date × MERRA-cell rows:", len(dedup))
+print("Compression ratio:", len(df) / max(len(dedup), 1))
+
+dedup.to_csv(OUT_CSV, index=False)
+print("Saved:", OUT_CSV)
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Robust post-processing for yearly MERRA2_wide_*.csv
+#
+# Fixes:
+# - skip empty CSV files
+# - skip malformed CSV files
+# - record which years/files are empty
+# - continue processing valid years
+#
+# Outputs:
+#   1) MERRA2_wide_all_years_merged.csv
+#   2) MERRA2_long_all.csv
+#   3) ERA5_MERRA2_matched_raw_samples.csv
+#   4) GlobalUrbanCooling_dataset_v2_MERRA2_rawmerge.parquet
+#   5) GlobalUrbanCooling_dataset_v2_MERRA2.parquet
+#   6) empty_or_bad_csv_report.csv
+# ============================================================
+
+import os
+import re
+import glob
+import numpy as np
+import pandas as pd
+from pandas.errors import EmptyDataError, ParserError
+
+# ============================================================
+# 0) PATHS
+# ============================================================
+MERRA_CSV_DIR = "/content/drive/MyDrive/Second_research/MERRA/CSV"
+POINTS_CSV    = "/content/drive/MyDrive/Second_research/derived_datasets/merra2_match_points.csv"
+PARQUET_PATH  = "/content/drive/MyDrive/Second_research/derived_datasets/GlobalUrbanCooling_dataset_v2.parquet"
+OUT_DIR       = "/content/drive/MyDrive/Second_research/MERRA/processed"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+OUT_WIDE_MERGED = os.path.join(OUT_DIR, "MERRA2_wide_all_years_merged.csv")
+OUT_LONG_ALL    = os.path.join(OUT_DIR, "MERRA2_long_all.csv")
+OUT_MATCHED_RAW = os.path.join(OUT_DIR, "ERA5_MERRA2_matched_raw_samples.csv")
+OUT_RAWMERGE    = os.path.join(OUT_DIR, "GlobalUrbanCooling_dataset_v2_MERRA2_rawmerge.parquet")
+OUT_MERRA_ONLY  = os.path.join(OUT_DIR, "GlobalUrbanCooling_dataset_v2_MERRA2.parquet")
+OUT_BAD_REPORT  = os.path.join(OUT_DIR, "empty_or_bad_csv_report.csv")
+OUT_EXACT_CSV   = os.path.join(OUT_DIR, "merra_points_exact_with_values.csv")
+
+# ============================================================
+# 1) FIND YEARLY WIDE CSV FILES
+# ============================================================
+files = sorted(glob.glob(os.path.join(MERRA_CSV_DIR, "MERRA2_wide_*.csv")))
+if len(files) == 0:
+    raise FileNotFoundError(f"❌ No files found in: {MERRA_CSV_DIR}")
+
+print(f"✅ Found {len(files)} yearly wide CSV files")
+for f in files[:10]:
+    print("  ", os.path.basename(f))
+
+# ============================================================
+# 2) SAFE LOAD ALL WIDE CSVs
+# ============================================================
+wide_parts = []
+bad_rows = []
+
+for f in files:
+    fname = os.path.basename(f)
+    try:
+        # skip true zero-byte files first
+        if os.path.getsize(f) == 0:
+            bad_rows.append({
+                "file": fname,
+                "status": "empty_zero_bytes"
+            })
+            print(f"[SKIP] {fname}: zero-byte file")
+            continue
+
+        df = pd.read_csv(f)
+
+        # skip files with no columns or no rows
+        if df.shape[1] == 0:
+            bad_rows.append({
+                "file": fname,
+                "status": "no_columns"
+            })
+            print(f"[SKIP] {fname}: no columns")
+            continue
+
+        if df.shape[0] == 0:
+            bad_rows.append({
+                "file": fname,
+                "status": "no_rows"
+            })
+            print(f"[SKIP] {fname}: no rows")
+            continue
+
+        df["source_file"] = fname
+        wide_parts.append(df)
+        print(f"[OK]   {fname}: shape={df.shape}")
+
+    except EmptyDataError:
+        bad_rows.append({
+            "file": fname,
+            "status": "EmptyDataError"
+        })
+        print(f"[SKIP] {fname}: EmptyDataError")
+        continue
+
+    except ParserError as e:
+        bad_rows.append({
+            "file": fname,
+            "status": f"ParserError: {str(e)[:200]}"
+        })
+        print(f"[SKIP] {fname}: ParserError")
+        continue
+
+    except Exception as e:
+        bad_rows.append({
+            "file": fname,
+            "status": f"OtherError: {str(e)[:200]}"
+        })
+        print(f"[SKIP] {fname}: {type(e).__name__}")
+        continue
+
+bad_df = pd.DataFrame(bad_rows)
+bad_df.to_csv(OUT_BAD_REPORT, index=False)
+print(f"\n✅ Saved bad/empty file report: {OUT_BAD_REPORT}")
+
+if len(wide_parts) == 0:
+    raise RuntimeError("❌ No valid yearly CSV files could be loaded.")
+
+wide_all = pd.concat(wide_parts, axis=0, ignore_index=True)
+wide_all.to_csv(OUT_WIDE_MERGED, index=False)
+
+print(f"\n✅ Saved merged wide table: {OUT_WIDE_MERGED}")
+print("Wide merged shape:", wide_all.shape)
+
+# ============================================================
+# 3) RESHAPE WIDE -> LONG
+# ============================================================
+print("\n🔄 Reshaping wide -> long ...")
+
+candidate_id_cols = [
+    "cell_id", "merra_ix", "merra_iy", "merra_lon", "merra_lat",
+    "lon", "lat", "source_file"
+]
+id_cols = [c for c in candidate_id_cols if c in wide_all.columns]
+print("ID columns detected:", id_cols)
+
+pat = re.compile(r"^(.*?)__(\d{4}-\d{2}-\d{2})$")
+
+data_cols = []
+for c in wide_all.columns:
+    m = pat.match(c)
+    if m:
+        data_cols.append(c)
+
+if len(data_cols) == 0:
+    raise ValueError("❌ No data columns like VAR__YYYY-MM-DD were found.")
+
+print(f"Detected {len(data_cols)} date-variable columns")
+
+pairs = []
+for c in data_cols:
+    m = pat.match(c)
+    pairs.append((c, m.group(1), m.group(2)))
+
+pairs_df = pd.DataFrame(pairs, columns=["col", "var", "date"])
+vars_found = sorted(pairs_df["var"].unique().tolist())
+dates_found = sorted(pairs_df["date"].unique().tolist())
+
+print("Variables found:", vars_found)
+print("Date count:", len(dates_found))
+print("First 10 dates:", dates_found[:10])
+
+# more memory-safe reshape
+long_chunks = []
+
+for var in vars_found:
+    sub = pairs_df[pairs_df["var"] == var].copy()
+    tmp_frames = []
+    for _, row in sub.iterrows():
+        col = row["col"]
+        date = row["date"]
+
+        tmp = wide_all[id_cols + [col]].copy()
+        tmp["date"] = date
+        tmp = tmp.rename(columns={col: var})
+        tmp_frames.append(tmp)
+
+    var_long = pd.concat(tmp_frames, axis=0, ignore_index=True)
+    long_chunks.append(var_long)
+
+stacked = pd.concat(long_chunks, axis=0, ignore_index=True)
+
+group_cols = [c for c in id_cols if c != "source_file"] + ["date"]
+long_all = stacked.groupby(group_cols, as_index=False).first()
+
+long_all["date"] = pd.to_datetime(long_all["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+value_cols = [c for c in vars_found if c in long_all.columns]
+long_all = long_all.dropna(subset=value_cols, how="all").reset_index(drop=True)
+long_all.to_csv(OUT_LONG_ALL, index=False)
+
+print(f"\n✅ Saved long table: {OUT_LONG_ALL}")
+print("Long table shape:", long_all.shape)
+print(long_all.head())
+
+# ============================================================
+# 4) LOAD ORIGINAL MATCH POINTS
+# ============================================================
+print("\n📥 Loading original exact sample points ...")
+pts = pd.read_csv(POINTS_CSV)
+pts["date"] = pd.to_datetime(pts["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+required_pts = ["city", "date", "pix_x", "pix_y", "lon", "lat"]
+miss_pts = [c for c in required_pts if c not in pts.columns]
+if miss_pts:
+    raise ValueError(f"❌ merra2_match_points.csv missing columns: {miss_pts}")
+
+# rebuild MERRA grid indices
+LON_RES = 0.625
+LAT_RES = 0.5
+
+pts["merra_ix"] = np.floor((pts["lon"] + 180.0) / LON_RES).astype(int)
+pts["merra_iy"] = np.floor((pts["lat"] +  90.0) / LAT_RES).astype(int)
+
+# if long table lacks merra_ix/iy, rebuild from lon/lat
+if "merra_ix" not in long_all.columns or "merra_iy" not in long_all.columns:
+    if "merra_lon" in long_all.columns and "merra_lat" in long_all.columns:
+        long_all["merra_ix"] = np.floor((long_all["merra_lon"] + 180.0) / LON_RES).astype(int)
+        long_all["merra_iy"] = np.floor((long_all["merra_lat"] +  90.0) / LAT_RES).astype(int)
+    elif "lon" in long_all.columns and "lat" in long_all.columns:
+        long_all["merra_ix"] = np.floor((long_all["lon"] + 180.0) / LON_RES).astype(int)
+        long_all["merra_iy"] = np.floor((long_all["lat"] +  90.0) / LAT_RES).astype(int)
+    else:
+        raise ValueError("❌ long_all has neither merra_ix/iy nor merra_lon/lat nor lon/lat")
+
+merra_vars = [v for v in [
+    "T2M_C", "TD_C", "VPD_kPa", "WIND10M_MS",
+    "SSRD_MJm2", "TP_mm", "SWVL1_m3m3", "STL1_C"
+] if v in long_all.columns]
+
+m2 = long_all[["date", "merra_ix", "merra_iy"] + merra_vars].drop_duplicates(
+    ["date", "merra_ix", "merra_iy"]
+)
+
+print("\nMERRA variable columns:", merra_vars)
+print("Unique date×MERRA-cell rows:", len(m2))
+
+# ============================================================
+# 5) MAP MERRA VALUES BACK TO EXACT ORIGINAL SAMPLE POINTS
+# ============================================================
+print("\n🔗 Mapping MERRA values back to exact original sample points ...")
+pts2 = pts.merge(
+    m2,
+    on=["date", "merra_ix", "merra_iy"],
+    how="left"
+)
+
+coverage = pts2[merra_vars].notna().mean().sort_values(ascending=False)
+print("\nCoverage after mapping to exact points:")
+print(coverage)
+
+pts2.to_csv(OUT_EXACT_CSV, index=False)
+print(f"\n✅ Saved exact point MERRA table: {OUT_EXACT_CSV}")
+
+# ============================================================
+# 6) LOAD ORIGINAL ERA5 PARQUET
+# ============================================================
+print("\n📥 Loading original ERA5 parquet ...")
+era = pd.read_parquet(PARQUET_PATH)
+era["date"] = pd.to_datetime(era["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+keys = ["city", "date", "pix_x", "pix_y"]
+miss_keys = [c for c in keys if c not in era.columns]
+if miss_keys:
+    raise ValueError(f"❌ GlobalUrbanCooling_dataset_v2.parquet missing keys: {miss_keys}")
+
+# ============================================================
+# 7) BUILD MATCHED RAW SAMPLE TABLE
+# ============================================================
+era_vars = [v for v in merra_vars if v in era.columns]
+
+matched = pts2.merge(
+    era[keys + era_vars].drop_duplicates(keys),
+    on=keys,
+    how="inner",
+    suffixes=("_MERRA2", "_ERA5")
+)
+
+matched.to_csv(OUT_MATCHED_RAW, index=False)
+
+print(f"\n✅ Saved matched raw sample table: {OUT_MATCHED_RAW}")
+print("Matched raw shape:", matched.shape)
+
+# ============================================================
+# 8) BUILD RAW-MERGED COMPANION PARQUET
+# ============================================================
+m2_for_merge = pts2[keys + merra_vars].drop_duplicates(keys).copy()
+rename_add = {v: "MERRA2_" + v for v in merra_vars}
+m2_for_merge = m2_for_merge.rename(columns=rename_add)
+
+rawmerge = era.merge(m2_for_merge, on=keys, how="left")
+rawmerge.to_parquet(OUT_RAWMERGE, index=False)
+
+print(f"\n✅ Saved ERA5 + raw MERRA columns parquet: {OUT_RAWMERGE}")
+print("Raw-merged shape:", rawmerge.shape)
+
+# ============================================================
+# 9) BUILD A PURE MERRA-2 VERSION
+# ============================================================
+merra_only = rawmerge.copy()
+
+for v in merra_vars:
+    merra_col = "MERRA2_" + v
+    if merra_col in merra_only.columns and v in merra_only.columns:
+        merra_only = merra_only.drop(columns=[v])
+        merra_only = merra_only.rename(columns={merra_col: v})
+
+merra_only.to_parquet(OUT_MERRA_ONLY, index=False)
+
+print(f"\n✅ Saved pure MERRA-2 companion parquet: {OUT_MERRA_ONLY}")
+print("MERRA-only shape:", merra_only.shape)
+
+# ============================================================
+# 10) SUMMARY
+# ============================================================
+print("\n================ SUMMARY ================")
+print("Valid yearly files used: ", len(wide_parts))
+print("Bad/empty yearly files:  ", len(bad_rows))
+print("Wide merged CSV:         ", OUT_WIDE_MERGED)
+print("Long all CSV:            ", OUT_LONG_ALL)
+print("Matched raw CSV:         ", OUT_MATCHED_RAW)
+print("ERA+MERRA parquet:       ", OUT_RAWMERGE)
+print("MERRA parquet:           ", OUT_MERRA_ONLY)
+
+print("\nMatched coverage in pure MERRA parquet:")
+for v in merra_vars:
+    print(f"{v:12s} -> {merra_only[v].notna().mean():.4f}")
+
+print("\nDone.")
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# STEP 3: ERA5 vs MERRA-2 consistency check
+#
+# Input:
+#   /content/drive/MyDrive/Second_research/MERRA/processed/
+#       ERA5_MERRA2_matched_raw_samples.csv
+#
+# Output:
+#   1) era5_merra2_variable_stats.csv
+#   2) era5_merra2_year_coverage.csv
+#   3) scatter plots for each variable
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# -------------------------
+# Paths
+# -------------------------
+IN_CSV = "/content/drive/MyDrive/Second_research/MERRA/processed/ERA5_MERRA2_matched_raw_samples.csv"
+OUT_DIR = "/content/drive/MyDrive/Second_research/MERRA/processed/checks"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# -------------------------
+# Load data
+# -------------------------
+df = pd.read_csv(IN_CSV)
+print("Loaded:", df.shape)
+
+# try to recover date/year
+if "date" in df.columns:
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["year"] = df["date"].dt.year
+
+# variable list
+vars_base = [
+    "T2M_C", "TD_C", "VPD_kPa", "WIND10M_MS",
+    "SSRD_MJm2", "TP_mm", "SWVL1_m3m3", "STL1_C"
+]
+
+# find paired columns
+pairs = []
+for v in vars_base:
+    c1 = v + "_MERRA2"
+    c2 = v + "_ERA5"
+    if c1 in df.columns and c2 in df.columns:
+        pairs.append((v, c1, c2))
+
+print("Variable pairs found:")
+for p in pairs:
+    print("  ", p)
+
+# -------------------------
+# 1) Year coverage
+# -------------------------
+if "year" in df.columns:
+    year_cov = (
+        df.groupby("year", dropna=True)
+          .size()
+          .reset_index(name="n_samples")
+          .sort_values("year")
+    )
+    year_cov.to_csv(os.path.join(OUT_DIR, "era5_merra2_year_coverage.csv"), index=False)
+    print("\nYear coverage:")
+    print(year_cov)
+else:
+    print("\n[WARN] No date/year column found, skipping year coverage table.")
+
+# -------------------------
+# 2) Variable-level statistics
+# -------------------------
+rows = []
+
+for v, cm, ce in pairs:
+    tmp = df[[cm, ce]].replace([np.inf, -np.inf], np.nan).dropna()
+    n = len(tmp)
+    if n == 0:
+        continue
+
+    x = tmp[ce].to_numpy(dtype=float)   # ERA5
+    y = tmp[cm].to_numpy(dtype=float)   # MERRA-2
+
+    pearson_r = np.corrcoef(x, y)[0, 1] if n > 1 else np.nan
+
+    # Spearman (fast rank-based)
+    xr = pd.Series(x).rank().to_numpy()
+    yr = pd.Series(y).rank().to_numpy()
+    spearman_r = np.corrcoef(xr, yr)[0, 1] if n > 1 else np.nan
+
+    diff = y - x  # MERRA - ERA5
+    bias = float(np.mean(diff))
+    mae = float(np.mean(np.abs(diff)))
+    rmse = float(np.sqrt(np.mean(diff**2)))
+
+    p05 = float(np.quantile(diff, 0.05))
+    p50 = float(np.quantile(diff, 0.50))
+    p95 = float(np.quantile(diff, 0.95))
+
+    rows.append({
+        "variable": v,
+        "n": n,
+        "pearson_r": pearson_r,
+        "spearman_r": spearman_r,
+        "bias_merra_minus_era5": bias,
+        "mae": mae,
+        "rmse": rmse,
+        "diff_p05": p05,
+        "diff_p50": p50,
+        "diff_p95": p95,
+        "era5_mean": float(np.mean(x)),
+        "merra2_mean": float(np.mean(y)),
+        "era5_std": float(np.std(x)),
+        "merra2_std": float(np.std(y)),
+    })
+
+stats = pd.DataFrame(rows).sort_values("pearson_r", ascending=False)
+stats.to_csv(os.path.join(OUT_DIR, "era5_merra2_variable_stats.csv"), index=False)
+
+print("\nVariable comparison summary:")
+print(stats)
+
+# -------------------------
+# 3) Scatter-density plots
+#    sample down for plotting
+# -------------------------
+PLOT_SAMPLE = 120000
+rng = np.random.default_rng(42)
+
+for v, cm, ce in pairs:
+    tmp = df[[cm, ce]].replace([np.inf, -np.inf], np.nan).dropna()
+    if len(tmp) == 0:
+        continue
+
+    if len(tmp) > PLOT_SAMPLE:
+        idx = rng.choice(tmp.index.to_numpy(), size=PLOT_SAMPLE, replace=False)
+        tmp = tmp.loc[idx]
+
+    x = tmp[ce].to_numpy(dtype=float)   # ERA5
+    y = tmp[cm].to_numpy(dtype=float)   # MERRA-2
+
+    fig, ax = plt.subplots(figsize=(6.2, 5.4))
+    hb = ax.hexbin(x, y, gridsize=55, mincnt=1)
+    cb = fig.colorbar(hb, ax=ax)
+    cb.set_label("Count")
+
+    lo = np.nanquantile(np.concatenate([x, y]), 0.01)
+    hi = np.nanquantile(np.concatenate([x, y]), 0.99)
+    ax.plot([lo, hi], [lo, hi], linewidth=1.2)
+
+    ax.set_xlabel(f"{v} (ERA5)")
+    ax.set_ylabel(f"{v} (MERRA-2)")
+    ax.set_title(f"{v}: ERA5 vs MERRA-2")
+
+    plt.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, f"scatter_{v}.png"), dpi=220)
+    plt.close(fig)
+
+print(f"\n✅ Saved outputs to: {OUT_DIR}")
+print(" - era5_merra2_variable_stats.csv")
+if "year" in df.columns:
+    print(" - era5_merra2_year_coverage.csv")
+print(" - scatter_*.png")
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# STEP 4:
+# 1) Fit ERA5 -> MERRA-2 mapping models
+# 2) Build full hybrid MERRA-2 companion parquet
+#
+# Inputs:
+#   /content/drive/MyDrive/Second_research/MERRA/processed/
+#       ERA5_MERRA2_matched_raw_samples.csv
+#   /content/drive/MyDrive/Second_research/derived_datasets/
+#       GlobalUrbanCooling_dataset_v2.parquet
+#
+# Outputs:
+#   /content/drive/MyDrive/Second_research/MERRA/hybrid/
+#       model_metrics.csv
+#       validation_predictions_sample.csv
+#       fitted_models.pkl
+#       GlobalUrbanCooling_dataset_v2_MERRA2_hybrid.parquet
+#       GlobalUrbanCooling_dataset_v2_ERA5_plus_MERRA2hybrid.parquet
+# ============================================================
+
+import os
+import gc
+import json
+import joblib
+import numpy as np
+import pandas as pd
+
+from sklearn.linear_model import HuberRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+
+# ============================================================
+# 0) PATHS
+# ============================================================
+MATCHED_CSV = "/content/drive/MyDrive/Second_research/MERRA/processed/ERA5_MERRA2_matched_raw_samples.csv"
+ERA5_PARQUET = "/content/drive/MyDrive/Second_research/derived_datasets/GlobalUrbanCooling_dataset_v2.parquet"
+
+OUT_DIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+OUT_METRICS_CSV = os.path.join(OUT_DIR, "model_metrics.csv")
+OUT_VALID_CSV   = os.path.join(OUT_DIR, "validation_predictions_sample.csv")
+OUT_MODELS_PKL  = os.path.join(OUT_DIR, "fitted_models.pkl")
+OUT_HYBRID_PQ   = os.path.join(OUT_DIR, "GlobalUrbanCooling_dataset_v2_MERRA2_hybrid.parquet")
+OUT_BOTH_PQ     = os.path.join(OUT_DIR, "GlobalUrbanCooling_dataset_v2_ERA5_plus_MERRA2hybrid.parquet")
+OUT_CONFIG_JSON = os.path.join(OUT_DIR, "hybrid_build_config.json")
+
+# ============================================================
+# 1) CONFIG
+# ============================================================
+# high-consistency variables -> robust linear
+LINEAR_VARS = ["T2M_C", "TD_C", "VPD_kPa", "SSRD_MJm2", "STL1_C"]
+
+# weaker / more nonlinear variables -> tree model
+TREE_VARS = ["WIND10M_MS", "TP_mm", "SWVL1_m3m3"]
+
+# train sample sizes
+MAX_TRAIN_LINEAR = 1_200_000   # enough, still manageable
+MAX_TRAIN_TREE   =   500_000   # keep training fast
+VALID_FRAC       = 0.15
+RANDOM_SEED      = 42
+
+# clip outputs to physically reasonable bounds
+PHYSICAL_BOUNDS = {
+    "VPD_kPa":     (0.0, None),
+    "WIND10M_MS":  (0.0, None),
+    "SSRD_MJm2":   (0.0, None),
+    "TP_mm":       (0.0, None),
+    "SWVL1_m3m3":  (0.0, 1.0),
+}
+
+# predictor sets for nonlinear variables
+TREE_FEATURES = {
+    "WIND10M_MS": ["WIND10M_MS_ERA5", "T2M_C_ERA5", "TD_C_ERA5", "VPD_kPa_ERA5", "SSRD_MJm2_ERA5"],
+    "TP_mm":      ["TP_mm_ERA5", "T2M_C_ERA5", "TD_C_ERA5", "VPD_kPa_ERA5", "SSRD_MJm2_ERA5"],
+    "SWVL1_m3m3": ["SWVL1_m3m3_ERA5", "TP_mm_ERA5", "T2M_C_ERA5", "VPD_kPa_ERA5", "STL1_C_ERA5"]
+}
+
+# linear variables only use their own ERA5 counterpart
+def linear_feature(var):
+    return [f"{var}_ERA5"]
+
+# ============================================================
+# 2) HELPERS
+# ============================================================
+def safe_rmse(y_true, y_pred):
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+def clip_physical(arr, varname):
+    if varname not in PHYSICAL_BOUNDS:
+        return arr
+    lo, hi = PHYSICAL_BOUNDS[varname]
+    arr = np.asarray(arr, dtype=float)
+    if lo is not None:
+        arr = np.maximum(arr, lo)
+    if hi is not None:
+        arr = np.minimum(arr, hi)
+    return arr
+
+def summarize_model(y_true, y_pred):
+    diff = np.asarray(y_pred) - np.asarray(y_true)
+    return {
+        "r2": float(r2_score(y_true, y_pred)),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "rmse": safe_rmse(y_true, y_pred),
+        "bias": float(np.mean(diff)),
+        "diff_p05": float(np.quantile(diff, 0.05)),
+        "diff_p50": float(np.quantile(diff, 0.50)),
+        "diff_p95": float(np.quantile(diff, 0.95)),
+    }
+
+def train_linear_model(train_df, valid_df, var):
+    xcols = linear_feature(var)
+    ycol = f"{var}_MERRA2"
+
+    Xtr = train_df[xcols].to_numpy(dtype=float)
+    ytr = train_df[ycol].to_numpy(dtype=float)
+
+    Xva = valid_df[xcols].to_numpy(dtype=float)
+    yva = valid_df[ycol].to_numpy(dtype=float)
+
+    model = HuberRegressor()
+    model.fit(Xtr, ytr)
+
+    pred_tr = clip_physical(model.predict(Xtr), var)
+    pred_va = clip_physical(model.predict(Xva), var)
+
+    row = {
+        "variable": var,
+        "model_type": "HuberRegressor",
+        "feature_cols": "|".join(xcols),
+        "n_train": len(train_df),
+        "n_valid": len(valid_df),
+        "coef_0": float(model.coef_[0]) if len(model.coef_) > 0 else np.nan,
+        "intercept": float(model.intercept_),
+    }
+    row.update({f"train_{k}": v for k, v in summarize_model(ytr, pred_tr).items()})
+    row.update({f"valid_{k}": v for k, v in summarize_model(yva, pred_va).items()})
+
+    valid_out = valid_df[["city", "date", ycol] + xcols].copy()
+    valid_out["variable"] = var
+    valid_out["pred_MERRA2"] = pred_va
+    valid_out["true_MERRA2"] = yva
+
+    return model, row, valid_out
+
+def train_tree_model(train_df, valid_df, var):
+    xcols = TREE_FEATURES[var]
+    ycol = f"{var}_MERRA2"
+
+    Xtr = train_df[xcols].to_numpy(dtype=float)
+    ytr = train_df[ycol].to_numpy(dtype=float)
+
+    Xva = valid_df[xcols].to_numpy(dtype=float)
+    yva = valid_df[ycol].to_numpy(dtype=float)
+
+    model = HistGradientBoostingRegressor(
+        loss="squared_error",
+        learning_rate=0.05,
+        max_iter=300,
+        max_leaf_nodes=31,
+        min_samples_leaf=100,
+        l2_regularization=0.1,
+        random_state=RANDOM_SEED
+    )
+    model.fit(Xtr, ytr)
+
+    pred_tr = clip_physical(model.predict(Xtr), var)
+    pred_va = clip_physical(model.predict(Xva), var)
+
+    row = {
+        "variable": var,
+        "model_type": "HistGradientBoostingRegressor",
+        "feature_cols": "|".join(xcols),
+        "n_train": len(train_df),
+        "n_valid": len(valid_df),
+        "coef_0": np.nan,
+        "intercept": np.nan,
+    }
+    row.update({f"train_{k}": v for k, v in summarize_model(ytr, pred_tr).items()})
+    row.update({f"valid_{k}": v for k, v in summarize_model(yva, pred_va).items()})
+
+    valid_out = valid_df[["city", "date", ycol] + xcols].copy()
+    valid_out["variable"] = var
+    valid_out["pred_MERRA2"] = pred_va
+    valid_out["true_MERRA2"] = yva
+
+    return model, row, valid_out
+
+def build_training_subset(df, xcols, ycol, max_n):
+    sub = df[xcols + [ycol]].replace([np.inf, -np.inf], np.nan).dropna().copy()
+    if "city" in df.columns:
+        keep_cols = list(dict.fromkeys(["city", "date"] + xcols + [ycol]))
+        sub = df[keep_cols].replace([np.inf, -np.inf], np.nan).dropna().copy()
+    if len(sub) > max_n:
+        sub = sub.sample(max_n, random_state=RANDOM_SEED)
+    return sub
+
+# ============================================================
+# 3) LOAD MATCHED RAW SAMPLE TABLE
+# ============================================================
+print("Loading matched raw sample table ...")
+dfm = pd.read_csv(MATCHED_CSV)
+print("Matched raw shape:", dfm.shape)
+
+if "date" in dfm.columns:
+    dfm["date"] = pd.to_datetime(dfm["date"], errors="coerce")
+
+required_base = ["city", "date"]
+for c in required_base:
+    if c not in dfm.columns:
+        print(f"[WARN] {c} not found in matched sample table")
+
+# ============================================================
+# 4) FIT MODELS
+# ============================================================
+fitted_models = {}
+metric_rows = []
+valid_parts = []
+
+all_vars = LINEAR_VARS + TREE_VARS
+
+for var in all_vars:
+    ycol = f"{var}_MERRA2"
+    if ycol not in dfm.columns:
+        print(f"[SKIP] target not found for {var}: {ycol}")
+        continue
+
+    if var in LINEAR_VARS:
+        xcols = linear_feature(var)
+        max_n = MAX_TRAIN_LINEAR
+        sub = build_training_subset(dfm, xcols, ycol, max_n)
+        if len(sub) < 1000:
+            print(f"[SKIP] too few samples for {var}")
+            continue
+
+        train_df, valid_df = train_test_split(sub, test_size=VALID_FRAC, random_state=RANDOM_SEED)
+        model, row, valid_out = train_linear_model(train_df, valid_df, var)
+
+    else:
+        xcols = TREE_FEATURES[var]
+        max_n = MAX_TRAIN_TREE
+        sub = build_training_subset(dfm, xcols, ycol, max_n)
+        if len(sub) < 2000:
+            print(f"[SKIP] too few samples for {var}")
+            continue
+
+        train_df, valid_df = train_test_split(sub, test_size=VALID_FRAC, random_state=RANDOM_SEED)
+        model, row, valid_out = train_tree_model(train_df, valid_df, var)
+
+    fitted_models[var] = {
+        "model": model,
+        "feature_cols": xcols,
+        "target_col": ycol
+    }
+    metric_rows.append(row)
+    valid_parts.append(valid_out)
+
+    print(f"✅ fitted {var}: {row['model_type']} | valid_r2={row['valid_r2']:.4f} | valid_rmse={row['valid_rmse']:.4f}")
+
+metrics = pd.DataFrame(metric_rows).sort_values("variable")
+metrics.to_csv(OUT_METRICS_CSV, index=False)
+
+valid_pred = pd.concat(valid_parts, axis=0, ignore_index=True)
+valid_pred.to_csv(OUT_VALID_CSV, index=False)
+
+joblib.dump(fitted_models, OUT_MODELS_PKL)
+
+config = {
+    "LINEAR_VARS": LINEAR_VARS,
+    "TREE_VARS": TREE_VARS,
+    "MAX_TRAIN_LINEAR": MAX_TRAIN_LINEAR,
+    "MAX_TRAIN_TREE": MAX_TRAIN_TREE,
+    "VALID_FRAC": VALID_FRAC,
+    "RANDOM_SEED": RANDOM_SEED,
+    "TREE_FEATURES": TREE_FEATURES,
+    "PHYSICAL_BOUNDS": PHYSICAL_BOUNDS
+}
+with open(OUT_CONFIG_JSON, "w", encoding="utf-8") as f:
+    json.dump(config, f, ensure_ascii=False, indent=2)
+
+print("\n✅ Saved model outputs:")
+print(" -", OUT_METRICS_CSV)
+print(" -", OUT_VALID_CSV)
+print(" -", OUT_MODELS_PKL)
+print(" -", OUT_CONFIG_JSON)
+
+# ============================================================
+# 5) LOAD FULL ERA5 PARQUET
+# ============================================================
+print("\nLoading full ERA5 parquet ...")
+era = pd.read_parquet(ERA5_PARQUET)
+print("ERA5 parquet shape:", era.shape)
+
+if "date" in era.columns:
+    era["date"] = pd.to_datetime(era["date"], errors="coerce")
+
+# ============================================================
+# ============================================================
+# 6) BUILD HYBRID MERRA2 COMPANION DATASET  [FIXED VERSION]
+# ============================================================
+print("\nApplying fitted models to full ERA5 parquet ...")
+
+# keep sample keys
+key_cols = ["city", "date", "pix_x", "pix_y"]
+for c in key_cols:
+    if c not in era.columns:
+        raise ValueError(f"Missing key column in ERA parquet: {c}")
+
+hybrid_add = era[key_cols].copy()
+
+# helper: map training feature names back to parquet feature names
+def map_train_feature_to_parquet(colname: str) -> str:
+    # training table uses *_ERA5, full parquet uses raw names
+    if colname.endswith("_ERA5"):
+        return colname[:-5]   # remove "_ERA5"
+    return colname
+
+prediction_report = []
+
+for var, bundle in fitted_models.items():
+    train_xcols = bundle["feature_cols"]   # e.g. ['T2M_C_ERA5'] or mixed *_ERA5
+    model = bundle["model"]
+
+    parquet_xcols = [map_train_feature_to_parquet(c) for c in train_xcols]
+
+    missing = [c for c in parquet_xcols if c not in era.columns]
+    if len(missing) > 0:
+        raise ValueError(
+            f"Missing feature columns for {var} in full ERA parquet.\n"
+            f"Training cols: {train_xcols}\n"
+            f"Mapped parquet cols: {parquet_xcols}\n"
+            f"Missing: {missing}"
+        )
+
+    X = era[parquet_xcols].replace([np.inf, -np.inf], np.nan).copy()
+
+    pred = np.full(len(era), np.nan, dtype=np.float32)
+    mask = X.notna().all(axis=1).to_numpy()
+
+    if mask.sum() == 0:
+        print(f"[WARN] no valid rows for {var}")
+        hybrid_add["MERRA2hyb_" + var] = pred
+        prediction_report.append({
+            "variable": var,
+            "n_total": len(era),
+            "n_valid_rows": 0,
+            "coverage": 0.0
+        })
+        continue
+
+    Xv = X.loc[mask, parquet_xcols].to_numpy(dtype=float)
+
+    yhat = model.predict(Xv)
+    yhat = clip_physical(yhat, var).astype(np.float32)
+
+    pred[mask] = yhat
+    hybrid_add["MERRA2hyb_" + var] = pred
+
+    prediction_report.append({
+        "variable": var,
+        "n_total": len(era),
+        "n_valid_rows": int(mask.sum()),
+        "coverage": float(mask.mean())
+    })
+
+    print(
+        f"✅ predicted {var}: "
+        f"valid rows = {mask.sum():,} / {len(era):,} "
+        f"({mask.mean():.4%})"
+    )
+
+# optional: save prediction coverage report
+pred_report_df = pd.DataFrame(prediction_report)
+pred_report_csv = os.path.join(OUT_DIR, "hybrid_prediction_coverage.csv")
+pred_report_df.to_csv(pred_report_csv, index=False)
+print("\n✅ Saved prediction coverage report:")
+print(" -", pred_report_csv)
+
+# ERA5 + hybrid side-by-side
+era_plus_hybrid = era.merge(
+    hybrid_add,
+    on=key_cols,
+    how="left"
+)
+
+era_plus_hybrid.to_parquet(OUT_BOTH_PQ, index=False)
+
+# pure hybrid MERRA2 version:
+# drop original ERA5 climate columns if present, replace with hybrid values
+hybrid_only = era.copy()
+
+for var in fitted_models.keys():
+    if var in hybrid_only.columns:
+        hybrid_only = hybrid_only.drop(columns=[var])
+
+for var in fitted_models.keys():
+    hybrid_only[var] = hybrid_add["MERRA2hyb_" + var].values
+
+hybrid_only.to_parquet(OUT_HYBRID_PQ, index=False)
+
+print("\n✅ Saved hybrid datasets:")
+print(" -", OUT_BOTH_PQ)
+print(" -", OUT_HYBRID_PQ)
+
+print("\nHybrid variable coverage:")
+for var in fitted_models.keys():
+    print(f"{var:12s} -> {hybrid_only[var].notna().mean():.4f}")
+
+import pandas as pd
+
+fp = "/content/drive/MyDrive/Second_research/MERRA/hybrid/GlobalUrbanCooling_dataset_v2_ERA5_plus_MERRA2hybrid.parquet"
+
+df = pd.read_parquet(fp)
+
+print("shape:", df.shape)
+
+print("\n前40列列名：")
+print(df.columns[:40].tolist())
+
+print("\n前5行：")
+print(df.head())
