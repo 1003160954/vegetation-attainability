@@ -1,0 +1,3761 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import math
+
+# ============================================================
+# Background-conditioned NONLINEAR response curves:
+#   cooling_efficiency ~ f(X) under different (T2M, VPD) backgrounds
+# Features analyzed (13):
+#   ['EVI','LAI','DEM','LC','DIST_WATER_km','T2M_C','TD_C','VPD_kPa','WIND10M_MS',
+#    'SSRD_MJm2','TP_mm','SWVL1_m3m3','STL1_C']
+#
+# Key goals:
+#   - show strong nonlinearity AND background dependence
+#   - FAST: operate on city×bin summaries (not 11M rows repeatedly)
+#   - robust: use per-city medians + bootstrap CI over cities
+#
+# Expected globals:
+#   dataset: DataFrame containing city, date, cooling_efficiency and features
+# ============================================================
+
+# -----------------------
+# Config (speed first)
+# -----------------------
+CITY = "city"
+DATE = "date"
+Y    = "cooling_efficiency"
+
+FEATURES = ['EVI','LAI','DEM','LC','DIST_WATER_km','T2M_C','TD_C','VPD_kPa',
+            'WIND10M_MS','SSRD_MJm2','TP_mm','SWVL1_m3m3','STL1_C']
+
+# summer definition (city-specific): top-3 hottest months from baseline years by T2M_C
+BASELINE_YEARS = (2002, 2006)         # inclusive
+TOPK_HOT_MONTHS = 3
+
+# background (T2M×VPD) bins (3x3 -> pick a few key backgrounds to plot)
+# We'll plot: Cool+Humid (T1V1), Mid (T2V2), Hot+Dry (T3V3)
+BG_Q = 3
+BG_TO_PLOT = [("T1","V1"), ("T2","V2"), ("T3","V3")]
+BG_NAME = {("T1","V1"):"Cool&Humid", ("T2","V2"):"Mid", ("T3","V3"):"Hot&Dry"}
+
+# curve bins
+N_BINS = 25                 # quantile bins per variable (LC will be treated as categories)
+MIN_CITY_PER_BIN = 15       # ignore bins with too few cities (stability)
+
+# bootstrap CI (fast, over cities, on city×bin medians)
+BOOT_N = 300                # 200–600 reasonable; 300 is a good speed/quality tradeoff
+CI_Z = 1.96                 # ~95%
+
+# speed control for raw row volume (optional)
+# If dataset is huge, sampling per-city helps a lot but still preserves city heterogeneity.
+ENABLE_CITY_SAMPLING = True
+MAX_ROWS_PER_CITY = 120000   # adjust for speed; 30k–200k depending on RAM
+RNG_SEED = 42
+
+# -----------------------
+# 0) Load & minimal checks
+# -----------------------
+assert "dataset" in globals(), "❌ dataset 不在 globals() 里"
+df0 = dataset.copy()
+
+need = [CITY, DATE, Y] + FEATURES
+miss = [c for c in need if c not in df0.columns]
+if miss:
+    raise ValueError(f"❌ dataset 缺少列：{miss}")
+
+df0[DATE] = pd.to_datetime(df0[DATE], errors="coerce")
+df0 = df0.dropna(subset=[CITY, DATE, Y]).reset_index(drop=True)
+
+# keep only needed columns to save memory
+keep_cols = [CITY, DATE, Y] + FEATURES
+df0 = df0[keep_cols].copy()
+
+# numeric coercion (keep CITY as string/category)
+for c in [Y] + FEATURES:
+    df0[c] = pd.to_numeric(df0[c], errors="coerce")
+
+df0["Year"] = df0[DATE].dt.year.astype(np.int16)
+df0["Month"] = df0[DATE].dt.month.astype(np.int8)
+
+# drop rows without key climate needed for summer & background
+df0 = df0.dropna(subset=["T2M_C","VPD_kPa"]).reset_index(drop=True)
+
+# category for speed
+df0[CITY] = df0[CITY].astype("category")
+
+print(f"Rows(raw after minimal clean): {len(df0):,} | Cities: {df0[CITY].nunique()} | Year range: {df0['Year'].min()}–{df0['Year'].max()}")
+
+# -----------------------
+# 1) City-specific summer months (baseline hottest months by T2M_C)
+# -----------------------
+def compute_city_summer_months(df, baseline_years=(2002, 2006), topk=3):
+    y0, y1 = baseline_years
+    base = df[(df["Year"] >= y0) & (df["Year"] <= y1)].copy()
+    # monthly mean T2M per city
+    m = (base.groupby([CITY, "Month"], observed=True)["T2M_C"]
+              .mean()
+              .reset_index())
+    # for each city choose top-k hottest months
+    summer_months = {}
+    for c, g in m.groupby(CITY, observed=True):
+        g2 = g.dropna(subset=["T2M_C"]).sort_values("T2M_C", ascending=False)
+        if len(g2) == 0:
+            continue
+        months = g2["Month"].astype(int).tolist()[:min(topk, len(g2))]
+        # make unique & sorted
+        months = sorted(list(dict.fromkeys(months)))
+        summer_months[str(c)] = months
+    return summer_months
+
+summer_months_by_city = compute_city_summer_months(df0, BASELINE_YEARS, TOPK_HOT_MONTHS)
+if len(summer_months_by_city) == 0:
+    raise RuntimeError("❌ 无法计算城市夏季月份：检查 baseline_years 是否有数据、T2M_C 是否为空。")
+
+# fast filter: map city->months and keep rows in those months
+# (vectorized by building a boolean mask per-row)
+city_str = df0[CITY].astype(str)
+months_arr = df0["Month"].to_numpy()
+# build summer boolean via python loop over cities (still fast for 100–300 cities)
+is_summer = np.zeros(len(df0), dtype=bool)
+for c, months in summer_months_by_city.items():
+    idx = (city_str.values == c)
+    if idx.any():
+        is_summer[idx] = np.isin(months_arr[idx], months)
+
+df = df0[is_summer].copy().reset_index(drop=True)
+if df.empty:
+    raise RuntimeError("❌ summer 数据为空：检查 summer_months_by_city 与 Month。")
+
+print(f"Summer definition: City-specific top-{TOPK_HOT_MONTHS} hottest months (baseline {BASELINE_YEARS[0]}–{BASELINE_YEARS[1]})")
+print(f"Rows(summer): {len(df):,}")
+
+# optional: per-city sampling for speed (preserve city heterogeneity)
+if ENABLE_CITY_SAMPLING:
+    rng = np.random.default_rng(RNG_SEED)
+    parts = []
+    for c, g in df.groupby(CITY, observed=True):
+        n = len(g)
+        if n <= MAX_ROWS_PER_CITY:
+            parts.append(g)
+        else:
+            take = rng.choice(g.index.to_numpy(), size=MAX_ROWS_PER_CITY, replace=False)
+            parts.append(df.loc[take])
+    df = pd.concat(parts, axis=0).reset_index(drop=True)
+    print(f"Rows(summer after per-city sampling): {len(df):,} (MAX_ROWS_PER_CITY={MAX_ROWS_PER_CITY})")
+
+# -----------------------
+# 2) Background strata by (T2M, VPD) terciles within summer
+# -----------------------
+def tercile_labels(x, prefix):
+    # x: series
+    q = np.nanquantile(x.to_numpy(dtype=float), [0, 1/3, 2/3, 1])
+    # ensure monotonic
+    q = np.unique(q)
+    if len(q) < 4:
+        # fallback: use min/median/max
+        q = np.array([np.nanmin(x), np.nanmedian(x), np.nanmax(x)])
+        # build 3 bins with duplicated edges handled by cut duplicates='drop'
+    bins = pd.qcut(x, q=BG_Q, labels=[f"{prefix}1", f"{prefix}2", f"{prefix}3"], duplicates="drop")
+    return bins
+
+df["T_bin"] = pd.qcut(df["T2M_C"], q=BG_Q, labels=["T1","T2","T3"], duplicates="drop")
+df["V_bin"] = pd.qcut(df["VPD_kPa"], q=BG_Q, labels=["V1","V2","V3"], duplicates="drop")
+df = df.dropna(subset=["T_bin","V_bin"]).reset_index(drop=True)
+
+df["BG"] = df["T_bin"].astype(str) + "_" + df["V_bin"].astype(str)
+
+# keep only BGs we want to plot
+want_bg = set([f"{t}_{v}" for (t,v) in BG_TO_PLOT])
+df = df[df["BG"].isin(want_bg)].copy().reset_index(drop=True)
+
+if df.empty:
+    raise RuntimeError("❌ 背景分层后为空：可能是数据里 T_bin/V_bin 形成的分位不稳定或筛选过严。")
+
+print("Backgrounds kept:", sorted(df["BG"].unique().tolist()))
+
+# -----------------------
+# 3) Helper: build city×bin median table for a given X under a given BG
+#    Then overall curve = median across cities
+#    CI via bootstrap resampling cities
+# -----------------------
+def build_curve_city_bootstrap(sub, xcol, ycol=Y, n_bins=N_BINS,
+                               boot_n=BOOT_N, min_city_per_bin=MIN_CITY_PER_BIN,
+                               rng_seed=RNG_SEED):
+    """
+    Returns:
+      curve_df: columns = [bin_id, x_mid, value, lo, hi, n_city]
+      city_bin: city×bin median (for diagnostics)
+    """
+    s = sub[[CITY, xcol, ycol]].dropna().copy()
+    if s.empty:
+        return None, None
+
+    # categorical/case handling
+    is_discrete = (xcol == "LC") or pd.api.types.is_integer_dtype(s[xcol]) or (s[xcol].nunique() <= 20 and xcol == "LC")
+
+    if is_discrete:
+        # treat as categories (sorted by code)
+        s["bin"] = s[xcol].astype("Int64").astype(str)
+        # x_mid = numeric code if possible
+        # city×bin median
+        city_bin = (s.groupby([CITY, "bin"], observed=True)[ycol]
+                     .median()
+                     .reset_index())
+        # compute x_mid
+        try:
+            city_bin["x_mid"] = city_bin["bin"].astype(float)
+        except Exception:
+            city_bin["x_mid"] = np.arange(city_bin["bin"].nunique())
+
+        # overall per-bin median across cities
+        grp = city_bin.groupby("bin", observed=True)
+        value = grp[ycol].median()
+        n_city = grp[ycol].count()
+
+        # bootstrap over cities
+        cities = city_bin[CITY].astype(str).unique()
+        rng = np.random.default_rng(rng_seed)
+
+        # prepare pivot (bin×city) for fast resample
+        piv = city_bin.pivot_table(index="bin", columns=CITY, values=ycol, aggfunc="median")
+        bins = piv.index.to_list()
+
+        boots = np.full((boot_n, len(bins)), np.nan, dtype=float)
+        for b in range(boot_n):
+            samp = rng.choice(cities, size=len(cities), replace=True)
+            # median across sampled cities for each bin
+            boots[b, :] = np.nanmedian(piv[samp].to_numpy(dtype=float), axis=1)
+
+        lo = np.nanpercentile(boots, 2.5, axis=0)
+        hi = np.nanpercentile(boots, 97.5, axis=0)
+
+        out = pd.DataFrame({
+            "bin": bins,
+            "x_mid": [np.nanmedian(piv.loc[bn].index.astype(str).str.replace("nan","").astype(float, errors="ignore"))
+                      if False else np.nan for bn in bins]
+        })
+        out["x_mid"] = pd.to_numeric(out["bin"], errors="coerce")
+        out["value"] = value.reindex(bins).to_numpy()
+        out["lo"] = lo
+        out["hi"] = hi
+        out["n_city"] = n_city.reindex(bins).to_numpy()
+        # filter unstable bins
+        out = out[out["n_city"] >= min_city_per_bin].copy()
+        out = out.sort_values("x_mid").reset_index(drop=True)
+        return out, city_bin
+
+    # continuous: quantile bins
+    x = s[xcol].to_numpy(dtype=float)
+    # quantile edges
+    qs = np.linspace(0, 1, n_bins + 1)
+    edges = np.nanquantile(x, qs)
+    edges = np.unique(edges)
+    if len(edges) < 5:
+        return None, None
+
+    # assign bins
+    s["bin"] = pd.cut(s[xcol], bins=edges, include_lowest=True, labels=False)
+    s = s.dropna(subset=["bin"]).copy()
+    s["bin"] = s["bin"].astype(int)
+
+    # bin mid for x-axis
+    mids = 0.5 * (edges[:-1] + edges[1:])
+    mids = mids[: (len(edges) - 1)]
+
+    # city×bin median
+    city_bin = (s.groupby([CITY, "bin"], observed=True)[ycol]
+                 .median()
+                 .reset_index())
+    # bin-level aggregation across cities
+    grp = city_bin.groupby("bin", observed=True)[ycol]
+    value = grp.median()
+    n_city = grp.count()
+
+    # pivot for bootstrap
+    piv = city_bin.pivot_table(index="bin", columns=CITY, values=ycol, aggfunc="median")
+    bins = piv.index.to_numpy()
+    if len(bins) < 5:
+        return None, None
+
+    cities = piv.columns.astype(str).to_numpy()
+    rng = np.random.default_rng(rng_seed)
+    boots = np.full((boot_n, len(bins)), np.nan, dtype=float)
+
+    arr = piv.to_numpy(dtype=float)  # shape: [n_bins_used, n_cities]
+    # precompute city index map
+    city_to_idx = {c:i for i,c in enumerate(cities)}
+
+    for b in range(boot_n):
+        samp = rng.integers(0, len(cities), size=len(cities))  # bootstrap indices
+        boots[b, :] = np.nanmedian(arr[:, samp], axis=1)
+
+    lo = np.nanpercentile(boots, 2.5, axis=0)
+    hi = np.nanpercentile(boots, 97.5, axis=0)
+
+    out = pd.DataFrame({
+        "bin": bins,
+        "x_mid": np.array([mids[i] if i < len(mids) else np.nan for i in bins], dtype=float),
+        "value": value.reindex(bins).to_numpy(),
+        "lo": lo,
+        "hi": hi,
+        "n_city": n_city.reindex(bins).to_numpy()
+    })
+
+    # filter unstable bins
+    out = out[out["n_city"] >= min_city_per_bin].copy()
+    out = out.sort_values("x_mid").reset_index(drop=True)
+
+    return out, city_bin
+
+# -----------------------
+# 4) Run all variables under all selected backgrounds
+# -----------------------
+response = {}      # response[(bg, xcol)] = curve_df
+diagnostics = {}   # diagnostics[(bg, xcol)] = city_bin
+
+for bg in sorted(df["BG"].unique()):
+    sub_bg = df[df["BG"] == bg].copy()
+    # keep only cities with enough rows to make medians meaningful
+    # (optional; leave off to avoid dropping)
+    for xcol in FEATURES:
+        curve_df, city_bin = build_curve_city_bootstrap(sub_bg, xcol)
+        response[(bg, xcol)] = curve_df
+        diagnostics[(bg, xcol)] = city_bin
+        if curve_df is None:
+            print(f"[WARN] BG={bg} x={xcol}: insufficient data/bins")
+
+print("✅ Finished building response curves (city-median + bootstrap CI).")
+
+# -----------------------
+# 5) Plot: one figure with all subplots (13 variables)
+# -----------------------
+n_vars = len(FEATURES)
+ncols = 4
+nrows = int(math.ceil(n_vars / ncols))
+
+fig, axes = plt.subplots(nrows, ncols, figsize=(4.2*ncols, 3.4*nrows), constrained_layout=True)
+axes = np.atleast_1d(axes).reshape(nrows, ncols)
+
+bgs = sorted(df["BG"].unique())
+bg_labels = {bg: BG_NAME.get(tuple(bg.split("_")), bg) for bg in bgs}
+
+def short_name(x):
+    # nicer subplot titles
+    mapping = {
+        "DIST_WATER_km":"DistWater",
+        "WIND10M_MS":"Wind10m",
+        "SSRD_MJm2":"SSRD",
+        "SWVL1_m3m3":"SoilW",
+        "STL1_C":"SoilT",
+        "VPD_kPa":"VPD",
+        "T2M_C":"Tair",
+        "TD_C":"Tdew"
+    }
+    return mapping.get(x, x)
+
+for i, xcol in enumerate(FEATURES):
+    r, c = divmod(i, ncols)
+    ax = axes[r, c]
+    any_plotted = False
+
+    for bg in bgs:
+        curve = response.get((bg, xcol), None)
+        if curve is None or curve.empty:
+            continue
+        any_plotted = True
+
+        ax.plot(curve["x_mid"], curve["value"], marker="o", linewidth=1, label=bg_labels.get(bg, bg))
+        ax.fill_between(curve["x_mid"], curve["lo"], curve["hi"], alpha=0.18)
+
+    ax.set_title(short_name(xcol))
+    ax.set_xlabel(xcol)
+    ax.set_ylabel("CE (°C/EVI)")
+    if not any_plotted:
+        ax.text(0.5, 0.5, "insufficient", ha="center", va="center", transform=ax.transAxes)
+    ax.grid(False)
+
+# turn off unused axes
+for j in range(n_vars, nrows*ncols):
+    r, c = divmod(j, ncols)
+    axes[r, c].axis("off")
+
+# legend (one for whole figure)
+handles, labels = axes[0,0].get_legend_handles_labels()
+if handles:
+    fig.legend(handles, labels, loc="lower center", ncol=min(3, len(labels)), frameon=False)
+
+fig.suptitle("Background-conditioned nonlinear response curves: cooling efficiency vs drivers\n(city-median curves; bootstrap 95% CI over cities)", fontsize=14)
+plt.show()
+
+# -----------------------
+# 6) Output “result parameters” + key tables for later analysis
+# -----------------------
+# Pack useful meta for methods/log
+result_params = {
+    "rows_summer_used": int(len(df)),
+    "cities_used": int(df[CITY].nunique()),
+    "year_range": (int(df["Year"].min()), int(df["Year"].max())),
+    "baseline_years": BASELINE_YEARS,
+    "summer_definition": f"City-specific top-{TOPK_HOT_MONTHS} hottest months (baseline {BASELINE_YEARS[0]}–{BASELINE_YEARS[1]}, by T2M_C)",
+    "background_definition": "T2M_C terciles × VPD_kPa terciles within summer; plotting (T1V1, T2V2, T3V3)",
+    "backgrounds_plotted": {bg: bg_labels.get(bg, bg) for bg in bgs},
+    "n_bins_continuous": N_BINS,
+    "min_city_per_bin": MIN_CITY_PER_BIN,
+    "bootstrap_n": BOOT_N,
+    "per_city_sampling": bool(ENABLE_CITY_SAMPLING),
+    "max_rows_per_city": int(MAX_ROWS_PER_CITY) if ENABLE_CITY_SAMPLING else None,
+    "features": FEATURES
+}
+
+print("\n=== Result parameters (save to log/methods) ===")
+for k,v in result_params.items():
+    print(f"{k}: {v}")
+
+# Build a compact summary table: for each (bg, x), report peak-to-peak range and slope proxy
+summary_rows = []
+for bg in bgs:
+    for xcol in FEATURES:
+        curve = response.get((bg, xcol), None)
+        if curve is None or curve.empty:
+            continue
+        yv = curve["value"].to_numpy(dtype=float)
+        xv = curve["x_mid"].to_numpy(dtype=float)
+        if len(yv) >= 5 and np.isfinite(yv).any():
+            amp = float(np.nanmax(yv) - np.nanmin(yv))
+            # simple trend proxy: corr(x,y) (not causal; just a descriptor)
+            ok = np.isfinite(xv) & np.isfinite(yv)
+            corr = float(np.corrcoef(xv[ok], yv[ok])[0,1]) if ok.sum() >= 5 else np.nan
+        else:
+            amp, corr = np.nan, np.nan
+        summary_rows.append({
+            "BG": bg,
+            "BG_label": bg_labels.get(bg, bg),
+            "X": xcol,
+            "amp_range": amp,
+            "corr_x_y": corr,
+            "bins_used": int(len(curve))
+        })
+
+summary = pd.DataFrame(summary_rows).sort_values(["BG","amp_range"], ascending=[True, False]).reset_index(drop=True)
+print("\n=== Nonlinearity/variation summary (bigger amp_range => stronger nonlinear variation) ===")
+print(summary.head(30).to_string(index=False))
+
+# Save outputs to globals for your next steps
+# - response: dict of curve tables (with x_mid, value, lo, hi, n_city)
+# - diagnostics: dict of city×bin medians (optional deep dive)
+# - result_params: methods/log
+# - summary: quick ranking table
+print("\n✅ Saved variables:")
+print(" - response[(BG, feature)] -> curve DataFrame")
+print(" - diagnostics[(BG, feature)] -> city×bin median DataFrame")
+print(" - result_params, summary")
+
+
+# ============================================================
+# NEXT STEP (critical upgrade):
+# Fix background bins using BASELINE thresholds (2002–2006),
+# then re-run yearly decomposition:
+#   P(active)_y = Σ_bg p_bg(y) * p_active_bg(y)
+# and attribute ΔP into:
+#   composition (bg share change) + within-bg (activation change)
+#
+# ✅ Fast: operates mostly on city-year tables (not row-level)
+# ✅ Uses your existing setup: city-specific "summer" = hottest-3 months
+#    defined from baseline 2002–2006 by T2M_C
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# -------------------------
+# Config (edit if needed)
+# -------------------------
+CITY   = "city"
+DATE   = "date"
+CE     = "cooling_efficiency"   # you already computed
+T2M    = "T2M_C"
+VPD    = "VPD_kPa"
+SSRD   = "SSRD_MJm2"
+
+BASELINE = (2002, 2006)
+PERIOD_A = (2002, 2006)
+PERIOD_B = (2019, 2025)
+
+# active threshold: city baseline summer Q60
+ACTIVE_Q = 0.60
+
+# background bins: 3×3 using BASELINE SUMMER thresholds
+Q_BG = (1/3, 2/3)  # terciles
+
+# speed controls
+MAX_ROWS_PER_CITY = 120000     # keep as before; 0/None means no cap
+BOOT_N = 300                   # quick CI; raise if needed
+RNG_SEED = 42
+
+# -------------------------
+# 0) Load minimal columns
+# -------------------------
+assert "dataset" in globals(), "❌ No dataset in globals()"
+
+need_cols = [CITY, DATE, CE, T2M, VPD, SSRD]
+miss = [c for c in need_cols if c not in dataset.columns]
+if miss:
+    raise ValueError(f"❌ dataset missing columns: {miss}")
+
+df = dataset[need_cols].copy()
+df[DATE] = pd.to_datetime(df[DATE], errors="coerce")
+df = df.dropna(subset=[CITY, DATE, CE, T2M, VPD, SSRD]).reset_index(drop=True)
+
+df["Year"]  = df[DATE].dt.year.astype(np.int16)
+df["Month"] = df[DATE].dt.month.astype(np.int8)
+
+# optional per-city cap (keeps distribution OK but speeds)
+df[CITY] = df[CITY].astype("category")
+if MAX_ROWS_PER_CITY and MAX_ROWS_PER_CITY > 0:
+    # sample per city (stable)
+    rs = np.random.RandomState(RNG_SEED)
+    out_parts = []
+    for c, g in df.groupby(CITY, observed=True):
+        if len(g) > MAX_ROWS_PER_CITY:
+            idx = rs.choice(g.index.to_numpy(), size=MAX_ROWS_PER_CITY, replace=False)
+            out_parts.append(df.loc[idx])
+        else:
+            out_parts.append(g)
+    df = pd.concat(out_parts, axis=0, ignore_index=True)
+    df[CITY] = df[CITY].astype("category")
+
+print(f"Rows(raw used): {len(df)} | Cities: {df[CITY].nunique()} | Year range: {df['Year'].min()}–{df['Year'].max()}")
+
+# -------------------------
+# 1) City-specific summer definition:
+#    hottest-3 months from BASELINE by T2M_C
+# -------------------------
+base = df[(df["Year"] >= BASELINE[0]) & (df["Year"] <= BASELINE[1])].copy()
+if base.empty:
+    raise RuntimeError("❌ Baseline slice is empty. Check BASELINE years and data coverage.")
+
+# For each city-month in baseline: mean T2M
+cm = (base
+      .groupby([CITY, "Month"], observed=True)[T2M]
+      .mean()
+      .reset_index()
+      .sort_values([CITY, T2M], ascending=[True, False]))
+
+# pick top-3 months per city
+top3 = (cm.groupby(CITY, observed=True)
+          .head(3)
+          .groupby(CITY, observed=True)["Month"]
+          .apply(lambda x: sorted(x.tolist()))
+          .to_dict())
+
+# annotate summer rows
+def _is_summer_city(row):
+    return row["Month"] in top3.get(row[CITY], [])
+
+# fast map: build city->set
+top3_set = {k: set(v) for k, v in top3.items()}
+df["is_summer"] = df.apply(lambda r: r["Month"] in top3_set.get(r[CITY], set()), axis=1)
+
+summer = df[df["is_summer"]].copy()
+if summer.empty:
+    raise RuntimeError("❌ Summer data is empty after city-specific top-3 months filtering.")
+
+print(f"Rows(summer): {len(summer)} | Cities: {summer[CITY].nunique()}")
+print("Summer definition: City-specific top-3 hottest months (baseline %d–%d, by %s)" % (BASELINE[0], BASELINE[1], T2M))
+
+# -------------------------
+# 2) Define ACTIVE using city baseline summer Q60
+# -------------------------
+base_summer = summer[(summer["Year"] >= BASELINE[0]) & (summer["Year"] <= BASELINE[1])].copy()
+if base_summer.empty:
+    raise RuntimeError("❌ Baseline summer is empty. Check baseline years and summer definition.")
+
+city_q = (base_summer.groupby(CITY, observed=True)[CE]
+          .quantile(ACTIVE_Q)
+          .rename("CE_thr")
+          .reset_index())
+
+summer = summer.merge(city_q, on=CITY, how="left")
+summer["active"] = (summer[CE] > summer["CE_thr"]).astype(np.int8)
+
+# -------------------------
+# 3) FIXED background bins using BASELINE SUMMER thresholds (global)
+#    (this is the key upgrade vs "yearly qcut")
+# -------------------------
+vpd_base = base_summer[VPD].to_numpy(dtype=float)
+ssrd_base = base_summer[SSRD].to_numpy(dtype=float)
+
+vpd_cuts = np.nanquantile(vpd_base[np.isfinite(vpd_base)], Q_BG)
+ssrd_cuts = np.nanquantile(ssrd_base[np.isfinite(ssrd_base)], Q_BG)
+
+# bins: 1..3
+def _bin3(x, cuts):
+    # cuts = [q33, q66]
+    return np.where(x <= cuts[0], 1, np.where(x <= cuts[1], 2, 3))
+
+summer["V_bin"] = _bin3(summer[VPD].to_numpy(dtype=float), vpd_cuts).astype(np.int8)
+summer["S_bin"] = _bin3(summer[SSRD].to_numpy(dtype=float), ssrd_cuts).astype(np.int8)
+summer["BG"] = ("S" + summer["S_bin"].astype(str) + "_V" + summer["V_bin"].astype(str)).astype("category")
+
+bg_list = ["S1_V1","S1_V2","S1_V3","S2_V1","S2_V2","S2_V3","S3_V1","S3_V2","S3_V3"]
+summer["BG"] = summer["BG"].cat.set_categories(bg_list)
+
+print("Fixed background bins (baseline thresholds):")
+print(f"  VPD terciles cuts: {vpd_cuts[0]:.3g}, {vpd_cuts[1]:.3g}")
+print(f"  SSRD terciles cuts: {ssrd_cuts[0]:.3g}, {ssrd_cuts[1]:.3g}")
+print("Background cells:", summer["BG"].nunique(), "|", list(summer["BG"].cat.categories))
+
+# -------------------------
+# 4) Build city-year-bg table:
+#    p_bg(y,c,bg) and p_active_bg(y,c,bg)
+# -------------------------
+# counts per city-year
+cy_n = (summer.groupby([CITY, "Year"], observed=True)
+              .size()
+              .rename("n_total")
+              .reset_index())
+
+# counts per city-year-bg + active mean
+cybg = (summer.groupby([CITY, "Year", "BG"], observed=True)
+              .agg(n_bg=("active", "size"),
+                   p_active_bg=("active", "mean"))
+              .reset_index())
+
+cybg = cybg.merge(cy_n, on=[CITY, "Year"], how="left")
+cybg["p_bg"] = (cybg["n_bg"] / cybg["n_total"]).astype(np.float32)
+cybg["contrib"] = (cybg["p_bg"] * cybg["p_active_bg"]).astype(np.float32)
+
+# city-year overall P(active) (from decomposition identity)
+cy_active = (cybg.groupby([CITY, "Year"], observed=True)["contrib"]
+                .sum()
+                .rename("p_active")
+                .reset_index())
+
+# keep only years where ALL cities exist if you want perfectly balanced trend:
+# (but with fixed bins, coverage should be much better if data exist)
+year_cov = cy_active.groupby("Year")["p_active"].count()
+print("\nYear coverage (#cities contributing):")
+print(year_cov.to_string())
+
+# -------------------------
+# 5) Year-level trends + bootstrap CI (resample cities)
+#    P(active)_y = mean over cities of city-year p_active
+# -------------------------
+rng = np.random.default_rng(RNG_SEED)
+cities = cy_active[CITY].cat.categories.tolist() if hasattr(cy_active[CITY], "cat") else sorted(cy_active[CITY].unique())
+years = sorted(cy_active["Year"].unique())
+
+# pivot city×year
+pv = cy_active.pivot_table(index="Year", columns=CITY, values="p_active", aggfunc="mean", observed=True).reindex(years)
+
+# city-mean per year
+trend = pd.DataFrame({"Year": years})
+trend["mean"] = pv.mean(axis=1, skipna=True).to_numpy()
+
+# bootstrap CI across cities
+boot_means = []
+city_cols = pv.columns.to_list()
+pv_np = pv.to_numpy(dtype=float)  # shape (Y, C)
+for b in range(BOOT_N):
+    sel = rng.integers(0, len(city_cols), size=len(city_cols))
+    m = np.nanmean(pv_np[:, sel], axis=1)
+    boot_means.append(m)
+boot = np.vstack(boot_means)  # (B, Y)
+trend["lo"] = np.nanpercentile(boot, 2.5, axis=0)
+trend["hi"] = np.nanpercentile(boot, 97.5, axis=0)
+trend["n_city"] = pv.count(axis=1).to_numpy()
+
+# -------------------------
+# 6) Decomposition over time (year×BG, averaged over cities)
+#    p_bg(y,bg) = mean_c p_bg(c,y,bg)
+#    p_active_bg(y,bg) = mean_c p_active_bg(c,y,bg)
+# -------------------------
+# make wide helper tables (year×BG)
+pbg = (cybg.groupby(["Year","BG"], observed=True)["p_bg"].mean().reset_index()
+          .pivot(index="Year", columns="BG", values="p_bg").reindex(years).fillna(0.0))
+pact = (cybg.groupby(["Year","BG"], observed=True)["p_active_bg"].mean().reset_index()
+           .pivot(index="Year", columns="BG", values="p_active_bg").reindex(years))
+
+contrib = (pbg * pact)  # year×BG
+trend_bg = contrib.sum(axis=1)
+
+# -------------------------
+# 7) Two-period attribution (composition vs within-bg)
+#    Using baseline-fixed bins, composition SHOULD now be meaningful.
+# -------------------------
+def _period_mean(table_year_bg, y0, y1):
+    sub = table_year_bg.loc[(table_year_bg.index >= y0) & (table_year_bg.index <= y1)]
+    return sub.mean(axis=0)
+
+pbg_A  = _period_mean(pbg,  PERIOD_A[0], PERIOD_A[1])
+pbg_B  = _period_mean(pbg,  PERIOD_B[0], PERIOD_B[1])
+pact_A = _period_mean(pact, PERIOD_A[0], PERIOD_A[1])
+pact_B = _period_mean(pact, PERIOD_B[0], PERIOD_B[1])
+
+P_A = float(np.nansum(pbg_A * pact_A))
+P_B = float(np.nansum(pbg_B * pact_B))
+dP  = P_B - P_A
+
+# Oaxaca-like split (A as reference)
+comp = float(np.nansum((pbg_B - pbg_A) * pact_A))
+within = float(np.nansum(pbg_B * (pact_B - pact_A)))
+
+print("\n=== Two-period attribution (baseline-fixed BG bins) ===")
+print("Period A:", PERIOD_A, "P(active)=", P_A)
+print("Period B:", PERIOD_B, "P(active)=", P_B)
+print("ΔP =", dP)
+print("composition =", comp, "| within-bg =", within, "| sum =", comp + within)
+
+# -------------------------
+# 8) Plots (simple, fast)
+# -------------------------
+plt.figure(figsize=(10,4))
+plt.plot(trend["Year"], trend["mean"], marker="o", linewidth=1.5)
+plt.fill_between(trend["Year"], trend["lo"], trend["hi"], alpha=0.25)
+plt.xlabel("Year")
+plt.ylabel("P(active cooling)")
+plt.title("Global summer P(active cooling) by year (city-mean) with bootstrap 95% CI")
+plt.tight_layout()
+plt.show()
+
+# stacked area: p_bg(y)
+plt.figure(figsize=(11,4.5))
+plt.stackplot(pbg.index, [pbg[c].to_numpy() for c in pbg.columns], labels=pbg.columns)
+plt.xlabel("Year")
+plt.ylabel("Background share p_bg")
+plt.title("Background composition by year (baseline-fixed bins)")
+plt.legend(ncol=3, frameon=False, fontsize=9)
+plt.tight_layout()
+plt.show()
+
+# within-bg activation p_active_bg(y)
+plt.figure(figsize=(11,4.5))
+for c in pact.columns:
+    plt.plot(pact.index, pact[c].to_numpy(), linewidth=1.2, label=c)
+plt.xlabel("Year")
+plt.ylabel("P(active | BG)")
+plt.title("Within-background activation probability by year")
+plt.legend(ncol=3, frameon=False, fontsize=9)
+plt.tight_layout()
+plt.show()
+
+# contribution per BG (p_bg * p_active_bg)
+plt.figure(figsize=(11,4.5))
+plt.stackplot(contrib.index, [contrib[c].to_numpy() for c in contrib.columns], labels=contrib.columns)
+plt.xlabel("Year")
+plt.ylabel("Contribution to P(active)")
+plt.title("Decomposition: Σ_bg p_bg * p_active_bg (stacked contributions)")
+plt.legend(ncol=3, frameon=False, fontsize=9)
+plt.tight_layout()
+plt.show()
+
+# -------------------------
+# 9) Outputs for downstream analysis
+# -------------------------
+result_params = dict(
+    baseline_years=BASELINE,
+    summer_definition="City-specific top-3 hottest months (baseline by T2M_C)",
+    active_definition=f"active = 1(CE > city baseline summer Q{int(ACTIVE_Q*100)})",
+    bg_definition="SSRD×VPD terciles using BASELINE SUMMER thresholds (fixed over time)",
+    vpd_cuts=vpd_cuts.tolist(),
+    ssrd_cuts=ssrd_cuts.tolist(),
+    period_A=PERIOD_A,
+    period_B=PERIOD_B,
+    deltaP=dP,
+    composition=comp,
+    within_bg=within,
+    bootstrap_n=BOOT_N,
+    max_rows_per_city=MAX_ROWS_PER_CITY
+)
+
+print("\n✅ Saved variables:")
+print(" - summer (row-level summer with active + BG)")
+print(" - cybg (city-year-bg table: p_bg, p_active_bg, contrib)")
+print(" - cy_active (city-year overall p_active)")
+print(" - trend (yearly global mean+CI)")
+print(" - pbg, pact, contrib (year×BG wide tables)")
+print(" - result_params (for methods/log)")
+
+# expose to globals
+summer2 = summer
+decomp = cybg
+trend_overall = trend
+pbg_w, pact_w, contrib_w = pbg, pact, contrib
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# Pretty 2-panel figure (max 2 subplots), based on existing outputs
+# Panel A: Global summer P(active cooling) by year + bootstrap 95% CI
+# Panel B: Decomposition contributions stacked by VPD demand level
+# Legend OUTSIDE, FULL NAMES (no abbreviations)
+# ============================================================
+
+# -------------------------
+# 0) Require existing results
+# -------------------------
+# Expect you already have (from your previous run):
+# - trend : DataFrame with columns ["Year","mean","lo","hi"]  (global P(active))
+# - cybg  : DataFrame with ["Year","BG","contrib"] at least (city-year-bg aggregated)
+# OR you have contrib (wide year×BG table)
+
+need_any = ("trend" in globals()) and (("cybg" in globals()) or ("contrib" in globals()))
+assert need_any, "❌ Need existing variables: `trend` and (`cybg` or `contrib`). Run the attribution step first."
+
+trend_df = trend.copy()
+if "Year" not in trend_df.columns:
+    raise ValueError("❌ `trend` must contain a `Year` column.")
+for c in ["mean", "lo", "hi"]:
+    if c not in trend_df.columns:
+        raise ValueError("❌ `trend` must contain columns: mean, lo, hi.")
+
+trend_df = trend_df.sort_values("Year").reset_index(drop=True)
+
+# -------------------------
+# 1) Build contrib_wide: Year × BG
+# -------------------------
+if "contrib" in globals():
+    # contrib is expected to be a wide table: index=Year, columns=BG
+    contrib_wide = contrib.copy()
+    if isinstance(contrib_wide, pd.DataFrame) and ("Year" in contrib_wide.columns):
+        # if it's long but includes Year column, pivot it
+        if "BG" in contrib_wide.columns and "contrib" in contrib_wide.columns:
+            contrib_wide = contrib_wide.pivot_table(index="Year", columns="BG", values="contrib", aggfunc="sum").fillna(0.0)
+        else:
+            contrib_wide = contrib_wide.set_index("Year")
+    else:
+        # assume Year is already index
+        pass
+else:
+    # build from cybg long table
+    cybg_df = cybg.copy()
+    for c in ["Year", "BG", "contrib"]:
+        if c not in cybg_df.columns:
+            raise ValueError("❌ `cybg` must contain columns: Year, BG, contrib.")
+    contrib_wide = (
+        cybg_df.pivot_table(index="Year", columns="BG", values="contrib", aggfunc="sum")
+        .fillna(0.0)
+        .sort_index()
+    )
+
+# align years to trend years (balanced years)
+years = trend_df["Year"].to_numpy()
+contrib_wide = contrib_wide.reindex(years).fillna(0.0)
+
+# -------------------------
+# 2) Parse BG labels and aggregate to 3 VPD-demand groups
+# BG codes look like: "S1_V1" ... "S3_V3"
+# We'll sum across SSRD levels, keep VPD levels (Low/Medium/High).
+# This is readable and preserves total contribution.
+# -------------------------
+def vpd_level_from_bg(bg: str):
+    # bg like "S2_V3" -> "V3"
+    try:
+        v = bg.split("_")[1]  # "V3"
+        return v
+    except Exception:
+        return None
+
+bg_cols = list(contrib_wide.columns)
+v_levels = [vpd_level_from_bg(b) for b in bg_cols]
+
+# map to full names (no abbreviations)
+VPD_FULL = {
+    "V1": "Low atmospheric demand (low vapor pressure deficit)",
+    "V2": "Moderate atmospheric demand (medium vapor pressure deficit)",
+    "V3": "High atmospheric demand (high vapor pressure deficit)",
+}
+
+# Build grouped contributions
+group_names = [VPD_FULL["V1"], VPD_FULL["V2"], VPD_FULL["V3"]]
+grouped = pd.DataFrame({"Year": years})
+for v_code, full_name in VPD_FULL.items():
+    use_bgs = [b for b in bg_cols if vpd_level_from_bg(b) == v_code]
+    if len(use_bgs) == 0:
+        grouped[full_name] = 0.0
+    else:
+        grouped[full_name] = contrib_wide[use_bgs].sum(axis=1).to_numpy(dtype=float)
+
+# -------------------------
+# 3) Make one clean 2-panel figure
+# -------------------------
+plt.rcParams.update({
+    "font.size": 11,
+    "axes.titlesize": 13,
+    "axes.labelsize": 11,
+})
+
+fig, (ax1, ax2) = plt.subplots(
+    1, 2, figsize=(13.2, 4.6),
+    gridspec_kw={"width_ratios": [1.05, 1.15]},
+    constrained_layout=True
+)
+
+# ---- Panel A: Global P(active) + CI
+ax1.plot(trend_df["Year"], trend_df["mean"], marker="o", linewidth=2)
+ax1.fill_between(trend_df["Year"], trend_df["lo"], trend_df["hi"], alpha=0.22)
+ax1.set_title("Global summer probability of effective cooling\n(city-mean with bootstrap 95% confidence interval)")
+ax1.set_xlabel("Year")
+ax1.set_ylabel("Probability of effective cooling")
+
+# optional: gentle grid
+ax1.grid(True, axis="y", alpha=0.25)
+
+# ---- Panel B: Stacked contributions by VPD-demand group
+x = grouped["Year"].to_numpy()
+y1 = grouped[group_names[0]].to_numpy()
+y2 = grouped[group_names[1]].to_numpy()
+y3 = grouped[group_names[2]].to_numpy()
+
+ax2.stackplot(
+    x, y1, y2, y3,
+    labels=group_names,
+    alpha=0.92
+)
+ax2.set_title("Decomposition of effective-cooling probability\n(contributions grouped by atmospheric demand)")
+ax2.set_xlabel("Year")
+ax2.set_ylabel("Contribution to probability of effective cooling")
+ax2.grid(True, axis="y", alpha=0.25)
+
+# Put legend OUTSIDE (right side of panel B)
+ax2.legend(
+    loc="center left",
+    bbox_to_anchor=(1.02, 0.5),
+    frameon=False,
+    title="Background groups (full names)"
+)
+
+# ---- Optional: make y-limits comparable / tidy
+# (Panel B max should match Panel A mean scale; but contributions can exceed mean if you used different aggregation.
+# Here, contributions should sum to P(active).)
+ax2.set_ylim(0, max(0.01, float(np.nanmax(y1 + y2 + y3)) * 1.05))
+
+plt.show()
+
+# -------------------------
+# 4) Save compact result tables for your follow-up analysis
+# -------------------------
+# A) Trend table
+trend_out = trend_df[["Year","mean","lo","hi"]].copy()
+trend_out = trend_out.rename(columns={
+    "mean": "P_active_mean",
+    "lo": "P_active_lo95",
+    "hi": "P_active_hi95"
+})
+
+# B) Grouped contribution table (so you can compute deltas, shares, etc.)
+contrib_out = grouped.copy()
+contrib_out = contrib_out.rename(columns={
+    group_names[0]: "Contrib_low_demand",
+    group_names[1]: "Contrib_moderate_demand",
+    group_names[2]: "Contrib_high_demand",
+})
+contrib_out["Contrib_total"] = (
+    contrib_out["Contrib_low_demand"] +
+    contrib_out["Contrib_moderate_demand"] +
+    contrib_out["Contrib_high_demand"]
+)
+
+print("\n✅ Saved tables for analysis:")
+print(" - trend_out: yearly P(active) mean + 95% CI")
+print(" - contrib_out: yearly decomposition contributions by demand group (and total)")
+print("\ntrend_out (head):")
+print(trend_out.head(10).to_string(index=False))
+print("\ncontrib_out (head):")
+print(contrib_out.head(10).to_string(index=False))
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# Module A (Mechanism):  threshold(EVI) = g(VPD, SSRD)
+# ------------------------------------------------------------
+# 思路（高效、可复现、可解释）：
+# 1) 城市自适应夏季：用基线期(2002–2006)每城 T2M_C 最热的3个月定义“夏季月”
+# 2) “有效冷却状态”(active)：active = 1(CE > 城市基线夏季CE的Q60)
+# 3) 在夏季样本中，将背景(VPD,SSRD)离散成网格(如 10×10)，对每个网格计算：
+#    - P(active | EVI bin) 曲线
+#    - EVI阈值：使 P(active) >= p0 (默认0.5) 的最小EVI（线性插值）
+# 4) 城市bootstrap 得到阈值的 95% CI（对城市重采样，避免像元/时间相关导致虚假CI）
+# 5) 输出：threshold_grid + 一张好读的热力图（阈值随VPD/SSRD变化）
+# ============================================================
+
+# =========================
+# Config (你可以按需要改)
+# =========================
+CITY = "city"
+DATE = "date"
+
+EVI  = "EVI"
+CE   = "cooling_efficiency"
+
+VPD  = "VPD_kPa"
+SSRD = "SSRD_MJm2"
+T2M  = "T2M_C"
+
+BASELINE = (2002, 2006)     # 用于定义夏季月 & active阈值
+SUMMER_TOPK_MONTHS = 3      # 每城最热K个月作为夏季
+CE_Q_ACTIVE = 0.60          # active: CE > city baseline summer Q60
+
+# 背景网格（越大越细，但越慢）
+N_BINS_VPD  = 10
+N_BINS_SSRD = 10
+
+# EVI 内部分箱（用于P(active|EVI)曲线）
+N_BINS_EVI = 20
+P0 = 0.50                   # 阈值定义：P(active)达到P0的EVI
+MIN_CITY_PER_CELL = 10      # 每个(VPD,SSRD)格子至少多少城市才计算阈值（稳健）
+MIN_SAMPLES_PER_EVI_BIN = 200  # 每个EVI bin最少样本（避免噪声）
+
+# 数据量很大：按城市抽样上限（加速，不影响“城市-背景-阈值”总体模式）
+PER_CITY_CAP = 120_000
+RNG_SEED = 42
+
+# Bootstrap（城市层面）
+BOOT_N = 200                # 想更稳可设 300-600，但会更慢
+CI_Q = (0.025, 0.975)
+
+# 绘图
+PLOT = True
+
+# =========================
+# 0) Load + minimal columns
+# =========================
+assert "dataset" in globals(), "❌ 没有 dataset"
+
+need_cols = [CITY, DATE, EVI, CE, VPD, SSRD, T2M]
+miss = [c for c in need_cols if c not in dataset.columns]
+if miss:
+    raise ValueError(f"❌ dataset 缺少列：{miss}")
+
+df = dataset[need_cols].copy()
+df[DATE] = pd.to_datetime(df[DATE], errors="coerce")
+
+# drop NA (核心列)
+df = df.dropna(subset=[CITY, DATE, EVI, CE, VPD, SSRD, T2M]).reset_index(drop=True)
+
+# 压缩类型（省内存）
+df[CITY] = df[CITY].astype("category")
+for c in [EVI, CE, VPD, SSRD, T2M]:
+    df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32)
+df = df.dropna(subset=[EVI, CE, VPD, SSRD, T2M]).reset_index(drop=True)
+
+df["Year"]  = df[DATE].dt.year.astype(np.int16)
+df["Month"] = df[DATE].dt.month.astype(np.int8)
+
+print(f"Rows(raw): {len(df)} | Cities: {df[CITY].nunique()} | Year range: {df['Year'].min()}–{df['Year'].max()}")
+
+# =========================
+# 1) Per-city cap (speed)
+# =========================
+rng = np.random.default_rng(RNG_SEED)
+
+if PER_CITY_CAP is not None and PER_CITY_CAP > 0:
+    chunks = []
+    # observed=True 避免产生全组合
+    for c, g in df.groupby(CITY, observed=True):
+        if len(g) > PER_CITY_CAP:
+            idx = rng.choice(g.index.to_numpy(), size=PER_CITY_CAP, replace=False)
+            chunks.append(df.loc[idx])
+        else:
+            chunks.append(g)
+    df = pd.concat(chunks, axis=0, ignore_index=True)
+    del chunks
+
+print(f"After per-city cap: {len(df)}")
+
+# =========================
+# 2) City-specific summer months (baseline hottest 3 months by T2M)
+# =========================
+by = df[(df["Year"] >= BASELINE[0]) & (df["Year"] <= BASELINE[1])].copy()
+if by.empty:
+    raise RuntimeError("❌ 基线期数据为空：检查 BASELINE 与 Year")
+
+# 每城每月平均气温（基线期）
+mstat = (
+    by.groupby([CITY, "Month"], observed=True)[T2M]
+      .mean()
+      .reset_index()
+)
+
+# 对每城选择最热K个月
+mstat = mstat.sort_values([CITY, T2M], ascending=[True, False])
+topm = mstat.groupby(CITY, observed=True).head(SUMMER_TOPK_MONTHS)
+city2summer = topm.groupby(CITY, observed=True)["Month"].apply(lambda x: sorted(x.astype(int).tolist())).to_dict()
+
+# 标记夏季
+df["is_summer"] = df.apply(lambda r: int(r["Month"] in city2summer.get(r[CITY], [])), axis=1).astype(np.int8)
+summer = df[df["is_summer"] == 1].copy()
+if summer.empty:
+    raise RuntimeError("❌ 夏季样本为空：检查 summer month 定义")
+
+print(f"Rows(summer): {len(summer)} | Cities: {summer[CITY].nunique()}")
+print("Summer definition:", f"City-specific top-{SUMMER_TOPK_MONTHS} hottest months (baseline {BASELINE[0]}–{BASELINE[1]}, by {T2M})")
+
+# =========================
+# 3) active = 1(CE > city baseline summer Q60)
+# =========================
+base_summer = summer[(summer["Year"] >= BASELINE[0]) & (summer["Year"] <= BASELINE[1])].copy()
+if base_summer.empty:
+    raise RuntimeError("❌ 基线期夏季样本为空：检查 BASELINE 或 summer month")
+
+# 每城阈值
+city_thr = (
+    base_summer.groupby(CITY, observed=True)[CE]
+    .quantile(CE_Q_ACTIVE)
+    .astype(np.float32)
+)
+
+summer["ce_thr_city"] = summer[CITY].map(city_thr).astype(np.float32)
+summer = summer.dropna(subset=["ce_thr_city"]).reset_index(drop=True)
+summer["active"] = (summer[CE] > summer["ce_thr_city"]).astype(np.int8)
+
+# =========================
+# 4) Fixed background bins (use baseline thresholds for stability)
+# =========================
+# 用基线夏季来定 VPD/SSRD 分箱阈值（固定cut，避免“箱子在时间里漂移”）
+vpd_cuts  = np.nanquantile(base_summer[VPD].to_numpy(),  np.linspace(0, 1, N_BINS_VPD + 1)[1:-1])
+ssrd_cuts = np.nanquantile(base_summer[SSRD].to_numpy(), np.linspace(0, 1, N_BINS_SSRD + 1)[1:-1])
+
+def digitize_bins(x, cuts):
+    # returns 0..nbins-1
+    return np.digitize(x, cuts, right=False)
+
+summer["b_vpd"]  = digitize_bins(summer[VPD].to_numpy(),  vpd_cuts).astype(np.int16)
+summer["b_ssrd"] = digitize_bins(summer[SSRD].to_numpy(), ssrd_cuts).astype(np.int16)
+
+# bin midpoints（用于可视化坐标）
+def bin_midpoints(cuts, x_all):
+    # edges: [-inf, cuts..., +inf] -> we approximate with data min/max
+    xmin = float(np.nanmin(x_all))
+    xmax = float(np.nanmax(x_all))
+    edges = np.concatenate([[xmin], np.asarray(cuts, dtype=float), [xmax]])
+    mids = (edges[:-1] + edges[1:]) / 2.0
+    return mids.astype(np.float32)
+
+vpd_mids  = bin_midpoints(vpd_cuts,  base_summer[VPD].to_numpy())
+ssrd_mids = bin_midpoints(ssrd_cuts, base_summer[SSRD].to_numpy())
+
+# =========================
+# 5) Core: estimate EVI threshold per (VPDbin, SSRDbin)
+# =========================
+def evi_threshold_from_curve(evi_centers, p_active, p0=0.5):
+    """
+    given monotonic-ish curve p_active(EVI), find smallest EVI where p>=p0
+    linear interpolate between two neighboring points around crossing
+    """
+    ok = np.isfinite(evi_centers) & np.isfinite(p_active)
+    x = evi_centers[ok]
+    y = p_active[ok]
+    if len(x) < 4:
+        return np.nan
+    # ensure sorted
+    ord_ = np.argsort(x)
+    x = x[ord_]; y = y[ord_]
+    # crossing
+    above = y >= p0
+    if not np.any(above):
+        return np.nan
+    j = int(np.argmax(above))  # first True
+    if j == 0:
+        return float(x[0])
+    x0, y0 = float(x[j-1]), float(y[j-1])
+    x1, y1 = float(x[j]),   float(y[j])
+    if y1 == y0:
+        return float(x1)
+    # linear interp
+    t = (p0 - y0) / (y1 - y0)
+    return float(x0 + t * (x1 - x0))
+
+def compute_threshold_grid(data, p0=P0):
+    """
+    data: summer row-level with cols [CITY, EVI, active, b_vpd, b_ssrd]
+    returns DataFrame for each cell with evi_thr and diagnostics
+    """
+    out_rows = []
+    # iterate over background cells
+    for bv in range(N_BINS_VPD):
+        sub_v = data[data["b_vpd"] == bv]
+        if sub_v.empty:
+            continue
+        for bs in range(N_BINS_SSRD):
+            sub = sub_v[sub_v["b_ssrd"] == bs]
+            if sub.empty:
+                continue
+
+            # 城市覆盖：至少 MIN_CITY_PER_CELL
+            n_city = sub[CITY].nunique()
+            if n_city < MIN_CITY_PER_CELL:
+                continue
+
+            # EVI 分箱：用该cell内部的分位数边界（更均匀）
+            x = sub[EVI].to_numpy(dtype=np.float32)
+            y = sub["active"].to_numpy(dtype=np.int8)
+
+            # 去掉极端/异常：可选裁剪到 1–99%（减少噪声）
+            q1, q99 = np.nanquantile(x, [0.01, 0.99])
+            m = (x >= q1) & (x <= q99) & np.isfinite(x)
+            x = x[m]; y = y[m]
+            if x.size < (N_BINS_EVI * MIN_SAMPLES_PER_EVI_BIN):
+                # 不强制，但太少会很抖
+                pass
+
+            # 分位边界 -> bins
+            edges = np.nanquantile(x, np.linspace(0, 1, N_BINS_EVI + 1))
+            edges = np.unique(edges)
+            if edges.size < 6:
+                continue
+
+            # digitize
+            b = np.digitize(x, edges[1:-1], right=False)
+
+            # 每个EVI bin的中心 + P(active)
+            p_list = []
+            xc_list = []
+            n_list = []
+
+            for k in range(edges.size - 1):
+                sel = (b == k)
+                nk = int(sel.sum())
+                if nk < MIN_SAMPLES_PER_EVI_BIN:
+                    continue
+                xc = float(np.nanmedian(x[sel]))
+                pk = float(np.mean(y[sel]))
+                xc_list.append(xc); p_list.append(pk); n_list.append(nk)
+
+            if len(xc_list) < 5:
+                continue
+
+            xc_arr = np.array(xc_list, dtype=float)
+            p_arr  = np.array(p_list,  dtype=float)
+
+            thr = evi_threshold_from_curve(xc_arr, p_arr, p0=p0)
+
+            out_rows.append({
+                "b_vpd": bv,
+                "b_ssrd": bs,
+                "VPD_mid": float(vpd_mids[bv]),
+                "SSRD_mid": float(ssrd_mids[bs]),
+                "evi_thr": thr,
+                "n_city": int(n_city),
+                "n_rows": int(len(sub)),
+            })
+
+    return pd.DataFrame(out_rows)
+
+grid = compute_threshold_grid(summer, p0=P0)
+if grid.empty:
+    raise RuntimeError("❌ threshold grid 为空：尝试调小 MIN_CITY_PER_CELL 或减小 N_BINS_VPD/N_BINS_SSRD 或 MIN_SAMPLES_PER_EVI_BIN")
+
+print("Grid cells computed:", len(grid), "| Coverage cities min/med/max:", grid["n_city"].min(), float(grid["n_city"].median()), grid["n_city"].max())
+
+# =========================
+# 6) Bootstrap CI (city-resample)
+# =========================
+cities = summer[CITY].cat.categories.tolist()
+cities = [c for c in cities if (summer[CITY] == c).any()]
+cities = np.array(cities, dtype=object)
+
+rng = np.random.default_rng(RNG_SEED + 7)
+
+# 为了速度：预先按城市分组索引
+city_index = {c: summer.index[summer[CITY] == c].to_numpy() for c in cities}
+
+# 对每次bootstrap，重新拼接抽样城市的数据（有放回），再算grid
+boot_map = {}  # (bv,bs) -> list of thr
+for _ in range(BOOT_N):
+    samp = rng.choice(cities, size=len(cities), replace=True)
+    idx = np.concatenate([city_index[c] for c in samp])
+    sub = summer.loc[idx, [CITY, EVI, "active", "b_vpd", "b_ssrd"]].copy()
+    # 保持category一致
+    sub[CITY] = sub[CITY].astype("category")
+
+    g2 = compute_threshold_grid(sub, p0=P0)
+    if g2.empty:
+        continue
+    for r in g2.itertuples(index=False):
+        key = (int(r.b_vpd), int(r.b_ssrd))
+        boot_map.setdefault(key, []).append(float(r.evi_thr) if np.isfinite(r.evi_thr) else np.nan)
+
+# 汇总CI
+lo_list, hi_list = [], []
+for r in grid.itertuples(index=False):
+    key = (int(r.b_vpd), int(r.b_ssrd))
+    arr = np.array(boot_map.get(key, []), dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size >= max(30, BOOT_N // 4):
+        lo, hi = np.quantile(arr, CI_Q)
+    else:
+        lo, hi = np.nan, np.nan
+    lo_list.append(float(lo) if np.isfinite(lo) else np.nan)
+    hi_list.append(float(hi) if np.isfinite(hi) else np.nan)
+
+grid["evi_thr_lo95"] = np.array(lo_list, dtype=np.float32)
+grid["evi_thr_hi95"] = np.array(hi_list, dtype=np.float32)
+
+# =========================
+# 7) Output tables for later analysis
+# =========================
+threshold_grid = grid.sort_values(["b_vpd","b_ssrd"]).reset_index(drop=True)
+
+result_params = {
+    "baseline_years": BASELINE,
+    "summer_definition": f"City-specific top-{SUMMER_TOPK_MONTHS} hottest months (baseline {BASELINE[0]}–{BASELINE[1]}, by {T2M})",
+    "active_definition": f"active = 1({CE} > city baseline summer Q{int(CE_Q_ACTIVE*100)})",
+    "bg_definition": f"{VPD} bins={N_BINS_VPD} (baseline-fixed cuts) × {SSRD} bins={N_BINS_SSRD} (baseline-fixed cuts)",
+    "threshold_definition": f"EVI threshold where P(active|EVI, bg) reaches {P0}",
+    "per_city_cap": PER_CITY_CAP,
+    "min_city_per_cell": MIN_CITY_PER_CELL,
+    "n_bins_evi": N_BINS_EVI,
+    "min_samples_per_evi_bin": MIN_SAMPLES_PER_EVI_BIN,
+    "bootstrap_n": BOOT_N,
+    "vpd_cuts": [float(x) for x in np.asarray(vpd_cuts).ravel()],
+    "ssrd_cuts": [float(x) for x in np.asarray(ssrd_cuts).ravel()],
+}
+
+print("\n✅ Saved variables:")
+print(" - threshold_grid (VPD×SSRD cell -> EVI threshold + 95% CI)")
+print(" - result_params")
+
+# =========================
+# 8) Visualization (single, clean)
+# =========================
+if PLOT:
+    # pivot to matrix
+    mat = threshold_grid.pivot_table(index="b_ssrd", columns="b_vpd", values="evi_thr", aggfunc="mean")
+    # reorder axes: SSRD low->high from bottom to top? make it intuitive (low at left/bottom)
+    mat = mat.sort_index(ascending=True)
+
+    plt.figure(figsize=(10, 6))
+    im = plt.imshow(mat.to_numpy(), origin="lower", aspect="auto")
+    plt.colorbar(im, shrink=0.9, label="EVI threshold for activation (P(active)=%.2f)" % P0)
+
+    # tick labels use physical midpoints (not bin id)
+    xt = np.arange(mat.shape[1])
+    yt = np.arange(mat.shape[0])
+    plt.xticks(xt, [f"{vpd_mids[i]:.2f}" for i in mat.columns], rotation=0)
+    plt.yticks(yt, [f"{ssrd_mids[i]:.0f}" for i in mat.index])
+
+    plt.xlabel(f"Vapor Pressure Deficit (kPa) bin midpoint")
+    plt.ylabel(f"Shortwave Radiation (MJ m$^{{-2}}$) bin midpoint")
+    plt.title("Activation threshold of vegetation cooling efficiency\nEVI threshold as a function of atmospheric demand (VPD) and energy supply (SSRD)")
+    plt.tight_layout()
+    plt.show()
+
+    # 可选：把CI范围画成点（更直观但仍不乱）
+    # 只画有CI的格子
+    gci = threshold_grid.dropna(subset=["evi_thr_lo95","evi_thr_hi95"]).copy()
+    if len(gci) > 0:
+        plt.figure(figsize=(10, 5.5))
+        x = gci["VPD_mid"].to_numpy()
+        y = gci["SSRD_mid"].to_numpy()
+        z = gci["evi_thr"].to_numpy()
+        plt.scatter(x, y, s=40, c=z)
+        cb = plt.colorbar(shrink=0.9)
+        cb.set_label("EVI threshold (P(active)=%.2f)" % P0)
+        plt.xlabel("VPD (kPa) midpoint")
+        plt.ylabel("SSRD (MJ m$^{-2}$) midpoint")
+        plt.title("Threshold samples (colored by EVI threshold)\n(bootstrap CI available in threshold_grid)")
+        plt.tight_layout()
+        plt.show()
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# Module B (NCC-style): time series of "active cooling"
+# B1) Stratified trends (latitude bands + proxy climate zones) using SAME summer definition
+#     - Summer = city-specific hottest-3 months from baseline (2002–2006 by T2M_C)
+#     - Active = 1( CE > city baseline-summer Q60 )
+#     - Trends ONLY on balanced years (full coverage years)
+#     - CI = bootstrap over cities (fast, robust)
+# B2) Sync check: CE median + trimmed mean trend vs P(active)
+#     - use balanced years; compare relative change vs baseline (same axis, Nature-friendly)
+# ============================================================
+
+# ----------------------------
+# 0) Config (keep simple & fast)
+# ----------------------------
+CITY = "city"
+DATE = "date"
+CE   = "cooling_efficiency"
+T2M  = "T2M_C"
+TP   = "TP_mm"
+
+BASELINE_YEARS = (2002, 2006)
+HOTTEST_K = 3
+ACTIVE_Q = 60  # city baseline-summer quantile for active threshold
+
+LAT_BINS_EACH_HEMI = 4
+CLIM_Q = 3  # terciles × terciles = 9 zones
+
+PER_CITY_CAP = 120000         # keep your cap (speed)
+BOOT_N = 400                  # CI bootstrap reps (fast enough)
+CI_ALPHA = 0.05               # 95% CI
+TRIM_P = 0.10                 # trimmed mean (10%)
+
+# If you already have row-level summer table from Module A/B:
+#   - summer (row-level) with columns: city, date, Year, Month, CE, T2M_C, TP_mm, active (optional)
+# This script can recompute from dataset if needed.
+
+# ----------------------------
+# 1) Load city latitude table (xlsx) + name normalization
+# ----------------------------
+# You have an uploaded copy at /mnt/data/城市100.xlsx
+CITY_XLSX = "/content/drive/MyDrive/Second_research/城市100.xlsx"  # <- if you want Drive path, replace here
+
+def norm_city(s: str) -> str:
+    # keep letters only, lowercase (matches your "删除空格等只保留字母")
+    if pd.isna(s): 
+        return ""
+    s = str(s)
+    out = []
+    for ch in s:
+        if ("A" <= ch <= "Z") or ("a" <= ch <= "z"):
+            out.append(ch.lower())
+    return "".join(out)
+
+city_meta_raw = pd.read_excel(CITY_XLSX)
+# Auto-detect a city column and latitude column (robust)
+cand_city = [c for c in city_meta_raw.columns if str(c).lower() in ["city","City","CITY","name","Name","NAME","城市","城市名","cityname"]]
+cand_lat  = [c for c in city_meta_raw.columns if str(c).lower() in ["lat","latitude","LAT","Latitude","纬度","lat_deg","lat(deg)"]]
+
+if len(cand_city) == 0:
+    # fallback: first column as city
+    cand_city = [city_meta_raw.columns[0]]
+if len(cand_lat) == 0:
+    # fallback: search substring "lat"
+    cand_lat = [c for c in city_meta_raw.columns if "lat" in str(c).lower()]
+    if len(cand_lat) == 0:
+        raise ValueError(f"❌ 城市表中找不到纬度列。当前列：{city_meta_raw.columns.tolist()}")
+
+CITY_COL_META = cand_city[0]
+LAT_COL_META  = cand_lat[0]
+
+city_meta = city_meta_raw[[CITY_COL_META, LAT_COL_META]].copy()
+city_meta.columns = ["city_meta", "lat"]
+city_meta["city_key"] = city_meta["city_meta"].map(norm_city)
+city_meta["lat"] = pd.to_numeric(city_meta["lat"], errors="coerce")
+city_meta = city_meta.dropna(subset=["city_key","lat"]).drop_duplicates("city_key").reset_index(drop=True)
+
+# ----------------------------
+# 2) Build row-level table (cap per city) + compute summer + active
+# ----------------------------
+assert "dataset" in globals(), "❌ 没有 dataset"
+
+df = dataset.copy()
+
+need_cols = [CITY, DATE, CE, T2M, TP]
+miss = [c for c in need_cols if c not in df.columns]
+if miss:
+    raise ValueError(f"❌ dataset 缺少列：{miss}")
+
+df = df[[CITY, DATE, CE, T2M, TP]].copy()
+df[DATE] = pd.to_datetime(df[DATE], errors="coerce")
+df = df.dropna(subset=[CITY, DATE]).reset_index(drop=True)
+
+# numeric
+for c in [CE, T2M, TP]:
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
+df = df.dropna(subset=[CE, T2M]).reset_index(drop=True)
+
+df["Year"]  = df[DATE].dt.year.astype(np.int16)
+df["Month"] = df[DATE].dt.month.astype(np.int8)
+
+# city normalization key (merge lat)
+df["city_key"] = df[CITY].map(norm_city)
+df = df.merge(city_meta[["city_key","lat"]], on="city_key", how="left")
+df = df.dropna(subset=["lat"]).reset_index(drop=True)
+
+# cap per city for speed
+df[CITY] = df[CITY].astype("category")
+rng = np.random.RandomState(42)
+if PER_CITY_CAP is not None and PER_CITY_CAP > 0:
+    parts = []
+    for c, g in df.groupby(CITY, observed=True):
+        if len(g) > PER_CITY_CAP:
+            idx = rng.choice(g.index.to_numpy(), size=PER_CITY_CAP, replace=False)
+            parts.append(df.loc[idx])
+        else:
+            parts.append(g)
+    df = pd.concat(parts, ignore_index=True)
+    df[CITY] = df[CITY].astype("category")
+
+print(f"Rows(raw used): {len(df)} | Cities: {df[CITY].nunique()} | Year range: {df['Year'].min()}–{df['Year'].max()}")
+
+# ---- 2.1) City-specific hottest-3 months from baseline years by T2M_C
+b0, b1 = BASELINE_YEARS
+base = df[(df["Year"] >= b0) & (df["Year"] <= b1)].copy()
+if base.empty:
+    raise RuntimeError("❌ baseline years 数据为空，检查年份范围或数据时间。")
+
+# monthly mean T2M per city
+m = base.groupby([CITY, "Month"], observed=True)[T2M].mean().reset_index()
+# pick top-K months per city
+m = m.sort_values([CITY, T2M], ascending=[True, False])
+m["rank"] = m.groupby(CITY, observed=True).cumcount() + 1
+hot_months = m[m["rank"] <= HOTTEST_K].groupby(CITY, observed=True)["Month"].apply(list).to_dict()
+
+# mark summer rows
+df["is_summer"] = df.apply(lambda r: int(r["Month"] in hot_months.get(r[CITY], [])), axis=1).astype(np.int8)
+summer = df[df["is_summer"] == 1].copy()
+if summer.empty:
+    raise RuntimeError("❌ summer 为空：hottest months 映射失败或数据月份缺失。")
+
+print(f"Rows(summer): {len(summer)} | Cities: {summer[CITY].nunique()}")
+print(f"Summer definition: City-specific hottest-{HOTTEST_K} months (baseline {b0}–{b1}, by {T2M})")
+
+# ---- 2.2) Active threshold: city baseline-summer Q60 of CE
+base_summer = summer[(summer["Year"] >= b0) & (summer["Year"] <= b1)].copy()
+thr = base_summer.groupby(CITY, observed=True)[CE].quantile(ACTIVE_Q/100.0).rename("CE_thr").reset_index()
+summer = summer.merge(thr, on=CITY, how="left")
+summer["active"] = (summer[CE] > summer["CE_thr"]).astype(np.int8)
+
+# ----------------------------
+# 3) City-year metrics for B1/B2 (robust aggregation)
+# ----------------------------
+def trimmed_mean(x, p=0.10):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return np.nan
+    lo = np.nanpercentile(x, p*100)
+    hi = np.nanpercentile(x, (1-p)*100)
+    x2 = x[(x >= lo) & (x <= hi)]
+    if x2.size == 0:
+        return np.nan
+    return float(np.nanmean(x2))
+
+cy = summer.groupby([CITY, "Year"], observed=True).agg(
+    P_active=("active", "mean"),
+    CE_median=(CE, "median"),
+    CE_trim=(CE, lambda s: trimmed_mean(s, TRIM_P)),
+    lat_city=("lat", "median"),
+    T2M_mean=(T2M, "mean"),
+    TP_mean=(TP, "mean"),
+).reset_index()
+
+# balanced years: years with full city coverage
+year_cov = cy.groupby("Year", observed=True)[CITY].nunique()
+n_city_total = cy[CITY].nunique()
+balanced_years = year_cov[year_cov == n_city_total].index.tolist()
+if len(balanced_years) == 0:
+    # fallback: >=95% coverage (still stable)
+    balanced_years = year_cov[year_cov >= int(0.95 * n_city_total)].index.tolist()
+
+cyb = cy[cy["Year"].isin(balanced_years)].copy()
+
+print("\nBalanced years:", balanced_years)
+print("Coverage (min/median/max):", int(year_cov.loc[balanced_years].min()), float(year_cov.loc[balanced_years].median()), int(year_cov.loc[balanced_years].max()))
+
+# ----------------------------
+# 4) Latitude bands (NH 4 + SH 4, balanced & fixed by city lat)
+# ----------------------------
+city_lat = cy.groupby(CITY, observed=True)["lat_city"].median()
+
+def assign_lat_band(lat_series):
+    out = pd.Series(index=lat_series.index, dtype="object")
+    nh_idx = lat_series[lat_series >= 0].index
+    sh_idx = lat_series[lat_series < 0].index
+
+    def qcut_labels(k, prefix):
+        return [f"{prefix}{i+1}" for i in range(k)]
+
+    if len(nh_idx) > 0:
+        k = min(LAT_BINS_EACH_HEMI, lat_series.loc[nh_idx].nunique())
+        out.loc[nh_idx] = pd.qcut(lat_series.loc[nh_idx], q=k, labels=qcut_labels(k, "NH"), duplicates="drop").astype(str)
+
+    if len(sh_idx) > 0:
+        k = min(LAT_BINS_EACH_HEMI, lat_series.loc[sh_idx].nunique())
+        out.loc[sh_idx] = pd.qcut(lat_series.loc[sh_idx], q=k, labels=qcut_labels(k, "SH"), duplicates="drop").astype(str)
+
+    return out
+
+city_band = assign_lat_band(city_lat)
+cyb["lat_band"] = cyb[CITY].map(city_band).astype("category")
+
+# nicer full labels (no abbreviations on legend)
+def latband_full_label(code):
+    # NH1..NH4, SH1..SH4 -> "Northern Hemisphere band 1 (lower latitude)" etc.
+    if not isinstance(code, str): 
+        return str(code)
+    hemi = "Northern Hemisphere" if code.startswith("NH") else ("Southern Hemisphere" if code.startswith("SH") else "Hemisphere")
+    idx = "".join([ch for ch in code if ch.isdigit()]) or "?"
+    return f"{hemi} latitude band {idx}"
+
+# ----------------------------
+# 5) Proxy climate zones (9 zones) fixed by baseline summer means (city-level)
+# ----------------------------
+# compute city baseline-summer mean T2M and TP
+cy_base = cy[(cy["Year"] >= b0) & (cy["Year"] <= b1)].groupby(CITY, observed=True).agg(
+    T2M_b=( "T2M_mean", "mean"),
+    TP_b =( "TP_mean",  "mean"),
+).reset_index()
+
+# terciles
+cy_base["T_bin"] = pd.qcut(cy_base["T2M_b"], q=CLIM_Q, labels=[f"T{i+1}" for i in range(CLIM_Q)], duplicates="drop")
+cy_base["P_bin"] = pd.qcut(cy_base["TP_b"],  q=CLIM_Q, labels=[f"P{i+1}" for i in range(CLIM_Q)], duplicates="drop")
+cy_base["clim_zone"] = (cy_base["T_bin"].astype(str) + " × " + cy_base["P_bin"].astype(str)).astype("category")
+
+city2cz = cy_base.set_index(CITY)["clim_zone"]
+cyb["clim_zone"] = cyb[CITY].map(city2cz).astype("category")
+
+# full labels (no abbreviations)
+def clim_full_label(z):
+    # "T1 × P3" -> "Temperature tercile 1 × Precipitation tercile 3"
+    if pd.isna(z):
+        return ""
+    z = str(z)
+    return z.replace("T", "Temperature tercile ").replace("P", "Precipitation tercile ")
+
+# bin ranges for caption/params
+def bin_ranges(series, q=3):
+    x = series.to_numpy(dtype=float)
+    x = x[np.isfinite(x)]
+    qs = np.nanpercentile(x, np.linspace(0, 100, q+1))
+    out = []
+    for i in range(q):
+        out.append((i+1, float(qs[i]), float(qs[i+1])))
+    return out
+
+T_ranges = bin_ranges(cy_base["T2M_b"], q=CLIM_Q)
+P_ranges = bin_ranges(cy_base["TP_b"],  q=CLIM_Q)
+
+# ----------------------------
+# 6) Fast bootstrap CI over cities (Nature-friendly, robust)
+# ----------------------------
+def bootstrap_ci_mean(values, B=400, alpha=0.05, seed=42):
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    n = v.size
+    if n <= 2:
+        return (np.nan, np.nan)
+    rng = np.random.RandomState(seed)
+    means = np.empty(B, dtype=float)
+    for b in range(B):
+        idx = rng.randint(0, n, size=n)
+        means[b] = np.nanmean(v[idx])
+    lo = float(np.nanpercentile(means, 100*(alpha/2)))
+    hi = float(np.nanpercentile(means, 100*(1-alpha/2)))
+    return (lo, hi)
+
+def trend_table(cy_year, group_col, value_col, B=400):
+    # cy_year: city-year table (balanced years)
+    # group_col: None for overall, else column name
+    rows = []
+    if group_col is None:
+        for y in sorted(cy_year["Year"].unique()):
+            sub = cy_year[cy_year["Year"] == y]
+            vals = sub.groupby(CITY, observed=True)[value_col].mean().to_numpy()
+            lo, hi = bootstrap_ci_mean(vals, B=B, alpha=CI_ALPHA, seed=42+int(y))
+            rows.append([ "Overall", y, float(np.nanmean(vals)), lo, hi, int(np.isfinite(vals).sum()) ])
+    else:
+        for g in cy_year[group_col].dropna().unique():
+            g = str(g)
+            gdf = cy_year[cy_year[group_col].astype(str) == g]
+            for y in sorted(gdf["Year"].unique()):
+                sub = gdf[gdf["Year"] == y]
+                vals = sub.groupby(CITY, observed=True)[value_col].mean().to_numpy()
+                lo, hi = bootstrap_ci_mean(vals, B=B, alpha=CI_ALPHA, seed=99+hash(g)%1000+int(y))
+                rows.append([ g, y, float(np.nanmean(vals)), lo, hi, int(np.isfinite(vals).sum()) ])
+    out = pd.DataFrame(rows, columns=["group","Year","mean","lo95","hi95","n_city"])
+    return out
+
+# B1: P(active) trends by lat band and climate zone
+trend_lat = trend_table(cyb, "lat_band", "P_active", B=BOOT_N)
+trend_cz  = trend_table(cyb, "clim_zone", "P_active", B=BOOT_N)
+trend_all = trend_table(cyb, None,        "P_active", B=BOOT_N)
+
+# B2: CE median and trimmed trends (overall), compare with P(active)
+trend_ce_med  = trend_table(cyb, None, "CE_median", B=BOOT_N)
+trend_ce_trim = trend_table(cyb, None, "CE_trim",   B=BOOT_N)
+
+# ----------------------------
+# 7) Nature-style Figure 1 (two panels): stratified P(active) trends
+# ----------------------------
+def plot_stratified(ax, tab, label_func, title):
+    groups = sorted(tab["group"].unique())
+    for g in groups:
+        sub = tab[tab["group"] == g].sort_values("Year")
+        x = sub["Year"].to_numpy()
+        y = sub["mean"].to_numpy()
+        lo = sub["lo95"].to_numpy()
+        hi = sub["hi95"].to_numpy()
+        ax.plot(x, y, marker="o", linewidth=1.8, label=label_func(g))
+        ax.fill_between(x, lo, hi, alpha=0.18)
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel("Year")
+    ax.set_ylabel("Probability of active cooling, P(active)")
+    ax.grid(True, alpha=0.25)
+
+fig = plt.figure(figsize=(12.6, 5.4))
+gs = fig.add_gridspec(1, 2, wspace=0.25)
+
+ax1 = fig.add_subplot(gs[0, 0])
+plot_stratified(ax1, trend_lat, latband_full_label,
+                "Latitude-stratified trends (balanced years)")
+
+ax2 = fig.add_subplot(gs[0, 1])
+plot_stratified(ax2, trend_cz, clim_full_label,
+                "Climate-zone stratified trends (balanced years)")
+
+# Legend outside (right)
+handles, labels = ax2.get_legend_handles_labels()
+fig.legend(handles, labels, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, fontsize=9)
+
+fig.suptitle("Active vegetation cooling is changing over time, consistently across strata", fontsize=13, y=1.02)
+fig.tight_layout()
+plt.show()
+
+# ----------------------------
+# 8) Nature-style Figure 2 (one panel): sync check
+#     Compare relative change vs baseline mean (same axis; no dual-y)
+# ----------------------------
+# Baseline reference: mean over baseline years within balanced set
+base_years_for_ref = [y for y in balanced_years if (y >= b0 and y <= b1)]
+if len(base_years_for_ref) == 0:
+    # fallback: earliest 2 points
+    base_years_for_ref = sorted(balanced_years)[:2]
+
+def make_relative(tab, name):
+    t = tab.copy()
+    t = t[t["group"] == "Overall"].sort_values("Year")
+    ref = float(t[t["Year"].isin(base_years_for_ref)]["mean"].mean())
+    t[name] = 100.0 * (t["mean"]/ref - 1.0)  # % change
+    t[name+"_lo"] = 100.0 * (t["lo95"]/ref - 1.0)
+    t[name+"_hi"] = 100.0 * (t["hi95"]/ref - 1.0)
+    return t[["Year", name, name+"_lo", name+"_hi"]]
+
+rel_p   = make_relative(trend_all,     "P(active)")
+rel_med = make_relative(trend_ce_med,  "CE median")
+rel_trm = make_relative(trend_ce_trim, "CE trimmed mean")
+
+fig, ax = plt.subplots(1, 1, figsize=(10.6, 4.6))
+
+def plot_rel(ax, t, col, lab):
+    ax.plot(t["Year"], t[col], marker="o", linewidth=2.0, label=lab)
+    ax.fill_between(t["Year"], t[col+"_lo"], t[col+"_hi"], alpha=0.18)
+
+plot_rel(ax, rel_p,   "P(active)",         "Active cooling probability (relative change)")
+plot_rel(ax, rel_med, "CE median",         "Cooling efficiency median (relative change)")
+plot_rel(ax, rel_trm, "CE trimmed mean",   f"Cooling efficiency trimmed mean (p={TRIM_P:.2f}) (relative change)")
+
+ax.axhline(0, linewidth=1.0, alpha=0.6)
+ax.set_title("Synchrony check: probability of active cooling vs cooling-efficiency strength", fontsize=12)
+ax.set_xlabel("Year")
+ax.set_ylabel(f"Relative change vs baseline mean ({min(base_years_for_ref)}–{max(base_years_for_ref)}) [%]")
+ax.grid(True, alpha=0.25)
+
+# legend outside
+ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False, fontsize=9)
+
+fig.tight_layout()
+plt.show()
+
+# ----------------------------
+# 9) Export “parameters” for Methods / caption + key result tables
+# ----------------------------
+params = {
+    "rows_raw_used_after_cap": int(len(df)),
+    "rows_summer": int(len(summer)),
+    "cities_used": int(n_city_total),
+    "year_range_raw": (int(df["Year"].min()), int(df["Year"].max())),
+    "baseline_years": BASELINE_YEARS,
+    "summer_definition": f"City-specific hottest-{HOTTEST_K} months (baseline {b0}–{b1}, by {T2M})",
+    "active_definition": f"active = 1({CE} > city baseline-summer Q{ACTIVE_Q})",
+    "balanced_years": balanced_years,
+    "lat_bins_each_hemi": LAT_BINS_EACH_HEMI,
+    "climate_proxy_definition": "9 zones = Temperature terciles × Precipitation terciles (city baseline-summer means)",
+    "T2M_tercile_ranges_degC": {f"T{i}": (lo, hi) for i, lo, hi in T_ranges},
+    "TP_tercile_ranges_mm":    {f"P{i}": (lo, hi) for i, lo, hi in P_ranges},
+    "bootstrap_reps": BOOT_N,
+    "trimmed_mean_p": TRIM_P,
+    "per_city_cap": PER_CITY_CAP,
+}
+
+print("\n=== Parameters (save to Methods/log) ===")
+for k, v in params.items():
+    print(f"{k}: {v}")
+
+# Tables you will likely use in paper / further modules
+# - trend_lat, trend_cz: stratified P(active) with CI
+# - trend_all: overall P(active) with CI
+# - trend_ce_med, trend_ce_trim: strength trends with CI
+trend_lat_out = trend_lat.copy()
+trend_lat_out["group_full"] = trend_lat_out["group"].map(latband_full_label)
+
+trend_cz_out = trend_cz.copy()
+trend_cz_out["group_full"] = trend_cz_out["group"].map(clim_full_label)
+
+print("\n✅ Saved tables:")
+print(" - trend_lat_out : latitude bands P(active) mean+CI (balanced years)")
+print(" - trend_cz_out  : climate zones P(active) mean+CI (balanced years)")
+print(" - trend_all     : overall P(active) mean+CI (balanced years)")
+print(" - trend_ce_med  : overall CE median mean+CI (balanced years)")
+print(" - trend_ce_trim : overall CE trimmed mean mean+CI (balanced years)")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# Module C (Attribution / "who changed CE?") — NCC-style
+# C1) Within-background (within-BG) driver decomposition:
+#     Explain changes in p_active_bg over time using a small TWFE within each BG cell:
+#       p_active,c,y(bg) = α_c + γ_y + β'X + ε
+#     Then decompose Δp_active_bg (Period B vs Period A) into β_k * ΔX_k,
+#     and weight by BG share p_bg to get contributions to overall ΔP(active).
+#
+# C2) City-year TWFE "main result":
+#     Use city-year overall P(active) (or CE) as outcome and explain its drift by
+#     demand/supply/capacity + background-composition.
+#
+# Output figures (Nature-ready):
+#  - Fig C1: stacked contribution bars (overall + by demand level) — 2 panels
+#  - Fig C2: coefficient dot-whisker plot (TWFE) — 1 panel
+#
+# Uses existing outputs if present:
+#   - summer : row-level summer with columns city, Year, active, BG, plus vars
+#   - cybg   : city-year-bg table with p_bg, p_active_bg (from your previous code)
+# If not present, it will try to rebuild from dataset (minimal).
+# ============================================================
+
+# ----------------------------
+# 0) Config (keep small & fast)
+# ----------------------------
+CITY = "city"
+DATE = "date"
+YEAR = "Year"
+ACTIVE = "active"
+
+# Background bin column name in your saved "summer" table:
+BG = "BG"  # e.g., "S1_V1" ... "S3_V3"
+
+# Core variables you allowed
+VARS_ALL = ['EVI', 'LAI', 'DEM', 'LC', 'DIST_WATER_km',
+            'T2M_C', 'TD_C', 'VPD_kPa', 'WIND10M_MS', 'SSRD_MJm2',
+            'TP_mm', 'SWVL1_m3m3', 'STL1_C']
+
+# C1 (within-bg) — choose 5–6 key drivers (avoid too many)
+# capacity:
+CAP_VARS = ["EVI", "LAI"]
+# supply:
+SUP_VARS = ["SWVL1_m3m3", "TP_mm"]
+# demand (continuous within fixed BG):
+DEMND_VARS = ["VPD_kPa", "SSRD_MJm2"]
+
+# small model set (6 vars)
+X_VARS = CAP_VARS + SUP_VARS + DEMND_VARS
+
+# Periods (match your previous attribution)
+PERIOD_A = (2002, 2006)
+PERIOD_B = (2019, 2025)
+
+# Balanced years (use your previously found balanced years if available)
+# If not present, we compute from city-year coverage.
+BALANCED_ONLY = True
+
+# Plot options
+CI_ALPHA = 0.05
+FONT = 11
+
+# ----------------------------
+# 1) Ensure we have summer + cybg; build minimal if missing
+# ----------------------------
+def ensure_tables():
+    global summer, cybg
+
+    if ("summer" in globals()) and isinstance(summer, pd.DataFrame) and (BG in summer.columns) and (ACTIVE in summer.columns):
+        ok_summer = True
+    else:
+        ok_summer = False
+
+    if ("cybg" in globals()) and isinstance(cybg, pd.DataFrame) and ("p_bg" in cybg.columns) and ("p_active_bg" in cybg.columns):
+        ok_cybg = True
+    else:
+        ok_cybg = False
+
+    if ok_summer and ok_cybg:
+        return
+
+    assert "dataset" in globals(), "❌ Missing tables and no dataset found."
+    df = dataset.copy()
+
+    need = [CITY, DATE, "cooling_efficiency", "T2M_C", "VPD_kPa", "SSRD_MJm2", "TP_mm", "SWVL1_m3m3", "EVI", "LAI"]
+    miss = [c for c in need if c not in df.columns]
+    if miss:
+        raise ValueError(f"❌ dataset missing columns for rebuild: {miss}")
+
+    df = df[need].copy()
+    df[DATE] = pd.to_datetime(df[DATE], errors="coerce")
+    df = df.dropna(subset=[CITY, DATE]).reset_index(drop=True)
+    df[YEAR] = df[DATE].dt.year.astype(np.int16)
+
+    # ---- summer definition (reuse your previous: city-specific hottest-3 months baseline by T2M_C)
+    # (requires Month)
+    df["Month"] = df[DATE].dt.month.astype(np.int8)
+    b0, b1 = PERIOD_A
+    base = df[(df[YEAR] >= b0) & (df[YEAR] <= b1)].copy()
+
+    m = base.groupby([CITY, "Month"], as_index=False)["T2M_C"].mean()
+    m = m.sort_values([CITY, "T2M_C"], ascending=[True, False])
+    m["rank"] = m.groupby(CITY).cumcount() + 1
+    hot_months = m[m["rank"] <= 3].groupby(CITY)["Month"].apply(list).to_dict()
+
+    df["is_summer"] = df.apply(lambda r: int(r["Month"] in hot_months.get(r[CITY], [])), axis=1).astype(np.int8)
+    summer = df[df["is_summer"] == 1].copy()
+
+    # ---- active threshold: city baseline-summer Q60 of cooling_efficiency
+    base_s = summer[(summer[YEAR] >= b0) & (summer[YEAR] <= b1)].copy()
+    thr = base_s.groupby(CITY)["cooling_efficiency"].quantile(0.60).rename("CE_thr").reset_index()
+    summer = summer.merge(thr, on=CITY, how="left")
+    summer[ACTIVE] = (summer["cooling_efficiency"] > summer["CE_thr"]).astype(np.int8)
+
+    # ---- BG bins fixed by baseline cuts (terciles) of VPD and SSRD
+    # Use baseline-period summer to define thresholds
+    vb = base_s["VPD_kPa"].to_numpy(dtype=float)
+    sb = base_s["SSRD_MJm2"].to_numpy(dtype=float)
+    v1, v2 = np.nanpercentile(vb[np.isfinite(vb)], [33.333, 66.666])
+    s1, s2 = np.nanpercentile(sb[np.isfinite(sb)], [33.333, 66.666])
+
+    def v_bin(x):
+        if x <= v1: return "V1"
+        if x <= v2: return "V2"
+        return "V3"
+
+    def s_bin(x):
+        if x <= s1: return "S1"
+        if x <= s2: return "S2"
+        return "S3"
+
+    summer[BG] = [f"{s_bin(s)}_{v_bin(v)}" for s, v in zip(summer["SSRD_MJm2"].to_numpy(), summer["VPD_kPa"].to_numpy())]
+
+    # ---- build cybg
+    # p_bg = share of rows in each bg (within city-year)
+    # p_active_bg = mean(active) within bg (within city-year)
+    g = summer.groupby([CITY, YEAR, BG], as_index=False)
+    cybg = g.agg(
+        n=("cooling_efficiency", "size"),
+        p_active_bg=(ACTIVE, "mean"),
+        EVI=("EVI", "mean"),
+        LAI=("LAI", "mean"),
+        SWVL1_m3m3=("SWVL1_m3m3", "mean"),
+        TP_mm=("TP_mm", "mean"),
+        VPD_kPa=("VPD_kPa", "mean"),
+        SSRD_MJm2=("SSRD_MJm2", "mean"),
+    )
+    # p_bg from counts within (city,year)
+    tot = cybg.groupby([CITY, YEAR], as_index=False)["n"].sum().rename(columns={"n":"n_total"})
+    cybg = cybg.merge(tot, on=[CITY, YEAR], how="left")
+    cybg["p_bg"] = cybg["n"] / cybg["n_total"]
+
+ensure_tables()
+
+# ----------------------------
+# 2) Balanced years (optional, to remove missing-year artefacts)
+# ----------------------------
+# For cybg, city-year exists only if summer rows exist. We want years where every city has some summer rows.
+cities_all = cybg[CITY].nunique()
+cov = cybg.groupby(YEAR)[CITY].nunique()
+balanced_years = cov[cov == cities_all].index.tolist()
+
+if BALANCED_ONLY and (len(balanced_years) >= 3):
+    cybg_use = cybg[cybg[YEAR].isin(balanced_years)].copy()
+    summer_use = summer[summer[YEAR].isin(balanced_years)].copy()
+else:
+    cybg_use = cybg.copy()
+    summer_use = summer.copy()
+
+# ----------------------------
+# 3) C1 — within-BG TWFE (city FE + year FE) and decomposition PeriodB-PeriodA
+# ----------------------------
+try:
+    import statsmodels.formula.api as smf
+except Exception:
+    raise ImportError("statsmodels 未安装：请先运行 !pip -q install statsmodels")
+
+# small helper: z-score within each BG to make coefficients comparable
+def zscore_within_bg(df, cols):
+    out = df.copy()
+    for c in cols:
+        mu = out.groupby(BG)[c].transform("mean")
+        sd = out.groupby(BG)[c].transform("std")
+        sd = sd.replace(0, np.nan)
+        out[c+"_z"] = (out[c] - mu) / sd
+    return out
+
+# Use city-year-bg panel: outcome is p_active_bg in each bg cell
+panel = cybg_use[[CITY, YEAR, BG, "p_bg", "p_active_bg"] + [c for c in X_VARS if c in cybg_use.columns]].copy()
+panel = panel.dropna(subset=["p_active_bg", "p_bg"]).reset_index(drop=True)
+
+# Keep only BG cells with enough city-years (avoid unstable FE)
+min_rows_bg = 150  # fast + stable; adjust if needed
+bg_counts = panel.groupby(BG).size()
+keep_bg = bg_counts[bg_counts >= min_rows_bg].index.tolist()
+panel = panel[panel[BG].isin(keep_bg)].reset_index(drop=True)
+
+# z-score within bg
+panel_z = zscore_within_bg(panel, [c for c in X_VARS if c in panel.columns])
+
+# Fit TWFE separately per BG: p_active_bg ~ X + C(city) + C(year)
+# (linear probability model; robust SE)
+coef_rows = []
+decomp_rows = []
+
+bA0, bA1 = PERIOD_A
+bB0, bB1 = PERIOD_B
+
+# We decompose Δp_active_bg between Period B and A:
+# explained_k(bg) = beta_k(bg) * (mean(X_k|B,bg) - mean(X_k|A,bg))  [in z units]
+# overall contribution to ΔP(active) (within-bg part) weights by avg p_bg over both periods:
+# contrib_k(bg) = w_bg * explained_k(bg), where w_bg = mean(p_bg in A∪B for that bg) averaged across cities
+# Finally sum across bg -> category bars.
+
+def mean_over_period(df, y0, y1, cols):
+    d = df[(df[YEAR] >= y0) & (df[YEAR] <= y1)]
+    # city-mean first to avoid cities with more rows dominating
+    cm = d.groupby(CITY)[cols].mean()
+    return cm.mean(axis=0)
+
+# demand level label from BG (V1/V2/V3)
+def demand_level(bg_code):
+    # bg_code like "S2_V3"
+    if not isinstance(bg_code, str): return "Unknown demand"
+    if "_V1" in bg_code: return "Low atmospheric demand"
+    if "_V2" in bg_code: return "Moderate atmospheric demand"
+    if "_V3" in bg_code: return "High atmospheric demand"
+    return "Unknown demand"
+
+# Fit per BG
+for bg in sorted(panel_z[BG].unique()):
+    d = panel_z[panel_z[BG] == bg].copy()
+    # Require period coverage
+    if d[(d[YEAR] >= bA0) & (d[YEAR] <= bA1)].empty: 
+        continue
+    if d[(d[YEAR] >= bB0) & (d[YEAR] <= bB1)].empty:
+        continue
+
+    rhs = " + ".join([f"{c}_z" for c in X_VARS if f"{c}_z" in d.columns])
+    fml = f"p_active_bg ~ {rhs} + C({CITY}) + C({YEAR})"
+    try:
+        m = smf.ols(fml, data=d).fit(cov_type="HC3")
+    except Exception:
+        continue
+
+    # store coefs
+    for c in X_VARS:
+        t = f"{c}_z"
+        if t in m.params.index:
+            coef_rows.append({
+                "BG": bg,
+                "demand_group": demand_level(bg),
+                "term": c,
+                "beta": float(m.params[t]),
+                "se": float(m.bse[t]),
+                "p": float(m.pvalues[t]),
+                "lo": float(m.conf_int().loc[t,0]),
+                "hi": float(m.conf_int().loc[t,1]),
+            })
+
+    # decomposition
+    zcols = [f"{c}_z" for c in X_VARS if f"{c}_z" in d.columns]
+    muA = mean_over_period(d, bA0, bA1, zcols)
+    muB = mean_over_period(d, bB0, bB1, zcols)
+    dX = (muB - muA)
+
+    # bg weight: average p_bg across cities, averaged over A∪B
+    w_bg = d[(d[YEAR] >= bA0) & (d[YEAR] <= bB1)].groupby(CITY)["p_bg"].mean().mean()
+
+    # explained pieces
+    explained = {}
+    for c in X_VARS:
+        t = f"{c}_z"
+        if (t in dX.index) and (t in m.params.index):
+            explained[c] = float(m.params[t] * dX[t])
+        else:
+            explained[c] = 0.0
+
+    # model-implied delta in bg
+    explained_sum = float(np.sum(list(explained.values())))
+
+    # actual delta (city-mean, so consistent with mean_over_period)
+    yA = mean_over_period(d, bA0, bA1, ["p_active_bg"])["p_active_bg"]
+    yB = mean_over_period(d, bB0, bB1, ["p_active_bg"])["p_active_bg"]
+    dy = float(yB - yA)
+    resid = dy - explained_sum
+
+    for c, val in explained.items():
+        decomp_rows.append({
+            "BG": bg,
+            "demand_group": demand_level(bg),
+            "component": c,
+            "delta_p_active_bg_explained": val,
+            "weight_bg": float(w_bg),
+            "contrib_to_overall_withinbg": float(w_bg * val),
+        })
+    decomp_rows.append({
+        "BG": bg,
+        "demand_group": demand_level(bg),
+        "component": "Residual / unmodelled",
+        "delta_p_active_bg_explained": resid,
+        "weight_bg": float(w_bg),
+        "contrib_to_overall_withinbg": float(w_bg * resid),
+    })
+
+coef_tab = pd.DataFrame(coef_rows)
+decomp_tab = pd.DataFrame(decomp_rows)
+
+# Category mapping for NCC-style storytelling
+def map_category(comp):
+    if comp in CAP_VARS: return "Vegetation capacity (EVI/LAI)"
+    if comp in SUP_VARS: return "Water supply (soil water / precipitation)"
+    if comp in DEMND_VARS: return "Atmospheric demand & energy (VPD / radiation)"
+    if comp == "Residual / unmodelled": return "Residual / unmodelled"
+    return "Other"
+
+decomp_tab["category"] = decomp_tab["component"].map(map_category)
+
+# Aggregate contributions across BG -> overall within-bg explained bar
+overall_contrib = (decomp_tab.groupby("category", as_index=False)["contrib_to_overall_withinbg"].sum()
+                   .sort_values("contrib_to_overall_withinbg"))
+
+# And by demand level (Low/Moderate/High demand)
+by_demand = (decomp_tab.groupby(["demand_group","category"], as_index=False)["contrib_to_overall_withinbg"].sum())
+
+# ----------------------------
+# 4) C2 — City-year TWFE "main result": outcome = P(active) (city-year)
+#     Predictors: capacity (EVI/LAI), supply (SWVL1/TP), demand (VPD/SSRD),
+#                 composition (share of high-demand BG)
+# ----------------------------
+# Build city-year overall table from summer_use (balanced years recommended)
+# P(active) = city-year mean(active)
+# Also compute means for X vars and composition share of "High demand" (V3 & S3 as extreme)
+cy = (summer_use.groupby([CITY, YEAR], as_index=False)
+      .agg(P_active=(ACTIVE, "mean"),
+           EVI=("EVI","mean"),
+           LAI=("LAI","mean"),
+           SWVL1_m3m3=("SWVL1_m3m3","mean"),
+           TP_mm=("TP_mm","mean"),
+           VPD_kPa=("VPD_kPa","mean"),
+           SSRD_MJm2=("SSRD_MJm2","mean")))
+
+# composition: fraction of rows in the most stressful cell (S3_V3)
+if BG in summer_use.columns:
+    share_s3v3 = (summer_use.assign(is_s3v3=(summer_use[BG] == "S3_V3").astype(np.int8))
+                  .groupby([CITY, YEAR])["is_s3v3"].mean().rename("share_high_demand_BG").reset_index())
+    cy = cy.merge(share_s3v3, on=[CITY, YEAR], how="left")
+else:
+    cy["share_high_demand_BG"] = np.nan
+
+# Keep balanced years only for TWFE stability
+if BALANCED_ONLY and (len(balanced_years) >= 3):
+    cy = cy[cy[YEAR].isin(balanced_years)].copy()
+
+# z-score predictors (global) for comparable coefficients
+X2 = ["EVI","LAI","SWVL1_m3m3","TP_mm","VPD_kPa","SSRD_MJm2","share_high_demand_BG"]
+for c in X2:
+    if c in cy.columns:
+        mu, sd = float(np.nanmean(cy[c])), float(np.nanstd(cy[c]))
+        if not np.isfinite(sd) or sd <= 0: sd = 1.0
+        cy[c+"_z"] = (cy[c] - mu) / sd
+
+rhs2 = " + ".join([c+"_z" for c in X2 if (c+"_z") in cy.columns])
+fml2 = f"P_active ~ {rhs2} + C({CITY}) + C({YEAR})"
+m2 = smf.ols(fml2, data=cy).fit(cov_type="HC3")
+
+# Extract coefficients
+coef2 = []
+for c in X2:
+    t = c+"_z"
+    if t in m2.params.index:
+        coef2.append({
+            "term": c,
+            "beta": float(m2.params[t]),
+            "lo": float(m2.conf_int().loc[t,0]),
+            "hi": float(m2.conf_int().loc[t,1]),
+            "p": float(m2.pvalues[t]),
+            "category": ("Vegetation capacity (EVI/LAI)" if c in CAP_VARS else
+                         "Water supply (soil water / precipitation)" if c in SUP_VARS else
+                         "Atmospheric demand & energy (VPD / radiation)" if c in DEMND_VARS else
+                         "Background composition (stressful share)")
+        })
+coef2 = pd.DataFrame(coef2)
+
+# ----------------------------
+# 5) Nature-style Figures (minimal, readable, legend outside)
+# ----------------------------
+plt.rcParams.update({
+    "font.size": FONT,
+    "axes.titlesize": FONT+1,
+    "axes.labelsize": FONT,
+    "legend.fontsize": FONT-1
+})
+
+# ----- Fig C1: two panels (overall + by demand)
+fig = plt.figure(figsize=(12.6, 4.8))
+gs = fig.add_gridspec(1, 2, wspace=0.32)
+
+# Panel A: Overall within-bg contributions (stacked)
+axA = fig.add_subplot(gs[0,0])
+cats = overall_contrib["category"].tolist()
+vals = overall_contrib["contrib_to_overall_withinbg"].to_numpy()
+
+# stacked single bar
+bottom = 0.0
+handles = []
+labels = []
+for cat, v in zip(cats, vals):
+    h = axA.bar([0], [v], bottom=bottom, width=0.6, label=cat)
+    bottom += v
+    handles.append(h)
+    labels.append(cat)
+
+axA.axhline(0, linewidth=1, alpha=0.6)
+axA.set_xticks([0])
+axA.set_xticklabels([f"ΔP(active)\nwithin-background\n({PERIOD_B[0]}–{PERIOD_B[1]} vs {PERIOD_A[0]}–{PERIOD_A[1]})"])
+axA.set_ylabel("Contribution to ΔP(active)")
+axA.set_title("C1. What drives within-background change? (weighted by background share)")
+axA.set_xlim(-0.8, 0.8)
+axA.grid(True, axis="y", alpha=0.25)
+
+# Panel B: by demand group (3 bars, stacked categories)
+axB = fig.add_subplot(gs[0,1])
+demand_order = ["Low atmospheric demand", "Moderate atmospheric demand", "High atmospheric demand"]
+cat_order = ["Vegetation capacity (EVI/LAI)",
+             "Water supply (soil water / precipitation)",
+             "Atmospheric demand & energy (VPD / radiation)",
+             "Residual / unmodelled"]
+
+xpos = np.arange(len(demand_order))
+bottoms = np.zeros(len(demand_order), dtype=float)
+
+for cat in cat_order:
+    vals_cat = []
+    for dg in demand_order:
+        v = by_demand[(by_demand["demand_group"] == dg) & (by_demand["category"] == cat)]["contrib_to_overall_withinbg"]
+        vals_cat.append(float(v.iloc[0]) if len(v) else 0.0)
+    axB.bar(xpos, vals_cat, bottom=bottoms, width=0.65, label=cat)
+    bottoms += np.array(vals_cat)
+
+axB.axhline(0, linewidth=1, alpha=0.6)
+axB.set_xticks(xpos)
+axB.set_xticklabels(demand_order, rotation=20, ha="right")
+axB.set_ylabel("Contribution to ΔP(active)")
+axB.set_title("C1 (by demand level): where does the within-background change occur?")
+axB.grid(True, axis="y", alpha=0.25)
+
+# shared legend outside
+fig.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False)
+fig.tight_layout()
+plt.show()
+
+# ----- Fig C2: TWFE coefficients (dot-whisker), Nature style
+coef2_plot = coef2.copy()
+# order by category then abs(beta)
+coef2_plot["absb"] = coef2_plot["beta"].abs()
+coef2_plot = coef2_plot.sort_values(["category","absb"], ascending=[True, False]).reset_index(drop=True)
+
+fig, ax = plt.subplots(1, 1, figsize=(9.8, 4.8))
+y = np.arange(len(coef2_plot))
+ax.errorbar(coef2_plot["beta"], y,
+            xerr=np.vstack([coef2_plot["beta"]-coef2_plot["lo"], coef2_plot["hi"]-coef2_plot["beta"]]),
+            fmt="o", capsize=3)
+ax.axvline(0, linewidth=1, alpha=0.7)
+ax.set_yticks(y)
+
+# full labels (no abbreviations)
+term_full = {
+    "EVI": "Enhanced Vegetation Index (EVI)",
+    "LAI": "Leaf Area Index (LAI)",
+    "SWVL1_m3m3": "Top-layer soil water (SWVL1)",
+    "TP_mm": "Precipitation (TP)",
+    "VPD_kPa": "Vapor pressure deficit (VPD)",
+    "SSRD_MJm2": "Downward shortwave radiation (SSRD)",
+    "share_high_demand_BG": "Share of high-demand background (S3_V3)"
+}
+ax.set_yticklabels([term_full.get(t, t) for t in coef2_plot["term"].tolist()])
+ax.set_xlabel("Standardized coefficient (TWFE; city and year fixed effects; 95% CI)")
+ax.set_title("C2. City-year TWFE: which changes best explain long-run drift in P(active)?")
+ax.grid(True, axis="x", alpha=0.25)
+plt.tight_layout()
+plt.show()
+
+# ----------------------------
+# 6) Parameters + outputs for Methods / analysis
+# ----------------------------
+params = {
+    "period_A": PERIOD_A,
+    "period_B": PERIOD_B,
+    "balanced_only": BALANCED_ONLY,
+    "balanced_years_used": sorted(list(set(cybg_use[YEAR].unique()))),
+    "within_bg_min_rows_bg": int(min_rows_bg),
+    "within_bg_predictors": X_VARS,
+    "within_bg_model": "Per-BG TWFE: p_active_bg ~ X(z-scored within BG) + city FE + year FE, HC3 SE",
+    "within_bg_decomposition": "Δp_active_bg(B-A) decomposed into β_k*ΔX_k; weighted by bg share p_bg",
+    "twfe_outcome": "P_active (city-year overall, summer)",
+    "twfe_predictors": X2,
+    "twfe_model": "TWFE: P_active ~ X(z-scored) + city FE + year FE, HC3 SE",
+}
+
+print("\n=== Result parameters (save to log/methods) ===")
+for k, v in params.items():
+    print(f"{k}: {v}")
+
+print("\n=== Key numeric summaries ===")
+# Total within-bg contribution explained vs residual
+tot_by_cat = overall_contrib.set_index("category")["contrib_to_overall_withinbg"]
+explained = float(tot_by_cat.drop(index="Residual / unmodelled", errors="ignore").sum())
+resid = float(tot_by_cat.get("Residual / unmodelled", 0.0))
+print(f"Within-bg ΔP(active) explained (sum of modelled categories): {explained:.4f}")
+print(f"Residual / unmodelled part: {resid:.4f}")
+print(f"Total within-bg contribution (sum all categories): {(explained+resid):.4f}")
+
+# Save tables for your follow-up analysis
+withinbg_contrib_overall = overall_contrib.copy()
+withinbg_contrib_by_demand = by_demand.copy()
+twfe_coef_table = coef2.copy()
+withinbg_coef_table = coef_tab.copy()
+
+print("\n✅ Saved tables:")
+print(" - withinbg_contrib_overall : overall within-bg contributions by category")
+print(" - withinbg_contrib_by_demand : within-bg contributions by category × demand level")
+print(" - withinbg_coef_table : per-BG TWFE coefficients (beta, CI, p)")
+print(" - twfe_coef_table : city-year TWFE coefficients (beta, CI, p)")
+
+import os, json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import statsmodels.formula.api as smf
+
+# ============================================================
+# 0) Config
+# ============================================================
+OUT_DIR = "./mechanism_reshape_from_dataset_active"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# periods (与你前面日志一致：A=2002-2006, B=2019-2025)
+PERIODS = [
+    ("A_2002_2006", 2002, 2006),
+    ("B_2019_2025", 2019, 2025),
+]
+REF_PERIOD = PERIODS[0][0]
+ROBUST_COV = "HC3"
+
+ACTIVE_Q = 0.60  # active = 1(CE > city baseline-summer Q60)
+
+FEATURES = ['EVI', 'LAI', 'DEM', 'LC', 'DIST_WATER_km',
+            'T2M_C', 'TD_C', 'VPD_kPa', 'WIND10M_MS', 'SSRD_MJm2',
+            'TP_mm', 'SWVL1_m3m3', 'STL1_C']
+
+SUMMER_DEF = "City-specific hottest-3 months (baseline 2002–2006, by T2M_C)"  # log only
+
+# ============================================================
+# 1) Use updated dataset (must contain cooling_efficiency)
+# ============================================================
+assert "dataset" in globals(), "❌ dataset not found. Please run your counterfactual code first."
+df = dataset.copy()
+
+need_cols = ["city", "date", "cooling_efficiency"]
+missing = [c for c in need_cols if c not in df.columns]
+assert not missing, f"❌ dataset missing columns: {missing}. (Run your CE computation first.)"
+
+df["date"] = pd.to_datetime(df["date"], errors="coerce")
+df = df.dropna(subset=["date", "city", "cooling_efficiency"]).copy()
+df["year"] = df["date"].dt.year.astype(int)
+
+# keep only needed features that exist
+use_feats = [c for c in FEATURES if c in df.columns]
+assert len(use_feats) > 0, f"❌ None of FEATURES exist in dataset. Got columns: {df.columns.tolist()[:50]}"
+
+# ============================================================
+# 2) Define active using baseline (2002–2006) city-specific Q60
+# ============================================================
+base_mask = (df["year"] >= PERIODS[0][1]) & (df["year"] <= PERIODS[0][2])
+base = df.loc[base_mask, ["city", "cooling_efficiency"]].dropna().copy()
+assert len(base) > 0, "❌ No baseline rows found (2002–2006) to compute city Q60."
+
+q60 = base.groupby("city")["cooling_efficiency"].quantile(ACTIVE_Q).rename("ce_q60_baseline").reset_index()
+df = df.merge(q60, on="city", how="left")
+df["active"] = (df["cooling_efficiency"] > df["ce_q60_baseline"]).astype(np.int8)
+
+# ============================================================
+# 3) Aggregate to city-year panel (P_active + mean predictors)
+# ============================================================
+agg_dict = {"active": "mean"}
+for c in use_feats:
+    agg_dict[c] = "mean"
+
+df_cityyear = (
+    df[["city", "year", "active"] + use_feats]
+    .dropna(subset=["city", "year", "active"])
+    .groupby(["city", "year"], as_index=False)
+    .agg(agg_dict)
+    .rename(columns={"active": "P_active"})
+)
+
+print("✅ city-year panel:", df_cityyear.shape,
+      "| cities:", df_cityyear["city"].nunique(),
+      "| year range:", (df_cityyear["year"].min(), df_cityyear["year"].max()))
+df_cityyear.to_csv(os.path.join(OUT_DIR, "cityyear_panel.csv"), index=False)
+
+# ============================================================
+# 4) Period labels + z-score predictors
+# ============================================================
+df_cy = df_cityyear.copy()
+df_cy["period"] = np.nan
+for name, y0, y1 in PERIODS:
+    m = (df_cy["year"] >= y0) & (df_cy["year"] <= y1)
+    df_cy.loc[m, "period"] = name
+df_cy = df_cy.dropna(subset=["period"]).copy()
+df_cy["period"] = pd.Categorical(df_cy["period"], categories=[p[0] for p in PERIODS], ordered=True)
+
+for c in use_feats:
+    mu = df_cy[c].mean()
+    sd = df_cy[c].std(ddof=0)
+    df_cy[c + "_z"] = (df_cy[c] - mu) / (sd if sd and sd > 0 else 1.0)
+
+XZ = [c + "_z" for c in use_feats]
+
+# ============================================================
+# 5) TWFE + period interactions
+# ============================================================
+formula = "P_active ~ (" + " + ".join(XZ) + ")*C(period) + C(city) + C(year)"
+m = smf.ols(formula=formula, data=df_cy).fit(cov_type=ROBUST_COV)
+
+# save all params
+coef = pd.DataFrame({
+    "param": m.params.index,
+    "beta": m.params.values,
+    "se": m.bse.values,
+    "p": m.pvalues.values
+})
+ci = m.conf_int()
+coef["ci_low"] = ci[0].values
+coef["ci_high"] = ci[1].values
+coef.to_csv(os.path.join(OUT_DIR, "twfe_drift_coef_all_params.csv"), index=False)
+
+# ============================================================
+# 6) Marginal effects by period (beta + 95% CI)
+# ============================================================
+cov = m.cov_params()
+params = m.params
+
+def marg_effect(base, per):
+    # base like "VPD_kPa_z"
+    if per == REF_PERIOD:
+        b = float(params.get(base, np.nan))
+        v = float(cov.loc[base, base]) if (base in cov.index) else np.nan
+    else:
+        inter = f"{base}:C(period)[T.{per}]"
+        b = float(params.get(base, 0.0) + params.get(inter, 0.0))
+        if (base in cov.index) and (inter in cov.index):
+            v = float(cov.loc[base, base] + cov.loc[inter, inter] + 2.0 * cov.loc[base, inter])
+        elif base in cov.index:
+            v = float(cov.loc[base, base])
+        else:
+            v = np.nan
+    se = np.sqrt(v) if np.isfinite(v) else np.nan
+    lo = b - 1.96 * se if np.isfinite(se) else np.nan
+    hi = b + 1.96 * se if np.isfinite(se) else np.nan
+    return b, se, lo, hi
+
+rows = []
+for base in XZ:
+    pred = base.replace("_z", "")
+    for per, _, _ in PERIODS:
+        b, se, lo, hi = marg_effect(base, per)
+        rows.append([pred, per, b, se, lo, hi])
+
+me = pd.DataFrame(rows, columns=["predictor", "period", "beta", "se", "ci_low", "ci_high"])
+me.to_csv(os.path.join(OUT_DIR, "marginal_effects_by_period.csv"), index=False)
+
+# ============================================================
+# 7) Plot: forest of marginal effects
+# ============================================================
+pred_order = ["VPD_kPa", "SSRD_MJm2", "EVI", "LAI", "TP_mm", "SWVL1_m3m3", "T2M_C", "TD_C",
+              "WIND10M_MS", "STL1_C", "DEM", "LC", "DIST_WATER_km"]
+pred_order = [p for p in pred_order if p in me["predictor"].unique()]
+per_order = [p[0] for p in PERIODS]
+
+pos = {}
+y = 0
+gap = 0.7
+block_gap = 0.9
+yticks, ylabels = [], []
+for p in pred_order:
+    for per in per_order:
+        pos[(p, per)] = y
+        yticks.append(y)
+        ylabels.append(f"{p} | {per}")
+        y += gap
+    y += block_gap
+
+plt.figure(figsize=(11, max(4, 0.35 * len(ylabels))))
+ax = plt.gca()
+for _, r in me.iterrows():
+    key = (r["predictor"], r["period"])
+    if key not in pos:
+        continue
+    yy = pos[key]
+    ax.errorbar(
+        x=r["beta"], y=yy,
+        xerr=[[r["beta"] - r["ci_low"]], [r["ci_high"] - r["beta"]]],
+        fmt="o", capsize=3
+    )
+
+ax.axvline(0, linewidth=1)
+ax.set_yticks(yticks)
+ax.set_yticklabels(ylabels)
+ax.set_xlabel("Marginal effect on P(active) per 1 SD change (TWFE; 95% CI)")
+ax.set_title("Mechanism reshaping: period-varying coupling (city & year FE; HC3)")
+ax.grid(True, axis="x", alpha=0.3)
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "forest_marginal_effects.png"), dpi=220)
+plt.show()
+
+# ============================================================
+# 8) Dump “all available result parameters”
+# ============================================================
+result_params = {
+    "data_source": "dataset (after counterfactual prediction)",
+    "dataset_rows_used": int(len(df)),
+    "cityyear_panel_shape": list(df_cityyear.shape),
+    "cities_used": int(df_cityyear["city"].nunique()),
+    "year_range": (int(df_cityyear["year"].min()), int(df_cityyear["year"].max())),
+    "periods_used": PERIODS,
+    "active_definition": f"active = 1(cooling_efficiency > city baseline(2002–2006) Q{int(ACTIVE_Q*100)})",
+    "summer_definition": SUMMER_DEF,
+    "features_used_in_TWFE": use_feats,
+    "model": "TWFE: P_active ~ (X_z * period) + city FE + year FE, HC3 SE",
+    "robust_cov": ROBUST_COV,
+    "formula": formula,
+    "nobs": int(m.nobs),
+    "r2": float(m.rsquared),
+    "r2_adj": float(m.rsquared_adj),
+}
+
+with open(os.path.join(OUT_DIR, "result_params.json"), "w", encoding="utf-8") as f:
+    json.dump(result_params, f, ensure_ascii=False, indent=2)
+
+print("\n=== Result parameters (copy to Methods/log) ===")
+for k, v in result_params.items():
+    print(f"{k}: {v}")
+
+print("\n✅ Saved outputs to:", OUT_DIR)
+print(" - cityyear_panel.csv")
+print(" - twfe_drift_coef_all_params.csv")
+print(" - marginal_effects_by_period.csv")
+print(" - forest_marginal_effects.png")
+print(" - result_params.json")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+
+# ============================================================
+# 0) 配置
+# ============================================================
+TARGET = "cooling_efficiency"
+
+CLIMATE_VARS = [
+    "T2M_C","TD_C","VPD_kPa","SSRD_MJm2",
+    "TP_mm","SWVL1_m3m3","STL1_C","WIND10M_MS"
+]
+
+VEG_VARS = ["EVI","LAI"]
+URBAN_VARS = ["NTL"] if "NTL" in dataset.columns else []
+
+VARS = VEG_VARS + CLIMATE_VARS + URBAN_VARS
+
+SUMMER_ONLY = True
+SUMMER_MONTHS = [6,7,8]
+MAX_SAMPLES = 150000
+SEED = 42
+
+# 高/低效率分位（city 内，避免气候带偏置）
+HIGH_Q = 0.80
+LOW_Q  = 0.20
+
+# 稳定高效像元阈值（city 内）
+MEAN_Q = 0.70
+STD_Q  = 0.30
+
+# ============================================================
+# 1) 数据准备
+# ============================================================
+df = dataset.copy()
+df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+if SUMMER_ONLY:
+    df = df[df["date"].dt.month.isin(SUMMER_MONTHS)]
+
+need = [TARGET,"city","pix_x","pix_y"] + VARS
+df = df.dropna(subset=need).reset_index(drop=True)
+
+# ============================================================
+# 2) city 内部分位数阈值（关键）
+# ============================================================
+df["ce_hi_city"] = df.groupby("city")[TARGET].transform(lambda x: x.quantile(HIGH_Q))
+df["ce_lo_city"] = df.groupby("city")[TARGET].transform(lambda x: x.quantile(LOW_Q))
+
+# ============================================================
+# 3) 像元尺度稳定性（city 无关）
+# ============================================================
+pix_stats = (
+    df.groupby(["pix_y","pix_x"])[TARGET]
+      .agg(mean_cool="mean", std_cool="std")
+      .reset_index()
+)
+
+pix_stats["mean_hi"] = pix_stats["mean_cool"].quantile(MEAN_Q)
+pix_stats["std_lo"]  = pix_stats["std_cool"].quantile(STD_Q)
+
+df = df.merge(pix_stats, on=["pix_y","pix_x"], how="left")
+
+# ============================================================
+# 4) 定义状态（不预设物理方向，只用联合约束）
+# ============================================================
+mask_strong = df[TARGET] >= df["ce_hi_city"]
+mask_failure = df[TARGET] <= df["ce_lo_city"]
+mask_stable = (
+    (df["mean_cool"] >= pix_stats["mean_hi"].iloc[0]) &
+    (df["std_cool"]  <= pix_stats["std_lo"].iloc[0])
+)
+
+label = np.full(len(df), "Other", dtype=object)
+label[mask_failure.values] = "Failure"
+label[mask_stable.values]  = "Stable"
+label[mask_strong.values]  = "Strong"
+
+df["regime"] = label
+
+# ============================================================
+# 5) PCA 状态空间（仅用于展示联合结构）
+# ============================================================
+df_vis = df.copy()
+if MAX_SAMPLES and len(df_vis) > MAX_SAMPLES:
+    df_vis = df_vis.sample(MAX_SAMPLES, random_state=SEED)
+
+X = df_vis[VARS].to_numpy(float)
+Xz = StandardScaler().fit_transform(X)
+
+pca = PCA(n_components=2, random_state=SEED)
+XY = pca.fit_transform(Xz)
+var = pca.explained_variance_ratio_
+
+plt.figure(figsize=(7.4,6.2))
+colors = {"Strong":"tab:blue","Failure":"tab:red","Stable":"tab:green","Other":"gray"}
+sizes  = {"Strong":30,"Failure":30,"Stable":26,"Other":6}
+alphas = {"Strong":0.85,"Failure":0.85,"Stable":0.85,"Other":0.15}
+
+plt.hexbin(XY[:,0], XY[:,1], gridsize=45, mincnt=8, cmap="Greys", alpha=0.25)
+
+for k in colors:
+    m = df_vis["regime"] == k
+    if m.sum() == 0: continue
+    plt.scatter(XY[m,0], XY[m,1],
+                s=sizes[k], c=colors[k], alpha=alphas[k],
+                label=f"{k} (n={m.sum()})")
+
+plt.xlabel(f"PC1 ({var[0]*100:.1f}%)")
+plt.ylabel(f"PC2 ({var[1]*100:.1f}%)")
+plt.title("High cooling-efficiency feasibility space (multi-climate variables)")
+plt.legend(frameon=True)
+plt.tight_layout()
+plt.show()
+
+# ============================================================
+# 6) 数值组合范围总结（论文可用）
+# ============================================================
+def regime_summary(df, name):
+    sub = df[df["regime"] == name]
+    if len(sub) == 0:
+        return None
+    q = sub[VARS + [TARGET]].quantile([0.2,0.5,0.8]).T
+    out = pd.DataFrame({
+        "var": q.index,
+        "p20": q[0.2].values,
+        "p50": q[0.5].values,
+        "p80": q[0.8].values
+    })
+    out["regime"] = name
+    out["n"] = len(sub)
+    return out
+
+summary = pd.concat(
+    [regime_summary(df, k) for k in ["Strong","Failure","Stable"]],
+    axis=0
+)
+
+print(summary)
+
+# ============================================================
+# 7) 自动生成“可写进论文”的描述句
+# ============================================================
+def describe(name):
+    sub = summary[summary["regime"] == name]
+    if sub.empty:
+        return f"{name}: no samples."
+    def rng(v):
+        r = sub[sub["var"]==v].iloc[0]
+        return f"[{r.p20:.2f},{r.p80:.2f}]"
+    return (
+        f"{name} cooling-efficiency regime (n={sub.n.iloc[0]}): "
+        f"EVI≈{rng('EVI')}, LAI≈{rng('LAI')}, "
+        f"T2M≈{rng('T2M_C')}, VPD≈{rng('VPD_kPa')}, "
+        f"SSRD≈{rng('SSRD_MJm2')}, WIND≈{rng('WIND10M_MS')}, "
+        f"TP≈{rng('TP_mm')}, SWVL1≈{rng('SWVL1_m3m3')}; "
+        f"CE≈{rng(TARGET)}."
+    )
+
+print(describe("Strong"))
+print(describe("Failure"))
+print(describe("Stable"))
+
+# ============================================================
+# 8) 占比
+# ============================================================
+print("\nRegime proportions (%):")
+print(df["regime"].value_counts(normalize=True).mul(100).round(2))
+
+import os, json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# Config
+# ============================================================
+OUTDIR = "./future_tipping_vpd_windows"
+os.makedirs(OUTDIR, exist_ok=True)
+
+TARGET   = "cooling_efficiency"
+COL_CITY = "city"
+COL_DATE = "date"
+COL_T2M  = "T2M_C"
+COL_VPD  = "VPD_kPa"
+COL_SSRD = "SSRD_MJm2"
+COL_EVI  = "EVI"
+COL_LAI  = "LAI"
+
+# --- City-specific summer definition (hottest-2 months) ---
+BASELINE_Y0, BASELINE_Y1 = 2002, 2006
+HOTTEST_N_MONTHS = 2     # ✅ 你要的“两个月”
+TIE_BREAKER = "all"      # "all"=若并列超过2个月，全保留；"first"=只取排序最前的2个月
+
+# --- High CE definition (within-city quantile) ---
+HIGH_Q_CITY = 0.80   # HighCE = CE >= city P80
+
+# --- VPD axis binning ---
+VPD_BINS = 18
+VPD_BINNING = "quantile"  # "quantile" recommended
+
+# --- Grouping options ---
+SSRD_GROUPS = 3      # tertiles of SSRD within the summer subset
+EVI_GROUPS  = None   # set to 2 or 3 to further split by EVI; None = no split
+
+# --- Curve target quantile for CE upper envelope ---
+CE_Q = 0.90          # P90 of CE in each VPD bin
+
+# ============================================================
+# 0) Load / basic checks
+# ============================================================
+assert "dataset" in globals(), "❌ dataset not found in globals()"
+df = dataset.copy()
+
+df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
+df = df.dropna(subset=[COL_DATE, COL_CITY]).copy()
+df["year"]  = df[COL_DATE].dt.year.astype(int)
+df["month"] = df[COL_DATE].dt.month.astype(int)
+
+need_cols = [TARGET, COL_T2M, COL_VPD, COL_SSRD, COL_EVI, COL_LAI]
+missing = [c for c in need_cols if c not in df.columns]
+assert not missing, f"❌ Missing required columns: {missing}"
+
+# keep finite only (avoid weird curves)
+for c in need_cols:
+    df = df[np.isfinite(df[c].to_numpy(dtype=float))]
+
+# ============================================================
+# 1) City-specific hottest-2 months from baseline (2002–2006)
+# ============================================================
+base = df[(df["year"] >= BASELINE_Y0) & (df["year"] <= BASELINE_Y1)].copy()
+assert len(base) > 0, "❌ No baseline rows found for 2002–2006."
+
+# monthly mean T2M per city in baseline
+city_month_t2m = (
+    base.groupby([COL_CITY, "month"], as_index=False)[COL_T2M]
+        .mean()
+        .rename(columns={COL_T2M: "T2M_mean"})
+)
+
+# pick hottest N months per city
+def pick_hottest_months(g):
+    g = g.sort_values("T2M_mean", ascending=False).copy()
+    if TIE_BREAKER == "first":
+        return g.head(HOTTEST_N_MONTHS)
+    # "all": include ties at the cutoff
+    if len(g) <= HOTTEST_N_MONTHS:
+        return g
+    cutoff = g.iloc[HOTTEST_N_MONTHS - 1]["T2M_mean"]
+    return g[g["T2M_mean"] >= cutoff]
+
+hot_months = city_month_t2m.groupby(COL_CITY, group_keys=False).apply(pick_hottest_months)
+hot_months = hot_months[[COL_CITY, "month", "T2M_mean"]].copy()
+
+# build dict city -> set(months)
+city2months = hot_months.groupby(COL_CITY)["month"].apply(lambda x: set(x.tolist())).to_dict()
+
+# apply summer mask to full df (all years)
+def is_summer_row(row):
+    return row["month"] in city2months.get(row[COL_CITY], set())
+
+summer_mask = df[[COL_CITY, "month"]].apply(is_summer_row, axis=1)
+df_s = df.loc[summer_mask].copy()
+
+print("✅ City-specific summer applied: hottest-2 months per city (baseline 2002–2006).")
+print("Rows after summer filter:", len(df_s), "| Cities:", df_s[COL_CITY].nunique())
+
+# ============================================================
+# 2) Define HighCE (within-city P80)
+# ============================================================
+df_s["ce_hi_city"] = df_s.groupby(COL_CITY)[TARGET].transform(lambda x: x.quantile(HIGH_Q_CITY))
+df_s["HighCE"] = (df_s[TARGET] >= df_s["ce_hi_city"]).astype(int)
+
+# ============================================================
+# 3) Build SSRD groups (within summer subset)
+# ============================================================
+# global tertiles to keep it simple/robust across cities
+ssrd_q = df_s[COL_SSRD].quantile([0.33, 0.67]).to_numpy()
+def ssrd_group(x):
+    if x <= ssrd_q[0]:
+        return "SSRD_low"
+    elif x <= ssrd_q[1]:
+        return "SSRD_mid"
+    else:
+        return "SSRD_high"
+
+df_s["SSRD_grp"] = df_s[COL_SSRD].apply(ssrd_group)
+
+# optional EVI groups
+if EVI_GROUPS in (2, 3):
+    qs = df_s[COL_EVI].quantile(np.linspace(0, 1, EVI_GROUPS + 1)).to_numpy()
+    def evi_grp(x):
+        # bin to 0..EVI_GROUPS-1
+        idx = np.searchsorted(qs, x, side="right") - 1
+        idx = int(np.clip(idx, 0, EVI_GROUPS - 1))
+        return f"EVI_g{idx+1}"
+    df_s["EVI_grp"] = df_s[COL_EVI].apply(evi_grp)
+    GROUP_COLS = ["SSRD_grp", "EVI_grp"]
+else:
+    GROUP_COLS = ["SSRD_grp"]
+
+# ============================================================
+# 4) VPD binning function
+# ============================================================
+vpd = df_s[COL_VPD].to_numpy()
+
+if VPD_BINNING == "quantile":
+    edges = np.quantile(vpd, np.linspace(0, 1, VPD_BINS + 1))
+    # avoid duplicate edges
+    edges = np.unique(edges)
+    if len(edges) < 6:
+        raise ValueError("❌ Too few unique VPD quantile edges; try fewer bins.")
+else:
+    edges = np.linspace(vpd.min(), vpd.max(), VPD_BINS + 1)
+
+# assign bins
+bin_id = np.digitize(df_s[COL_VPD].to_numpy(), edges[1:-1], right=True)
+df_s["vpd_bin"] = bin_id
+
+# bin centers for plotting
+bin_centers = []
+for b in range(df_s["vpd_bin"].max() + 1):
+    m = df_s["vpd_bin"] == b
+    if m.any():
+        bin_centers.append((b, float(df_s.loc[m, COL_VPD].median())))
+bin_center_map = dict(bin_centers)
+df_s["vpd_x"] = df_s["vpd_bin"].map(bin_center_map)
+
+# ============================================================
+# 5) Compute curves:
+#    (a) CE upper quantile (P90) vs VPD
+#    (b) Pr(HighCE) vs VPD
+# ============================================================
+rows_ce = []
+rows_pr = []
+
+group_keys = df_s.groupby(GROUP_COLS).groups.keys()
+for gkey, gdf in df_s.groupby(GROUP_COLS):
+    if not isinstance(gkey, tuple):
+        gkey = (gkey,)
+    gname = " | ".join([f"{c}={v}" for c, v in zip(GROUP_COLS, gkey)])
+
+    for b in sorted(gdf["vpd_bin"].unique()):
+        sub = gdf[gdf["vpd_bin"] == b]
+        if len(sub) < 200:   # avoid noisy tails
+            continue
+        x = float(sub["vpd_x"].iloc[0])
+
+        ce_q = float(sub[TARGET].quantile(CE_Q))
+        pr   = float(sub["HighCE"].mean())
+
+        rows_ce.append({"group": gname, "vpd_bin": int(b), "vpd_x": x, f"CE_p{int(CE_Q*100)}": ce_q, "n": int(len(sub))})
+        rows_pr.append({"group": gname, "vpd_bin": int(b), "vpd_x": x, "Pr_HighCE": pr, "n": int(len(sub))})
+
+ce_curve = pd.DataFrame(rows_ce)
+pr_curve = pd.DataFrame(rows_pr)
+
+ce_curve.to_csv(os.path.join(OUTDIR, f"vpd_curves_ce_p{int(CE_Q*100)}.csv"), index=False)
+pr_curve.to_csv(os.path.join(OUTDIR, "vpd_curves_prob_highce.csv"), index=False)
+
+# ============================================================
+# 6) Turning point detection (simple, robust):
+#    peak of smoothed CE curve (moving median) per group
+# ============================================================
+turns = []
+for g, sub in ce_curve.groupby("group"):
+    sub = sub.sort_values("vpd_x").copy()
+    y = sub[f"CE_p{int(CE_Q*100)}"].to_numpy()
+    x = sub["vpd_x"].to_numpy()
+
+    if len(sub) < 7:
+        continue
+
+    # smooth with rolling median on index
+    ys = pd.Series(y).rolling(5, center=True, min_periods=3).median().to_numpy()
+
+    # find global max in interior (avoid edge artifacts)
+    idx = np.nanargmax(ys)
+    x_peak = float(x[idx])
+    y_peak = float(ys[idx])
+
+    # check "decline after peak" signal (non-trivial drop)
+    post = ys[idx+1:]
+    pre  = ys[:idx]
+    has_pre = np.nanmax(pre) < y_peak - 1e-9 if len(pre) else False
+    has_drop = (np.nanmin(post) < y_peak * 0.98) if len(post) else False  # 2% drop criterion
+
+    turns.append({
+        "group": g,
+        "n_bins": int(len(sub)),
+        "vpd_peak": x_peak,
+        f"CE_peak_smoothed_p{int(CE_Q*100)}": y_peak,
+        "has_nonmonotonic_signal": bool(has_pre and has_drop)
+    })
+
+turn_df = pd.DataFrame(turns)
+turn_df.to_csv(os.path.join(OUTDIR, "turning_points.csv"), index=False)
+
+# ============================================================
+# 7) Plot 1: CE upper quantile vs VPD
+# ============================================================
+fig, ax = plt.subplots(figsize=(10.2, 5.2))
+for g, sub in ce_curve.groupby("group"):
+    sub = sub.sort_values("vpd_x")
+    ax.plot(sub["vpd_x"], sub[f"CE_p{int(CE_Q*100)}"], marker="o", linewidth=2, alpha=0.9, label=g)
+
+ax.set_xlabel("VPD (kPa) [city-specific summer]")
+ax.set_ylabel(f"CE upper envelope: P{int(CE_Q*100)}(cooling_efficiency)")
+ax.set_title(f"High-end cooling efficiency vs VPD (groups by {', '.join(GROUP_COLS)})")
+ax.grid(True, alpha=0.25)
+ax.legend(fontsize=8, frameon=True)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR, f"fig_CE_p{int(CE_Q*100)}_vs_VPD.png"), dpi=220)
+plt.show()
+
+# ============================================================
+# 8) Plot 2: Pr(HighCE) vs VPD
+# ============================================================
+fig, ax = plt.subplots(figsize=(10.2, 5.2))
+for g, sub in pr_curve.groupby("group"):
+    sub = sub.sort_values("vpd_x")
+    ax.plot(sub["vpd_x"], sub["Pr_HighCE"], marker="o", linewidth=2, alpha=0.9, label=g)
+
+ax.set_xlabel("VPD (kPa) [city-specific summer]")
+ax.set_ylabel(f"Pr(HighCE), HighCE = 1(CE ≥ city P{int(HIGH_Q_CITY*100)})")
+ax.set_title(f"Attainability of high cooling efficiency vs VPD (groups by {', '.join(GROUP_COLS)})")
+ax.grid(True, alpha=0.25)
+ax.legend(fontsize=8, frameon=True)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR, "fig_PrHighCE_vs_VPD.png"), dpi=220)
+plt.show()
+
+# ============================================================
+# 9) Methods/log
+# ============================================================
+methods = {
+    "data_source": "dataset (row-level)",
+    "target": TARGET,
+    "summer_definition": f"City-specific hottest-{HOTTEST_N_MONTHS} months based on baseline {BASELINE_Y0}–{BASELINE_Y1} mean T2M_C",
+    "tie_breaker": TIE_BREAKER,
+    "baseline_years": (BASELINE_Y0, BASELINE_Y1),
+    "highCE_definition": f"HighCE = 1(CE >= city P{int(HIGH_Q_CITY*100)})",
+    "ce_upper_quantile": CE_Q,
+    "grouping": GROUP_COLS,
+    "ssrd_groups": SSRD_GROUPS,
+    "evi_groups": EVI_GROUPS,
+    "vpd_binning": {"method": VPD_BINNING, "bins": VPD_BINS},
+    "min_bin_n": 200,
+    "cities": int(df_s[COL_CITY].nunique()),
+    "rows_summer": int(len(df_s)),
+    "year_range": (int(df_s["year"].min()), int(df_s["year"].max()))
+}
+with open(os.path.join(OUTDIR, "methods_log.json"), "w", encoding="utf-8") as f:
+    json.dump(methods, f, ensure_ascii=False, indent=2)
+
+print("\n✅ Saved to:", OUTDIR)
+print(" - vpd_curves_ce_pXX.csv")
+print(" - vpd_curves_prob_highce.csv")
+print(" - turning_points.csv")
+print(" - fig_CE_pXX_vs_VPD.png")
+print(" - fig_PrHighCE_vs_VPD.png")
+print(" - methods_log.json")
+
+import os, json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+OUTDIR = "./climate_multivar_envelope_attainability"
+os.makedirs(OUTDIR, exist_ok=True)
+
+# ---- columns ----
+COL_CITY="city"; COL_DATE="date"
+TARGET="cooling_efficiency"
+COL_T2M="T2M_C"; COL_TD="TD_C"
+COL_VPD="VPD_kPa"; COL_SSRD="SSRD_MJm2"
+COL_WIND="WIND10M_MS"; COL_TP="TP_mm"; COL_STL1="STL1_C"
+COL_EVI="EVI"; COL_LAI="LAI"
+
+CLIMATE_VARS = [COL_T2M, COL_TD, COL_VPD, COL_SSRD, COL_WIND, COL_TP, COL_STL1]
+
+# ---- summer definition (city hottest-2 months by baseline T2M) ----
+BASELINE_Y0, BASELINE_Y1 = 2002, 2006
+HOTTEST_N_MONTHS = 2
+
+# ---- HighCE definition ----
+HIGH_Q_CITY = 0.80
+CE_Q = 0.90               # envelope quantile
+MIN_BIN_N = 200
+BINS = 18
+BINNING = "quantile"      # or "fixed"
+
+# ---- grouping (what to stratify by) ----
+# default: SSRD terciles (global, within summer subset)
+GROUP_BY = COL_SSRD
+GROUP_LABELS = ["low","mid","high"]
+
+assert "dataset" in globals(), "dataset not found"
+df = dataset.copy()
+df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
+df = df.dropna(subset=[COL_DATE, COL_CITY]).copy()
+df["year"]=df[COL_DATE].dt.year.astype(int)
+df["month"]=df[COL_DATE].dt.month.astype(int)
+
+need = [TARGET, COL_T2M, COL_TD, COL_VPD, COL_SSRD, COL_WIND, COL_TP, COL_STL1, COL_EVI, COL_LAI]
+df = df.dropna(subset=need).copy()
+for c in need:
+    df = df[np.isfinite(df[c].to_numpy(float))]
+
+# baseline hottest months per city
+base = df[(df["year"]>=BASELINE_Y0)&(df["year"]<=BASELINE_Y1)].copy()
+cm = base.groupby([COL_CITY,"month"], as_index=False)[COL_T2M].mean().rename(columns={COL_T2M:"T2M_mean"})
+def pick(g):
+    g=g.sort_values("T2M_mean", ascending=False)
+    return g.head(HOTTEST_N_MONTHS)
+hot = cm.groupby(COL_CITY, group_keys=False).apply(pick)
+city2months = hot.groupby(COL_CITY)["month"].apply(lambda x:set(x.tolist())).to_dict()
+
+mask = df[[COL_CITY,"month"]].apply(lambda r: r["month"] in city2months.get(r[COL_CITY], set()), axis=1)
+df = df.loc[mask].copy()
+
+# HighCE within city
+df["ce_hi_city"] = df.groupby(COL_CITY)[TARGET].transform(lambda x: x.quantile(HIGH_Q_CITY))
+df["HighCE"] = (df[TARGET] >= df["ce_hi_city"]).astype(int)
+
+# stratify groups by GROUP_BY terciles
+q = df[GROUP_BY].quantile([0.33,0.67]).to_numpy()
+def grp(x):
+    if x<=q[0]: return f"{GROUP_BY}_low"
+    if x<=q[1]: return f"{GROUP_BY}_mid"
+    return f"{GROUP_BY}_high"
+df["grp"] = df[GROUP_BY].apply(grp)
+
+def make_bins(x):
+    x = x.to_numpy()
+    if BINNING=="quantile":
+        edges = np.unique(np.quantile(x, np.linspace(0,1,BINS+1)))
+        if len(edges)<6: raise ValueError("too few unique edges; reduce BINS")
+    else:
+        edges = np.linspace(np.min(x), np.max(x), BINS+1)
+    bid = np.digitize(x, edges[1:-1], right=True)
+    return edges, bid
+
+# main loop across climate vars
+all_out = []
+for XCOL in CLIMATE_VARS:
+    edges, bid = make_bins(df[XCOL])
+    df["_bin"] = bid
+    # bin center as median
+    centers = df.groupby("_bin")[XCOL].median().to_dict()
+    df["_x"] = df["_bin"].map(centers)
+
+    rows=[]
+    for g, gdf in df.groupby("grp"):
+        for b, sdf in gdf.groupby("_bin"):
+            if len(sdf) < MIN_BIN_N: 
+                continue
+            rows.append({
+                "X": XCOL, "group": g, "bin": int(b),
+                "x": float(sdf["_x"].iloc[0]),
+                f"CE_p{int(CE_Q*100)}": float(sdf[TARGET].quantile(CE_Q)),
+                "Pr_HighCE": float(sdf["HighCE"].mean()),
+                "n": int(len(sdf))
+            })
+    out = pd.DataFrame(rows).sort_values(["group","x"])
+    out.to_csv(os.path.join(OUTDIR, f"curve_{XCOL}.csv"), index=False)
+    all_out.append(out)
+
+    # plot
+    fig, ax = plt.subplots(1,2, figsize=(12,4.2))
+    for g, sub in out.groupby("group"):
+        sub=sub.sort_values("x")
+        ax[0].plot(sub["x"], sub[f"CE_p{int(CE_Q*100)}"], marker="o", label=g)
+        ax[1].plot(sub["x"], sub["Pr_HighCE"], marker="o", label=g)
+    ax[0].set_title(f"CE upper envelope P{int(CE_Q*100)} vs {XCOL}")
+    ax[0].set_xlabel(XCOL); ax[0].set_ylabel(f"P{int(CE_Q*100)}(CE)")
+    ax[1].set_title(f"Attainability Pr(HighCE) vs {XCOL}")
+    ax[1].set_xlabel(XCOL); ax[1].set_ylabel("Pr(HighCE)")
+    for a in ax: a.grid(True, alpha=0.25); a.legend(fontsize=8, frameon=True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTDIR, f"fig_{XCOL}.png"), dpi=220)
+    plt.show()
+
+# save methods
+methods = {
+    "summer_definition": f"City-specific hottest-{HOTTEST_N_MONTHS} months using baseline {BASELINE_Y0}-{BASELINE_Y1} mean T2M_C",
+    "Highs": {"HighCE_city_quantile": HIGH_Q_CITY, "CE_envelope_quantile": CE_Q},
+    "binning": {"method": BINNING, "bins": BINS, "min_bin_n": MIN_BIN_N},
+    "grouping": f"terciles by {GROUP_BY} within summer subset",
+    "climate_vars": CLIMATE_VARS,
+    "rows_summer": int(len(df)),
+    "cities": int(df[COL_CITY].nunique()),
+    "year_range": (int(df["year"].min()), int(df["year"].max()))
+}
+with open(os.path.join(OUTDIR,"methods_log.json"),"w",encoding="utf-8") as f:
+    json.dump(methods, f, ensure_ascii=False, indent=2)
+
+print("✅ Saved:", OUTDIR)
+
+# ============================================================
+# MUST 1–4 (Nature-ready): Window metrics + Multi-var constraint model
+# + City vulnerability + Conceptual summary figure
+#
+# Inputs assumed to exist in memory:
+#   - dataset : DataFrame with columns at least:
+#       city, date, cooling_efficiency,
+#       climate vars: T2M_C, TD_C, VPD_kPa, SSRD_MJm2, WIND10M_MS, TP_mm, STL1_C
+#       veg vars (optional but recommended): EVI, LAI
+#
+# Outputs (saved to OUTDIR):
+#   [MUST1] window_metrics_global.csv, window_metrics_by_city.csv, fig_window_metrics.png
+#   [MUST2] highCE_model_metrics.json, fig_2D_surface_VPD_SSRD.png, fig_pdp_1D.png, fig_perm_importance.png
+#   [MUST3] city_vulnerability.csv, fig_city_risk.png
+#   [MUST4] fig_concept_nature.png
+#   + methods_log.json (all parameters for paper Methods)
+#
+# Color palette (cool tone + light blue/pink): user-requested
+# ============================================================
+
+import os, json, warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import GroupKFold
+from sklearn.metrics import roc_auc_score, average_precision_score, brier_score_loss
+from sklearn.inspection import PartialDependenceDisplay, permutation_importance
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+
+warnings.filterwarnings("ignore")
+
+# ----------------------------
+# 0) Config
+# ----------------------------
+OUTDIR = "./nature_must1_4_outputs"
+os.makedirs(OUTDIR, exist_ok=True)
+
+# Core columns
+COL_CITY  = "city"
+COL_DATE  = "date"
+TARGET_CE = "cooling_efficiency"  # continuous
+# HighCE label: top-q within city (summer subset)
+HIGHCE_Q_WITHIN_CITY = 0.80  # (top 20% in each city)
+
+# Summer definition (city-specific hottest-N months based on baseline mean T2M)
+BASELINE_Y0, BASELINE_Y1 = 2002, 2006
+HOTTEST_N_MONTHS = 2
+
+# Two periods for "risk / drift" (tunable)
+PERIOD_A = (2002, 2006)
+PERIOD_B = (2019, 2025)
+
+# Variables (all climate vars + vegetation capacity)
+VARS = [
+    "EVI","LAI",
+    "T2M_C","TD_C","VPD_kPa","SSRD_MJm2","WIND10M_MS","TP_mm","STL1_C"
+]
+
+# If you want to include other covariates you have (e.g., DEM/LC/DIST_WATER), add here:
+EXTRA_VARS = []  # e.g., ["DEM","LC","DIST_WATER_km"]
+VARS_ALL = VARS + EXTRA_VARS
+
+# Window definition using attainability curve:
+# "Feasible window" = range of X where Pr(HighCE) >= alpha * peak_Pr(HighCE)
+WINDOW_ALPHA = 0.70  # 70% of peak attainability
+# Binning for curves
+NBINS = 18
+MIN_BIN_N = 250
+
+# Group stratification for curves: SSRD terciles (as you did)
+GROUP_BY = "SSRD_MJm2"
+GROUP_LABELS = ["SSRD_low", "SSRD_mid", "SSRD_high"]
+
+# Model for MUST 2 (constraint model): probability of HighCE
+# Use a simple regularized logistic model (robust, interpretable, stable).
+# You can switch to XGBoost if you prefer, but this is "Nature-safe" and reproducible.
+USE_STANDARDIZE = True
+LOGREG_C = 0.8
+LOGREG_PENALTY = "l2"
+
+# Colors: cool pastel palette (user requested)
+COLORS = {
+    "SSRD_low":  "#F4A7B9",  # light pink
+    "SSRD_mid":  "#9AD0F5",  # light blue
+    "SSRD_high": "#2E86C1",  # deeper blue
+    "bg_gray":   "#C7CBD1"
+}
+
+plt.rcParams.update({
+    "figure.dpi": 120,
+    "savefig.dpi": 260,
+    "font.size": 10,
+    "axes.titlesize": 11,
+    "axes.labelsize": 10,
+    "legend.fontsize": 9
+})
+
+# ----------------------------
+# 1) Load + basic prep
+# ----------------------------
+assert "dataset" in globals(), "❌ dataset not found in globals()"
+df = dataset.copy()
+
+df[COL_DATE] = pd.to_datetime(df[COL_DATE], errors="coerce")
+df = df.dropna(subset=[COL_DATE, COL_CITY, TARGET_CE]).copy()
+
+df["year"]  = df[COL_DATE].dt.year.astype(int)
+df["month"] = df[COL_DATE].dt.month.astype(int)
+
+# keep only needed vars that exist
+exist_vars = [c for c in VARS_ALL if c in df.columns]
+missing_vars = [c for c in VARS_ALL if c not in df.columns]
+print("✅ Using variables:", exist_vars)
+if missing_vars:
+    print("⚠ Missing (skipped):", missing_vars)
+
+need = [TARGET_CE, COL_CITY, "year", "month"] + exist_vars
+df = df.dropna(subset=need).copy()
+
+# enforce finites
+for c in [TARGET_CE] + exist_vars:
+    v = df[c].to_numpy()
+    df = df[np.isfinite(v)]
+
+print("Dataset rows (finite):", len(df), "| cities:", df[COL_CITY].nunique(), "| years:", (df["year"].min(), df["year"].max()))
+
+# ----------------------------
+# 2) City-specific summer (hottest-N months by baseline mean T2M_C)
+# ----------------------------
+assert "T2M_C" in df.columns, "❌ need T2M_C for city-specific summer definition"
+
+base = df[(df["year"] >= BASELINE_Y0) & (df["year"] <= BASELINE_Y1)].copy()
+cm = (base.groupby([COL_CITY, "month"], as_index=False)["T2M_C"].mean()
+      .rename(columns={"T2M_C":"T2M_mean"}))
+
+def pick_hottest(g):
+    g = g.sort_values("T2M_mean", ascending=False)
+    return g.head(HOTTEST_N_MONTHS)
+
+hot = cm.groupby(COL_CITY, group_keys=False).apply(pick_hottest)
+city2months = hot.groupby(COL_CITY)["month"].apply(lambda x: set(x.tolist())).to_dict()
+
+mask_summer = df[[COL_CITY,"month"]].apply(lambda r: r["month"] in city2months.get(r[COL_CITY], set()), axis=1)
+df_s = df.loc[mask_summer].copy()
+
+print("✅ Summer subset rows:", len(df_s), "| cities:", df_s[COL_CITY].nunique())
+
+# ----------------------------
+# 3) Define HighCE label (top-q within city in summer)
+# ----------------------------
+df_s["ce_thr_city"] = df_s.groupby(COL_CITY)[TARGET_CE].transform(lambda x: x.quantile(HIGHCE_Q_WITHIN_CITY))
+df_s["HighCE"] = (df_s[TARGET_CE] >= df_s["ce_thr_city"]).astype(int)
+
+# ----------------------------
+# 4) Stratify SSRD terciles (within summer subset)
+# ----------------------------
+q1, q2 = df_s[GROUP_BY].quantile([0.33, 0.67]).to_numpy()
+
+def ssrd_grp(x):
+    if x <= q1: return "SSRD_low"
+    if x <= q2: return "SSRD_mid"
+    return "SSRD_high"
+
+df_s["SSRD_grp"] = df_s[GROUP_BY].apply(ssrd_grp)
+
+# ----------------------------
+# Helpers: binned curves
+# ----------------------------
+def binned_curve(df_in, xcol, ycol, groupcol="SSRD_grp", nbins=NBINS, min_n=MIN_BIN_N, mode="quantile"):
+    """Return per-group binned curves: x_center, y_stat(s)."""
+    rows = []
+    for g, gdf in df_in.groupby(groupcol):
+        x = gdf[xcol].to_numpy()
+        if mode == "quantile":
+            edges = np.unique(np.quantile(x, np.linspace(0, 1, nbins + 1)))
+            if len(edges) < 6:
+                # fallback to fixed bins if too few unique
+                edges = np.linspace(np.nanmin(x), np.nanmax(x), nbins + 1)
+        else:
+            edges = np.linspace(np.nanmin(x), np.nanmax(x), nbins + 1)
+
+        b = np.digitize(x, edges[1:-1], right=True)
+        gdf = gdf.copy()
+        gdf["_bin"] = b
+
+        for bi, sdf in gdf.groupby("_bin"):
+            if len(sdf) < min_n:
+                continue
+            rows.append({
+                "group": g,
+                "bin": int(bi),
+                "x_center": float(sdf[xcol].median()),
+                "n": int(len(sdf)),
+                "Pr_HighCE": float(sdf["HighCE"].mean()),
+                "CE_p90": float(sdf[TARGET_CE].quantile(0.90)),
+                "CE_p50": float(sdf[TARGET_CE].quantile(0.50)),
+            })
+    out = pd.DataFrame(rows).sort_values(["group","x_center"])
+    return out
+
+def compute_window_metrics(curve_df, alpha=WINDOW_ALPHA):
+    """Window width per group for attainability curve: x-range where Pr >= alpha*peak."""
+    res = []
+    for g, sub in curve_df.groupby("group"):
+        sub = sub.sort_values("x_center")
+        pr = sub["Pr_HighCE"].to_numpy()
+        x  = sub["x_center"].to_numpy()
+        if len(sub) < 5:
+            continue
+        peak = float(np.nanmax(pr))
+        thr  = alpha * peak
+        ok   = pr >= thr
+        if ok.sum() < 2:
+            width = 0.0
+            x_lo = np.nan; x_hi = np.nan
+        else:
+            x_lo = float(np.nanmin(x[ok]))
+            x_hi = float(np.nanmax(x[ok]))
+            width = x_hi - x_lo
+        # "collapse" proxy: tail drop from peak to top-10% x region (right tail)
+        # robust: average last 2 points (if exist)
+        tail = float(np.nanmean(pr[-2:])) if len(pr) >= 2 else float(pr[-1])
+        collapse = peak - tail
+        res.append({
+            "group": g,
+            "peak_Pr": peak,
+            "thr_Pr": thr,
+            "x_lo": x_lo,
+            "x_hi": x_hi,
+            "window_width": width,
+            "collapse_peak_minus_tail": collapse
+        })
+    return pd.DataFrame(res)
+
+# ============================================================
+# MUST 1) Quantify "window width" + "collapse index" across variables
+# ============================================================
+window_rows = []
+curve_cache = {}
+
+for xcol in [c for c in exist_vars if c not in ["EVI","LAI"]]:  # focus climate vars for window metrics
+    curve = binned_curve(df_s, xcol=xcol, ycol="HighCE", groupcol="SSRD_grp")
+    if len(curve) == 0:
+        continue
+    curve_cache[xcol] = curve
+    w = compute_window_metrics(curve, alpha=WINDOW_ALPHA)
+    w["xcol"] = xcol
+    window_rows.append(w)
+
+win = pd.concat(window_rows, axis=0).reset_index(drop=True)
+win.to_csv(os.path.join(OUTDIR, "window_metrics_global.csv"), index=False)
+
+# Plot: window width + collapse for each variable (Nature-ready)
+fig, ax = plt.subplots(1, 2, figsize=(12.5, 4.2))
+
+# panel A: window width
+for g in GROUP_LABELS:
+    sub = win[win["group"] == g].copy()
+    sub = sub.sort_values("window_width", ascending=False)
+    ax[0].scatter(sub["window_width"], np.arange(len(sub)), s=45, c=COLORS[g], alpha=0.85, label=g)
+    # annotate var names lightly
+    for i, (ww, name) in enumerate(zip(sub["window_width"], sub["xcol"])):
+        ax[0].text(ww + 0.01*max(1e-6, sub["window_width"].max()), i, name, va="center", fontsize=9, color="#3A3A3A")
+
+ax[0].set_title(f"Feasible-window width (Pr(HighCE) ≥ {int(WINDOW_ALPHA*100)}% of peak)")
+ax[0].set_xlabel("Window width in raw units of X")
+ax[0].set_yticks([])
+ax[0].grid(True, alpha=0.25)
+ax[0].legend(frameon=True)
+
+# panel B: collapse index
+for g in GROUP_LABELS:
+    sub = win[win["group"] == g].copy()
+    sub = sub.sort_values("collapse_peak_minus_tail", ascending=False)
+    ax[1].scatter(sub["collapse_peak_minus_tail"], np.arange(len(sub)), s=45, c=COLORS[g], alpha=0.85, label=g)
+    for i, (cc, name) in enumerate(zip(sub["collapse_peak_minus_tail"], sub["xcol"])):
+        ax[1].text(cc + 0.01*max(1e-6, sub["collapse_peak_minus_tail"].max()), i, name, va="center", fontsize=9, color="#3A3A3A")
+
+ax[1].set_title("Collapse index (peak Pr − tail Pr)")
+ax[1].set_xlabel("Probability drop")
+ax[1].set_yticks([])
+ax[1].grid(True, alpha=0.25)
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR, "fig_window_metrics.png"), bbox_inches="tight")
+plt.show()
+
+# Per-city window metrics (example: VPD window width in SSRD_high)
+# (You can extend to all vars if desired; keep minimal for paper)
+def city_window_for_var(xcol="VPD_kPa"):
+    out = []
+    for city, cdf in df_s.groupby(COL_CITY):
+        if len(cdf) < 2000:
+            continue
+        curve = binned_curve(cdf, xcol=xcol, ycol="HighCE", groupcol="SSRD_grp", min_n=80)
+        if len(curve) == 0:
+            continue
+        w = compute_window_metrics(curve, alpha=WINDOW_ALPHA)
+        w["city"] = city
+        w["xcol"] = xcol
+        out.append(w)
+    return pd.concat(out, axis=0).reset_index(drop=True) if out else pd.DataFrame()
+
+city_win = city_window_for_var("VPD_kPa")
+if len(city_win) > 0:
+    city_win.to_csv(os.path.join(OUTDIR, "window_metrics_by_city.csv"), index=False)
+
+# ============================================================
+# MUST 2) Constraint model: HighCE ~ all climate vars (+ EVI/LAI)
+#       + 2D response surface (VPD×SSRD) and 1D PDPs
+# ============================================================
+
+# Build modeling frame (drop missing in features)
+FEATS = [c for c in exist_vars if c in df_s.columns]
+# Ensure we at least include the core set:
+for c in ["EVI","LAI","T2M_C","TD_C","VPD_kPa","SSRD_MJm2","WIND10M_MS","TP_mm","STL1_C"]:
+    if c in df_s.columns and c not in FEATS:
+        FEATS.append(c)
+
+X = df_s[FEATS].copy()
+y = df_s["HighCE"].astype(int).copy()
+groups = df_s[COL_CITY].astype(str).copy()
+
+# Model: regularized logistic regression with standardization (interpretable)
+steps = []
+if USE_STANDARDIZE:
+    steps.append(("scaler", StandardScaler(with_mean=True, with_std=True)))
+steps.append(("clf", LogisticRegression(
+    C=LOGREG_C, penalty=LOGREG_PENALTY, solver="lbfgs", max_iter=400
+)))
+model = Pipeline(steps)
+
+# GroupKFold CV metrics
+gkf = GroupKFold(n_splits=5)
+aucs, aps, briers = [], [], []
+pred_all = np.zeros(len(df_s), dtype=float)
+
+for tr, te in gkf.split(X, y, groups):
+    model.fit(X.iloc[tr], y.iloc[tr])
+    p = model.predict_proba(X.iloc[te])[:,1]
+    pred_all[te] = p
+    aucs.append(roc_auc_score(y.iloc[te], p))
+    aps.append(average_precision_score(y.iloc[te], p))
+    briers.append(brier_score_loss(y.iloc[te], p))
+
+model.fit(X, y)  # final fit on all summer data
+
+metrics = {
+    "model": "LogisticRegression + StandardScaler" if USE_STANDARDIZE else "LogisticRegression",
+    "features": FEATS,
+    "cv": {
+        "AUC_mean": float(np.mean(aucs)), "AUC_std": float(np.std(aucs)),
+        "AP_mean": float(np.mean(aps)),   "AP_std": float(np.std(aps)),
+        "Brier_mean": float(np.mean(briers)), "Brier_std": float(np.std(briers))
+    },
+    "label_def": f"HighCE = 1(CE >= city summer q{int(HIGHCE_Q_WITHIN_CITY*100)})",
+}
+with open(os.path.join(OUTDIR, "highCE_model_metrics.json"), "w", encoding="utf-8") as f:
+    json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+print("✅ MUST2 model CV:", metrics["cv"])
+
+# Permutation importance (global)
+perm = permutation_importance(model, X, y, n_repeats=8, random_state=42, scoring="roc_auc")
+imp = pd.DataFrame({
+    "feature": FEATS,
+    "importance_mean": perm.importances_mean,
+    "importance_std": perm.importances_std
+}).sort_values("importance_mean", ascending=False)
+imp.to_csv(os.path.join(OUTDIR, "perm_importance_auc.csv"), index=False)
+
+plt.figure(figsize=(7.2, 4.4))
+top = imp.head(12).iloc[::-1]
+plt.barh(top["feature"], top["importance_mean"], xerr=top["importance_std"], color="#9AD0F5", alpha=0.95)
+plt.title("Permutation importance (AUC drop) for HighCE attainability")
+plt.xlabel("ΔAUC (higher = more important)")
+plt.grid(True, axis="x", alpha=0.25)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR, "fig_perm_importance.png"), bbox_inches="tight")
+plt.show()
+
+# 1D PDP for key variables (Nature-friendly, avoid overplot)
+PDP_VARS = [c for c in ["VPD_kPa","SSRD_MJm2","T2M_C","TD_C","WIND10M_MS","TP_mm"] if c in FEATS]
+fig, ax = plt.subplots(2, 3, figsize=(12.8, 7.2))
+ax = ax.flatten()
+
+for i, v in enumerate(PDP_VARS[:6]):
+    PartialDependenceDisplay.from_estimator(
+        model, X, [v], kind="average", ax=ax[i], grid_resolution=25
+    )
+    ax[i].set_title(f"PDP: Pr(HighCE) vs {v}")
+    ax[i].grid(True, alpha=0.25)
+
+for j in range(len(PDP_VARS[:6]), 6):
+    ax[j].axis("off")
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR, "fig_pdp_1D.png"), bbox_inches="tight")
+plt.show()
+
+# 2D response surface: VPD × SSRD (others fixed at median)
+assert "VPD_kPa" in FEATS and "SSRD_MJm2" in FEATS, "Need VPD_kPa and SSRD_MJm2 for 2D surface"
+
+vpd_grid = np.linspace(df_s["VPD_kPa"].quantile(0.02), df_s["VPD_kPa"].quantile(0.98), 60)
+ssr_grid = np.linspace(df_s["SSRD_MJm2"].quantile(0.02), df_s["SSRD_MJm2"].quantile(0.98), 60)
+V, S = np.meshgrid(vpd_grid, ssr_grid)
+
+X0 = pd.DataFrame({c: df_s[c].median() for c in FEATS}, index=np.arange(V.size))
+X0["VPD_kPa"] = V.ravel()
+X0["SSRD_MJm2"] = S.ravel()
+
+P = model.predict_proba(X0)[:,1].reshape(V.shape)
+
+plt.figure(figsize=(7.2, 5.6))
+# cool pastel colormap (blue→pink)
+cmap = plt.cm.cool  # cool is blue-magenta; "coolwarm" is stronger; user asked light blue/pink
+im = plt.pcolormesh(V, S, P, shading="auto", cmap=cmap, vmin=np.nanpercentile(P, 2), vmax=np.nanpercentile(P, 98))
+cb = plt.colorbar(im)
+cb.set_label("Predicted Pr(HighCE)")
+
+# overlay feasible window ridge line: for each SSRD, VPD at max probability
+ridge_vpd = vpd_grid[np.argmax(P, axis=1)]
+plt.plot(ridge_vpd, ssr_grid, color="#FFFFFF", linewidth=2.0, alpha=0.9)
+plt.plot(ridge_vpd, ssr_grid, color="#2E86C1", linewidth=1.2, alpha=0.9)
+
+plt.title("Attainability surface: Pr(HighCE) over VPD × SSRD (others fixed at median)")
+plt.xlabel("VPD (kPa) [city-specific summer]")
+plt.ylabel("SSRD (MJ/m²)")
+plt.grid(False)
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR, "fig_2D_surface_VPD_SSRD.png"), bbox_inches="tight")
+plt.show()
+
+# ============================================================
+# MUST 3) City vulnerability: who is falling out of the window?
+#   Metric: ΔPr(HighCE) from Period A to Period B, and "collapse" in extreme demand
+# ============================================================
+
+def city_period_stats(df_in, y0, y1):
+    sub = df_in[(df_in["year"] >= y0) & (df_in["year"] <= y1)].copy()
+    out = (sub.groupby(COL_CITY, as_index=False)
+            .agg(
+                n=("HighCE","size"),
+                Pr_HighCE=("HighCE","mean"),
+                CE_p90=(TARGET_CE, lambda x: float(np.quantile(x, 0.90))),
+                VPD_p90=("VPD_kPa", lambda x: float(np.quantile(x, 0.90))) if "VPD_kPa" in sub.columns else ("HighCE","mean"),
+                SSRD_med=("SSRD_MJm2","median") if "SSRD_MJm2" in sub.columns else ("HighCE","mean")
+            ))
+    out["period"] = f"{y0}_{y1}"
+    return out
+
+A = city_period_stats(df_s, *PERIOD_A)
+B = city_period_stats(df_s, *PERIOD_B)
+
+city = A.merge(B, on=COL_CITY, suffixes=("_A","_B"))
+city["dPr_HighCE"] = city["Pr_HighCE_B"] - city["Pr_HighCE_A"]
+city["dCE_p90"]    = city["CE_p90_B"] - city["CE_p90_A"]
+
+# "extreme demand" = top 10% VPD within each city-period; check attainability there
+def extreme_tail_pr(df_in, y0, y1, q=0.90):
+    sub = df_in[(df_in["year"] >= y0) & (df_in["year"] <= y1)].copy()
+    res = []
+    for c, cdf in sub.groupby(COL_CITY):
+        if len(cdf) < 800:
+            continue
+        thr = float(np.quantile(cdf["VPD_kPa"], q))
+        tail = cdf[cdf["VPD_kPa"] >= thr]
+        res.append({"city": c, f"Pr_highCE_tailVPD_{y0}_{y1}": float(tail["HighCE"].mean()), "tail_thr": thr})
+    return pd.DataFrame(res)
+
+tailA = extreme_tail_pr(df_s, *PERIOD_A, q=0.90)
+tailB = extreme_tail_pr(df_s, *PERIOD_B, q=0.90)
+
+city = city.merge(tailA[[ "city", f"Pr_highCE_tailVPD_{PERIOD_A[0]}_{PERIOD_A[1]}" ]], on="city", how="left")
+city = city.merge(tailB[[ "city", f"Pr_highCE_tailVPD_{PERIOD_B[0]}_{PERIOD_B[1]}" ]], on="city", how="left")
+
+city["dPr_tailVPD"] = city[f"Pr_highCE_tailVPD_{PERIOD_B[0]}_{PERIOD_B[1]}"] - city[f"Pr_highCE_tailVPD_{PERIOD_A[0]}_{PERIOD_A[1]}"]
+
+city.to_csv(os.path.join(OUTDIR, "city_vulnerability.csv"), index=False)
+
+# City risk plot (Nature-ready): ΔPr overall vs ΔPr in extreme VPD tail
+plt.figure(figsize=(7.2, 5.2))
+x = city["dPr_HighCE"].to_numpy()
+y = city["dPr_tailVPD"].to_numpy()
+plt.scatter(x, y, s=38, c="#9AD0F5", edgecolor="#2E86C1", linewidth=0.6, alpha=0.85)
+
+plt.axhline(0, color="#666666", linewidth=1.0, alpha=0.6)
+plt.axvline(0, color="#666666", linewidth=1.0, alpha=0.6)
+plt.xlabel("ΔPr(HighCE): Period B − Period A")
+plt.ylabel("ΔPr(HighCE in top-10% VPD tail): Period B − Period A")
+plt.title("City vulnerability: falling out of the high-efficiency window under extreme demand")
+plt.grid(True, alpha=0.25)
+
+# annotate worst 8 cities (largest negative tail drop)
+tmp = city.dropna(subset=["dPr_tailVPD"]).sort_values("dPr_tailVPD").head(8)
+for _, r in tmp.iterrows():
+    plt.text(r["dPr_HighCE"]+0.001, r["dPr_tailVPD"]+0.001, str(r["city"])[:18], fontsize=8, color="#2B2B2B")
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR, "fig_city_risk.png"), bbox_inches="tight")
+plt.show()
+
+# ============================================================
+# MUST 4) One Nature-style conceptual figure:
+#   "Potential vs Attainability" with window overlay (VPD example)
+# ============================================================
+
+# Build curves for VPD (already have in your earlier figures, redo cleanly)
+xcol = "VPD_kPa"
+curve_vpd = curve_cache.get(xcol, binned_curve(df_s, xcol=xcol, ycol="HighCE", groupcol="SSRD_grp"))
+
+# smooth-ish by rolling average (per group) for presentation only
+def smooth_group(sub, k=3):
+    sub = sub.sort_values("x_center").copy()
+    for c in ["CE_p90","Pr_HighCE"]:
+        sub[c+"_sm"] = pd.Series(sub[c]).rolling(k, center=True, min_periods=1).mean().to_numpy()
+    return sub
+
+fig, ax = plt.subplots(1, 2, figsize=(12.2, 4.6))
+
+for g in GROUP_LABELS:
+    sub = curve_vpd[curve_vpd["group"] == g]
+    if len(sub) == 0:
+        continue
+    sub = smooth_group(sub, k=3)
+    ax[0].plot(sub["x_center"], sub["CE_p90_sm"], marker="o", markersize=4, color=COLORS[g], linewidth=2.0, label=g)
+    ax[1].plot(sub["x_center"], sub["Pr_HighCE_sm"], marker="o", markersize=4, color=COLORS[g], linewidth=2.0, label=g)
+
+# overlay feasible window for SSRD_high
+w_vpd = compute_window_metrics(curve_vpd[curve_vpd["group"]=="SSRD_high"], alpha=WINDOW_ALPHA)
+if len(w_vpd) == 1 and np.isfinite(w_vpd["x_lo"].iloc[0]):
+    xlo, xhi = float(w_vpd["x_lo"].iloc[0]), float(w_vpd["x_hi"].iloc[0])
+    for a in ax:
+        a.axvspan(xlo, xhi, color="#9AD0F5", alpha=0.18, linewidth=0)
+
+ax[0].set_title("Potential: CE upper envelope (P90) vs VPD")
+ax[0].set_xlabel("VPD (kPa) [city-specific summer]")
+ax[0].set_ylabel("P90(cooling efficiency)")
+ax[0].grid(True, alpha=0.22)
+
+ax[1].set_title("Attainability: Pr(HighCE) vs VPD")
+ax[1].set_xlabel("VPD (kPa) [city-specific summer]")
+ax[1].set_ylabel("Pr(HighCE)")
+ax[1].grid(True, alpha=0.22)
+
+for a in ax:
+    a.legend(frameon=True)
+
+plt.tight_layout()
+plt.savefig(os.path.join(OUTDIR, "fig_concept_nature.png"), bbox_inches="tight")
+plt.show()
+
+# ============================================================
+# Methods / Log export (paper-ready parameters)
+# ============================================================
+methods_log = {
+    "data": {
+        "rows_summer": int(len(df_s)),
+        "cities": int(df_s[COL_CITY].nunique()),
+        "year_range": (int(df_s["year"].min()), int(df_s["year"].max()))
+    },
+    "summer_definition": {
+        "baseline_years": [BASELINE_Y0, BASELINE_Y1],
+        "hottest_months_N": HOTTEST_N_MONTHS,
+        "method": "city-specific hottest-N months by baseline mean T2M_C"
+    },
+    "HighCE_definition": {
+        "within_city_quantile": HIGHCE_Q_WITHIN_CITY,
+        "label": "HighCE = 1(CE >= city summer quantile)"
+    },
+    "window_metrics": {
+        "alpha_of_peak": WINDOW_ALPHA,
+        "nbins": NBINS,
+        "min_bin_n": MIN_BIN_N,
+        "group_by": "SSRD terciles within summer subset",
+        "periods_for_city_risk": {"A": PERIOD_A, "B": PERIOD_B},
+        "extreme_tail": {"variable": "VPD_kPa", "q": 0.90}
+    },
+    "model": {
+        "type": metrics["model"],
+        "features": FEATS,
+        "cv_metrics": metrics["cv"]
+    },
+    "palette": COLORS
+}
+
+with open(os.path.join(OUTDIR, "methods_log.json"), "w", encoding="utf-8") as f:
+    json.dump(methods_log, f, ensure_ascii=False, indent=2)
+
+print("\n✅ DONE. All Nature-ready outputs saved to:", OUTDIR)
+print("Key files:",
+      "\n - fig_window_metrics.png",
+      "\n - fig_perm_importance.png",
+      "\n - fig_pdp_1D.png",
+      "\n - fig_2D_surface_VPD_SSRD.png",
+      "\n - fig_city_risk.png",
+      "\n - fig_concept_nature.png",
+      "\n - methods_log.json")
