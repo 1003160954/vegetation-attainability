@@ -1,0 +1,1269 @@
+/**** Guangzhou | ERA5-Land Daily Aggregates → 8-day | 0.1° 对齐 | 分段导出（解决 toBands>5000） ****/
+
+/* ===== 0) 参数 ===== */
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;            // 0.1°
+var DO_EXPORT       = true;
+
+var EXPORT_FOLDER_ERA = 'ERA5L_8day_0p1deg_CITY_' + CITY_NAME;
+
+/* ===== 1) ROI（干净 EPSG:4326 矩形）与导出矩阵 ===== */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color: 'orange'}, CITY_NAME + ' ROI rect', false);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+/* ===== 2) ERA5-Land 每日聚合集合 ===== */
+var ERA = ee.ImageCollection('ECMWF/ERA5_LAND/DAILY_AGGR')
+  .select([
+    'temperature_2m',
+    'dewpoint_temperature_2m',
+    'u_component_of_wind_10m',
+    'v_component_of_wind_10m',
+    'surface_solar_radiation_downwards_sum',
+    'total_precipitation_sum',
+    'volumetric_soil_water_layer_1',
+    'soil_temperature_level_1'
+  ]);
+
+/* ===== 3) 时间工具 ===== */
+function list8dayDatesBetween(startDate, endDate){
+  startDate = ee.Date(startDate);
+  endDate   = ee.Date(endDate);
+  var nDays = endDate.difference(startDate, 'day');
+  var steps = ee.List.sequence(0, nDays.subtract(1), 8);
+  return steps.map(function(d){ return startDate.advance(ee.Number(d), 'day'); });
+}
+function tagYYYYMMDD(date){ return ee.Date(date).format('YYYYMMdd'); }
+
+/* ===== 4) VPD（kPa） ===== */
+function vpdFromT_Td_C(tC, tdC){
+  return tC.expression(
+    '0.6108*exp(17.27*T/(T+237.3)) - 0.6108*exp(17.27*Td/(Td+237.3))',
+    {T: tC, Td: tdC}
+  ).rename('VPD_kPa');
+}
+
+/* ===== 5) 空窗占位（全掩膜） ===== */
+function emptyBandsForTag(tag){
+  var e = ee.Image(0).updateMask(ee.Image(0));
+  return e.rename(ee.String('T2M_C_').cat(tag))
+    .addBands(e.rename(ee.String('TD_C_').cat(tag)))
+    .addBands(e.rename(ee.String('VPD_kPa_').cat(tag)))
+    .addBands(e.rename(ee.String('WIND10M_MS_').cat(tag)))
+    .addBands(e.rename(ee.String('SSRD_MJm2_').cat(tag)))
+    .addBands(e.rename(ee.String('TP_mm_').cat(tag)))
+    .addBands(e.rename(ee.String('SWVL1_m3m3_').cat(tag)))
+    .addBands(e.rename(ee.String('STL1_C_').cat(tag)));
+}
+
+/* ===== 6) 日集合 → 8天窗口聚合 ===== */
+function aggregate8dayWindow(dStart){
+  dStart = ee.Date(dStart);
+  var dEnd = dStart.advance(8, 'day');
+  var tag  = tagYYYYMMDD(dStart);
+
+  var daily = ERA.filterDate(dStart, dEnd).filterBounds(roiSafe);
+  var hasData = daily.size().gt(0);
+
+  var out = ee.Image(ee.Algorithms.If(hasData, (function(){
+    var T2M_C = daily.select('temperature_2m').mean().subtract(273.15).rename('T2M_C');
+    var TD_C  = daily.select('dewpoint_temperature_2m').mean().subtract(273.15).rename('TD_C');
+
+    var U = daily.select('u_component_of_wind_10m').mean();
+    var V = daily.select('v_component_of_wind_10m').mean();
+    var WIND = U.hypot(V).rename('WIND10M_MS');
+
+    var SSRD_MJ = daily.select('surface_solar_radiation_downwards_sum').sum().divide(1e6).rename('SSRD_MJm2');
+    var TP_mm   = daily.select('total_precipitation_sum').sum().multiply(1000).rename('TP_mm');
+
+    var SWVL1 = daily.select('volumetric_soil_water_layer_1').mean().rename('SWVL1_m3m3');
+    var STL1C = daily.select('soil_temperature_level_1').mean().subtract(273.15).rename('STL1_C');
+
+    var VPD = vpdFromT_Td_C(T2M_C, TD_C);
+
+    return T2M_C.rename(ee.String('T2M_C_').cat(tag))
+      .addBands(TD_C.rename(ee.String('TD_C_').cat(tag)))
+      .addBands(VPD.rename(ee.String('VPD_kPa_').cat(tag)))
+      .addBands(WIND.rename(ee.String('WIND10M_MS_').cat(tag)))
+      .addBands(SSRD_MJ.rename(ee.String('SSRD_MJm2_').cat(tag)))
+      .addBands(TP_mm.rename(ee.String('TP_mm_').cat(tag)))
+      .addBands(SWVL1.rename(ee.String('SWVL1_m3m3_').cat(tag)))
+      .addBands(STL1C.rename(ee.String('STL1_C_').cat(tag)));
+  })(), emptyBandsForTag(tag)));
+
+  return out;
+}
+
+/* ===== 7) 构建一个“分段” 8天栈（避免 >5000 bands） ===== */
+function buildERA8dayStackSegment(startDate, endDate){
+  var dates8 = ee.List(list8dayDatesBetween(startDate, endDate));
+  var ic = ee.ImageCollection.fromImages(dates8.map(aggregate8dayWindow));
+  var img = ic.toBands();
+
+  // 清理 toBands 数字前缀
+  var old = img.bandNames();
+  var neu = old.map(function(n){ return ee.String(n).replace('^(\\d+_)+',''); });
+  img = img.rename(neu);
+
+  // 统一输出格网 + clip
+  img = img.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  img = img.clip(roiSafe);
+
+  return img;
+}
+
+/* ===== 8) 导出一个分段 ===== */
+function exportSegment(label, startDate, endDate){
+  var img = buildERA8dayStackSegment(startDate, endDate);
+
+  print('Segment', label, 'bands =', img.bandNames().size());
+  print('Segment', label, 'first 12 bands:', img.bandNames().slice(0, 12));
+
+  // 预览：第一个 T2M band
+  var t2mBands = img.bandNames().filter(ee.Filter.stringContains('item', 'T2M_C_'));
+  var firstT2M = ee.String(t2mBands.sort().get(0));
+  Map.addLayer(img.select([firstT2M]), {min:-5, max:35}, CITY_NAME + ' ERA5L T2M sample ' + label, false);
+
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image         : img.toFloat(),
+      description   : CITY_NAME + '_ERA5Lmain_8day_0p1deg_' + label,
+      folder        : EXPORT_FOLDER_ERA,
+      fileNamePrefix: CITY_NAME + '_ERA5Lmain_8day_0p1deg_' + label,
+      region        : roiSafe,
+      crs           : EXPORT_CRS,
+      dimensions    : EXPORT_DIMS.getInfo(),
+      maxPixels     : 1e13
+    });
+  }
+}
+
+/* ===== 9) 三段导出（你也可以按需改段） ===== */
+exportSegment('2002_2010', ee.Date('2002-01-01'), ee.Date('2011-01-01'));
+exportSegment('2011_2018', ee.Date('2011-01-01'), ee.Date('2019-01-01'));
+exportSegment('2019_2025', ee.Date('2019-01-01'), ee.Date('2026-01-01'));
+
+print('✅ 已创建 ERA5-Land 分段导出任务（解决 toBands>5000）。到 Tasks 启动导出。');
+
+/**** City | Annual Land Cover stack (2002–2025) | MODIS MCD12Q1 v061 (IGBP)
+      Output: ONE multi-band GeoTIFF (bands: LC_2002 … LC_2025)
+      Grid aligned to EPSG:4326 @ 0.005°, region=roiSafe, dimensions fixed ****/
+
+/* ===== 0) Parameters ===== */
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+var START_YEAR = 2002;
+var END_YEAR   = 2025;  // missing years fallback to latest available
+
+var EXPORT_CRS     = 'EPSG:4326';
+var DEG_PER_PIXEL  = 0.005;        // 0.1°
+var DO_EXPORT      = true;
+
+var EXPORT_FOLDER  = 'MODIS_LC_STACK_CITY_' + CITY_NAME;
+
+/* ===== 1) ROI（干净 EPSG:4326 矩形）与导出矩阵（固定 dimensions） ===== */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+// ★ 干净矩形（EPSG:4326 + geodesic:false）
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color:'red'}, CITY_NAME + ' ROI rect', false);
+
+// 固定像素矩阵（与 0.1° 对齐）
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+print('City:', CITY_NAME);
+print('Export dims @ 0.005°:', EXPORT_DIMS);
+
+/* ===== 2) MODIS MCD12Q1 (IGBP classes 0–16) ===== */
+var LC = ee.ImageCollection('MODIS/061/MCD12Q1').select('LC_Type1');
+
+// Latest available LC year (for fallback)
+var latestImg  = LC.sort('system:time_start', false).first();
+var latestYear = ee.Date(latestImg.get('system:time_start')).get('year');
+print('Latest available LC year =', latestYear);
+
+/* ===== 3) Build a single-band image for a given year (fallback to latest if missing)
+         Note: keep original band name inside each image; rename after toBands using client-side list. ===== */
+function lcBandForYear(y){
+  y = ee.Number(y);
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end   = ee.Date.fromYMD(y.add(1), 1, 1);
+
+  var subset = LC.filterDate(start, end);
+  var has    = subset.size().gt(0);
+
+  var fallback = LC.filterDate(
+    ee.Date.fromYMD(latestYear, 1, 1),
+    ee.Date.fromYMD(latestYear.add(1), 1, 1)
+  ).first();
+
+  var img = ee.Image(ee.Algorithms.If(has, subset.first(), fallback));
+
+  // ★ 声明输出格网（0.1° EPSG:4326），再 clip 到 roiSafe
+  img = ee.Image(img)
+    .setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL)
+    .clip(roiSafe)
+    .toInt16(); // LC 0–16，int16 更稳（也可 int8）
+
+  return img;
+}
+
+/* ===== 4) Build annual stack (2002–2025) as ONE multi-band image ===== */
+var yearsEE = ee.List.sequence(START_YEAR, END_YEAR);
+var imgList = yearsEE.map(lcBandForYear);
+var stack   = ee.ImageCollection.fromImages(imgList).toBands();
+
+// ---- Rename bands (client-side list) to LC_2002 ... LC_2025 ----
+var yearsJS = yearsEE.getInfo(); // [2002, 2003, ..., 2025]
+var desiredNames = yearsJS.map(function(y){ return 'LC_' + y; });
+
+print('Desired band names:', desiredNames);
+stack = stack.rename(desiredNames);
+
+// 再次统一声明输出格网 + clip（确保最终一致）
+stack = stack.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL).clip(roiSafe);
+
+// Quick preview: show one band
+Map.addLayer(stack.select(['LC_2002']), {min:0, max:16}, CITY_NAME + ' | LC_2002', false);
+print('Final stack bands:', stack.bandNames());
+
+/* ===== 5) Export: ONE multi-band GeoTIFF (LC_2002 … LC_2025) ===== */
+if (DO_EXPORT){
+  Export.image.toDrive({
+    image         : stack,
+    description   : CITY_NAME + '_MODIS_LC_STACK_' + START_YEAR + '_' + END_YEAR + '_0p1deg',
+    folder        : EXPORT_FOLDER,
+    fileNamePrefix: CITY_NAME + '_MODIS_LC_STACK_' + START_YEAR + '_' + END_YEAR + '_0p1deg',
+    region        : roiSafe,
+    crs           : EXPORT_CRS,
+    dimensions    : EXPORT_DIMS.getInfo(),  // exact grid alignment
+    maxPixels     : 1e13
+  });
+}
+
+print('✅ Created ONE export task: annual LC stack (' + START_YEAR + '–' + END_YEAR + '). Go to Tasks to run.');
+
+/**** Guangzhou | DEM (SRTM) | 8-day bands | 0.1° 对齐 | 2002–2025 合并导出（ONE multi-band GeoTIFF） ****/
+
+/* ===== 0) 参数 ===== */
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+var START_YEAR      = 2002;
+var END_YEAR        = 2025;
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;     // 0.1°
+var RR_MAXPIX       = 65535;
+var USE_MEDIAN_AGG  = true;
+var DO_EXPORT       = true;
+
+var EXPORT_FOLDER_DEM = 'DEM_8day_0p1deg_CITY_' + CITY_NAME;
+
+/* ===== 1) ROI（干净 EPSG:4326 矩形）与导出矩阵 ===== */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color: 'red'}, CITY_NAME + ' ROI rect', false);
+
+print('City:', CITY_NAME);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+/* ===== 2) 数据源（DEM） ===== */
+var DEM_IMG = ee.Image('USGS/SRTMGL1_003').select('elevation').rename('elevation');
+// 若想用 COP DEM，请改为：
+// var DEM_IMG = ee.Image('COPERNICUS/DEM/GLO-30').select('DEM').rename('elevation');
+
+/* ===== 3) 时间工具（生成 2002–2025 全部 8-day 起始日期序列） ===== */
+function dateTagFromMillis(ms){
+  return ee.Date(ms).format('YYYYMMdd');
+}
+
+function eightDayStartsBetween(y0, y1){
+  // 返回：ee.List(millis)，从 y0-01-01 到 (y1+1)-01-01，步长 8 天
+  y0 = ee.Number(y0);
+  y1 = ee.Number(y1);
+  var start = ee.Date.fromYMD(y0, 1, 1);
+  var end   = ee.Date.fromYMD(y1.add(1), 1, 1);
+  var nDays = end.difference(start, 'day');
+  var steps = ee.List.sequence(0, nDays.subtract(1), 8);
+  return steps.map(function(d){ return start.advance(ee.Number(d), 'day').millis(); });
+}
+
+/* ===== 4) 构建 2002–2025 的 DEM 8-day bands（复制静态 DEM） ===== */
+function buildDEMStack_2002_2025(){
+  var starts = ee.List(eightDayStartsBetween(START_YEAR, END_YEAR));
+  print('Total 8-day starts:', starts.size());
+
+  // 每个 8-day “期”命名为 DEM_YYYYMMDD
+  var bandImgs = ee.ImageCollection(starts.map(function(ms){
+    var tag = dateTagFromMillis(ms);
+    return DEM_IMG.rename(ee.String('DEM_').cat(tag));
+  })).toBands();
+
+  // 清理 toBands 数字前缀
+  var oldNames = bandImgs.bandNames();
+  var newNames = oldNames.map(function(n){
+    n = ee.String(n);
+    return n.replace('^(\\d+_)+', '');
+  });
+  bandImgs = bandImgs.rename(newNames);
+
+  // 30m → 0.1° 聚合
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  var bands01 = bandImgs.reduceResolution({
+    reducer: reducer,
+    bestEffort: true,
+    maxPixels: RR_MAXPIX
+  });
+
+  // 去除 _median/_mean 后缀
+  var afterNames = bands01.bandNames();
+  var cleaned = afterNames.map(function(n){
+    n = ee.String(n);
+    n = n.replace('_median$', '').replace('_mean$', '');
+    n = n.replace('^(\\d+_)+', '');
+    return n;
+  });
+  bands01 = bands01.rename(cleaned);
+
+  // 声明输出网格 + clip
+  bands01 = bands01.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  bands01 = bands01.clip(roiSafe);
+
+  return bands01;
+}
+
+/* ===== 5) 一次性导出 ONE multi-band GeoTIFF ===== */
+var stack = buildDEMStack_2002_2025();
+
+print('Final band count:', stack.bandNames().size());
+print('First 12 bands:', stack.bandNames().slice(0, 12));
+print('Last  12 bands:', stack.bandNames().slice(-12));
+
+// 预览：第一个 band
+var firstName = ee.String(ee.List(stack.bandNames().sort()).get(0));
+Map.addLayer(stack.select([firstName]),
+             {min: -50, max: 2000, palette: ['e0f3f8','abd9e9','74add1','4575b4','313695']},
+             CITY_NAME + ' DEM sample (first band, 0.1°)', false);
+
+if (DO_EXPORT){
+  Export.image.toDrive({
+    image         : stack.toFloat(),
+    description   : CITY_NAME + '_DEM_8day_0p1deg_' + START_YEAR + '_' + END_YEAR,
+    folder        : EXPORT_FOLDER_DEM,
+    fileNamePrefix: CITY_NAME + '_DEM_8day_0p1deg_' + START_YEAR + '_' + END_YEAR,
+    region        : roiSafe,
+    crs           : EXPORT_CRS,
+    dimensions    : EXPORT_DIMS.getInfo(),
+    maxPixels     : 1e13
+  });
+}
+
+print('✅ 已创建 ONE 导出任务：DEM 2002–2025 合并（8-day bands，0.1°，80km）。到 Tasks 面板启动导出。');
+
+/**** City | EVI (MOD09A1 v061) | 8-day | 0.1° 对齐 | 2002–2025 合并导出（ONE multi-band GeoTIFF） ****/
+
+/* ===== 0) 参数（换城市只改这块） ===== */
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+var START_YEAR      = 2002;
+var END_YEAR        = 2025;
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;     // 0.1°
+var RR_MAXPIX       = 65535;     // reduceResolution 安全上限（<65536）
+var USE_MEDIAN_AGG  = true;      // true: median 抗异常；false: mean
+var DO_EXPORT       = true;
+
+var EXPORT_FOLDER   = 'EVI_8day_0p1deg_CITY_' + CITY_NAME;
+
+/* ===== 1) ROI（干净 EPSG:4326 矩形）与导出矩阵 ===== */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+// 先取 bounds（可能在非 EPSG:4326），只用于拿经纬范围
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+// ★ 用 EPSG:4326 + geodesic:false 构造“干净”的矩形，避免跨投影 clip 出错
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+// 固定像素矩阵（确保与其它变量严格对齐）
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color: 'red'}, CITY_NAME + ' ROI rect', false);
+print('City:', CITY_NAME);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+/* ===== 2) MODIS/061/MOD09A1 → EVI（8天），QA 与稳健处理 ===== */
+var SR = ee.ImageCollection('MODIS/061/MOD09A1')
+  .select(['sur_refl_b01','sur_refl_b02','sur_refl_b03','StateQA'],
+          ['red','nir','blue','StateQA']);
+
+function maskStateQA(img){
+  var qa = img.select('StateQA');
+  var modland_best = qa.bitwiseAnd(3).eq(0);  // MODLAND QA bits 0–1 == 0
+  return img.updateMask(modland_best);
+}
+
+function toEVI_robust(img){
+  img = maskStateQA(img);
+
+  // 反射率缩放
+  var s = img.select(['red','nir','blue']).multiply(0.0001);
+
+  var evi = s.expression('2.5*(nir - red) / (nir + 6*red - 7.5*blue + 1)', {
+    nir: s.select('nir'),
+    red: s.select('red'),
+    blue: s.select('blue')
+  }).rename('EVI');
+
+  // 物理范围夹紧 + 掩膜离谱值
+  var eviClamped = evi.clamp(-0.1, 1.0);
+  var ok = evi.gte(-0.2).and(evi.lte(1.2));
+  eviClamped = eviClamped.updateMask(ok);
+
+  return eviClamped.copyProperties(img, img.propertyNames());
+}
+
+function fmtTag(img){
+  return ee.Date(img.get('system:time_start')).format('YYYYMMdd');
+}
+
+/* ===== 3) 构建 2002–2025 全时段：先 toBands（原生 500m），再 reduceResolution → 0.1° ===== */
+function buildEVIStack_2002_2025(){
+  var start = ee.Date.fromYMD(START_YEAR, 1, 1);
+  var end   = ee.Date.fromYMD(END_YEAR + 1, 1, 1);
+
+  var col = SR.filterDate(start, end)
+              .filterBounds(roiSafe)
+              .map(toEVI_robust)
+              .sort('system:time_start');
+
+  var count = col.size();
+  print('Total MOD09A1 images in range:', count);
+
+  var empty = ee.Image(0).updateMask(ee.Image(0)).rename('EVI_empty');
+
+  // 每期重命名为 EVI_YYYYMMDD，再 toBands
+  var bands500m = ee.Image(ee.Algorithms.If(
+    count.gt(0),
+    ee.ImageCollection(col.map(function(im){
+      var tag = fmtTag(im);
+      return im.rename(ee.String('EVI_').cat(tag));
+    })).toBands(),
+    empty
+  ));
+
+  // 清理 toBands 产生的数字前缀
+  var oldNames = bands500m.bandNames();
+  var newNames = oldNames.map(function(n){
+    n = ee.String(n);
+    return n.replace('^(\\d+_)+', '');
+  });
+  bands500m = bands500m.rename(newNames);
+
+  // 500m → 0.1° 聚合
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  var bands01 = bands500m.reduceResolution({
+    reducer: reducer,
+    bestEffort: true,
+    maxPixels: RR_MAXPIX
+  });
+
+  // 去除 _median/_mean 后缀 & 再清前缀
+  var afterNames = bands01.bandNames();
+  var cleaned = afterNames.map(function(n){
+    n = ee.String(n);
+    n = n.replace('_median$', '').replace('_mean$', '');
+    n = n.replace('^(\\d+_)+', '');
+    return n;
+  });
+  bands01 = bands01.rename(cleaned);
+
+  // ★ 声明输出网格 + clip（保证对齐/稳定）
+  bands01 = bands01.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  bands01 = bands01.clip(roiSafe);
+
+  return bands01;
+}
+
+/* ===== 4) 生成影像 + 预览 + 导出 ONE multi-band GeoTIFF ===== */
+var stack = buildEVIStack_2002_2025();
+print('Final band count:', stack.bandNames().size());
+print('First 20 band names:', stack.bandNames().slice(0, 20));
+print('Last  20 band names:', stack.bandNames().slice(-20));
+
+// 预览：选第一个波段
+var firstBand = ee.String(ee.List(stack.bandNames().sort()).get(0));
+Map.addLayer(stack.select([firstBand]), {min:0, max:0.8}, CITY_NAME + ' EVI sample (first band)', false);
+
+if (DO_EXPORT){
+  Export.image.toDrive({
+    image         : stack.toFloat(),
+    description   : CITY_NAME + '_EVI_8day_0p1deg_' + START_YEAR + '_' + END_YEAR,
+    folder        : EXPORT_FOLDER,
+    fileNamePrefix: CITY_NAME + '_EVI_8day_0p1deg_' + START_YEAR + '_' + END_YEAR,
+    region        : roiSafe,
+    crs           : EXPORT_CRS,
+    dimensions    : EXPORT_DIMS.getInfo(),
+    maxPixels     : 1e13
+  });
+}
+
+print('✅ Created ONE export task: EVI stack ' + START_YEAR + '–' + END_YEAR + ' (8-day, 0.1°, multi-band). Run it in Tasks.');
+
+/**** Guangzhou | LAI (MOD15A2H v061) | 8-day | 0.1° 对齐 | 2002–2025 合并导出（城市级 80km） ****/
+
+/* ===== 0) 参数（换城市/范围只改这里） ===== */
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+var START_YEAR      = 2002;
+var END_YEAR        = 2025;
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;     // 0.1°
+var RR_MAXPIX       = 65535;     // reduceResolution 安全上限（<65536）
+var USE_MEDIAN_AGG  = true;      // true: median 抗异常；false: mean
+var DO_EXPORT       = true;
+
+/* ===== 1) ROI 与导出矩阵（使用“干净”的 EPSG:4326 矩形） ===== */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+// 先取 bounds，只用于读取经纬范围
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+// ★ 干净矩形（EPSG:4326 + geodesic:false）
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+// 固定像素矩阵尺寸（与 0.1° 对齐）
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+var EXPORT_FOLDER_LAI = 'LAI_8day_0p1deg_CITY_' + CITY_NAME;
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color: 'red'}, CITY_NAME + ' ROI rect', false);
+print('City:', CITY_NAME);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+/* ===== 2) 数据源与 QA（MOD15A2H v061） =====
+   - Lai_500m（尺度因子 0.1）
+   - QA：FparLai_QC 低两位 ≤1 通过
+*/
+var LAI_IC = ee.ImageCollection('MODIS/061/MOD15A2H')
+  .select(['Lai_500m','FparLai_QC']);
+
+function laiWithQA(img){
+  var ok = img.select('FparLai_QC').bitwiseAnd(3).lte(1); // 0/1 通过
+  var lai = img.select('Lai_500m')
+    .updateMask(ok)
+    .multiply(0.1)
+    .clamp(0, 7)
+    .rename('LAI');
+  return lai.copyProperties(img, img.propertyNames());
+}
+
+function dateTag(im){
+  return ee.Date(im.get('system:time_start')).format('YYYYMMdd');
+}
+
+/* ===== 3) 2002–2025 全时段构建（先 toBands@500m，再 reduceResolution→0.1°） ===== */
+function buildLAIStack_2002_2025(){
+  var start = ee.Date.fromYMD(START_YEAR, 1, 1);
+  var end   = ee.Date.fromYMD(END_YEAR + 1, 1, 1);
+
+  var col = LAI_IC.filterDate(start, end)
+                  .filterBounds(roiSafe)
+                  .map(laiWithQA)
+                  .sort('system:time_start');
+
+  var count = col.size();
+  print('Total MOD15A2H images in range:', count);
+
+  var empty = ee.Image(0).updateMask(ee.Image(0)).rename('LAI_empty');
+
+  // 每期重命名为 LAI_YYYYMMDD → toBands
+  var bands500m = ee.Image(ee.Algorithms.If(count.gt(0),
+    ee.ImageCollection(col.map(function(im){
+      var tag = dateTag(im);
+      return im.rename(ee.String('LAI_').cat(tag));
+    })).toBands(),
+    empty
+  ));
+
+  // 清理 toBands 数字前缀
+  var oldNames = bands500m.bandNames();
+  var newNames = oldNames.map(function(n){
+    n = ee.String(n);
+    return n.replace('^(\\d+_)+', '');
+  });
+  bands500m = bands500m.rename(newNames);
+
+  // 500m → 0.1° 聚合（median/mean）
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  var bands01 = bands500m.reduceResolution({
+    reducer: reducer,
+    bestEffort: true,
+    maxPixels: RR_MAXPIX
+  });
+
+  // 去除 _median/_mean 后缀 & 再清前缀
+  var afterNames = bands01.bandNames();
+  var cleaned = afterNames.map(function(n){
+    n = ee.String(n);
+    n = n.replace('_median$', '').replace('_mean$', '');
+    n = n.replace('^(\\d+_)+', '');
+    return n;
+  });
+  bands01 = bands01.rename(cleaned);
+
+  // ★ 声明 0.1° 输出网格，再 clip
+  bands01 = bands01.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  bands01 = bands01.clip(roiSafe);
+
+  return bands01;
+}
+
+/* ===== 4) 一次性导出 ONE multi-band GeoTIFF ===== */
+var stack = buildLAIStack_2002_2025();
+
+print('Final band count:', stack.bandNames().size());
+print('First 20 bands:', stack.bandNames().slice(0, 20));
+print('Last  20 bands:', stack.bandNames().slice(-20));
+
+// 预览：首个波段（按名字排序取第一个）
+var firstName = ee.String( ee.List(stack.bandNames().sort()).get(0) );
+Map.addLayer(stack.select([firstName]),
+             {min:0, max:6, palette:['f7fcf5','c7e9c0','74c476','238b45','00441b']},
+             CITY_NAME + ' LAI sample (first band, 0.1°)', false);
+
+if (DO_EXPORT){
+  Export.image.toDrive({
+    image         : stack.toFloat(),
+    description   : CITY_NAME + '_LAI_8day_0p1deg_' + START_YEAR + '_' + END_YEAR,
+    folder        : EXPORT_FOLDER_LAI,
+    fileNamePrefix: CITY_NAME + '_LAI_8day_0p1deg_' + START_YEAR + '_' + END_YEAR,
+    region        : roiSafe,
+    crs           : EXPORT_CRS,
+    dimensions    : EXPORT_DIMS.getInfo(),
+    maxPixels     : 1e13
+  });
+}
+
+print('✅ 已创建 ONE 导出任务：LAI 2002–2025 合并（0.1°、80km、8-day）。到 Tasks 面板启动导出。');
+
+/**** Guangzhou | LST (MOD11A2 v061) | 8-day | 0.1° 对齐 | 2002–2025 合并导出（城市级 80km） ****/
+
+/* ===== 0) 参数（换城市/范围只改这里） ===== */
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+var START_YEAR      = 2002;
+var END_YEAR        = 2025;
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;     // 0.1°
+var RR_MAXPIX       = 65535;     // reduceResolution 安全上限（<65536）
+var USE_MEDIAN_AGG  = true;      // true: median 抗异常；false: mean
+var DO_EXPORT       = true;
+
+/* ===== 1) 研究区（保留你原逻辑：缓冲 + bounds；但导出 region 用“干净矩形”更稳） ===== */
+var cityPoint   = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer  = cityPoint.buffer(CITY_BUFFER_KM * 1000); // m
+
+// 原代码 roiRect
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+// ★ 干净矩形（EPSG:4326 + geodesic:false）
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color: 'red'}, CITY_NAME + ' ROI rect', false);
+
+// 导出像素矩阵尺寸（与 0.1° 对齐）
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round(); // 列
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round(); // 行
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+var EXPORT_FOLDER_LST = 'LST_8day_0p1deg_CITY_' + CITY_NAME;
+
+print('City:', CITY_NAME);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+/* ===== 2) 数据源与 QA（MOD11A2 v061） =====
+   LST_Day_1km / LST_Night_1km 标度因子 0.02 (K)
+   转为 °C：value * 0.02 - 273.15
+   QA: QC_Day / QC_Night 低 2 位 ≤ 1（good/average）通过
+*/
+var LST_IC = ee.ImageCollection('MODIS/061/MOD11A2')
+  .select(['LST_Day_1km','LST_Night_1km','QC_Day','QC_Night']);
+
+function lstDayNightC(img) {
+  var okDay   = img.select('QC_Day').bitwiseAnd(3).lte(1);
+  var okNight = img.select('QC_Night').bitwiseAnd(3).lte(1);
+
+  var dayC = img.select('LST_Day_1km')
+    .updateMask(okDay)
+    .multiply(0.02).subtract(273.15)
+    .rename('LSTD');
+
+  var nightC = img.select('LST_Night_1km')
+    .updateMask(okNight)
+    .multiply(0.02).subtract(273.15)
+    .rename('LSTN');
+
+  return dayC.addBands(nightC).copyProperties(img, img.propertyNames());
+}
+
+function dateTag(im){
+  return ee.Date(im.get('system:time_start')).format('YYYYMMdd');
+}
+
+/* ===== 3) 2002–2025 全时段构建：toBands@1km(原生) → reduceResolution→0.1° ===== */
+function buildLSTStack_2002_2025(){
+  var start = ee.Date.fromYMD(START_YEAR, 1, 1);
+  var end   = ee.Date.fromYMD(END_YEAR + 1, 1, 1);
+
+  var col = LST_IC.filterDate(start, end)
+                  .filterBounds(roiSafe)
+                  .map(lstDayNightC)
+                  .sort('system:time_start');
+
+  var count = col.size();
+  print('Total MOD11A2 images in range:', count);
+
+  var empty = ee.Image(0).updateMask(ee.Image(0)).rename('LST_empty');
+
+  // 每期：LSTD_YYYYMMDD + LSTN_YYYYMMDD，然后 toBands
+  var bandsNative = ee.Image(ee.Algorithms.If(count.gt(0),
+    ee.ImageCollection(col.map(function(im){
+      var tag = dateTag(im);
+      var d = im.select('LSTD').rename(ee.String('LSTD_').cat(tag));
+      var n = im.select('LSTN').rename(ee.String('LSTN_').cat(tag));
+      return d.addBands(n);
+    })).toBands(),
+    empty
+  ));
+
+  // 清理 toBands 数字前缀
+  var oldNames = bandsNative.bandNames();
+  var newNames = oldNames.map(function(n){
+    n = ee.String(n);
+    return n.replace('^(\\d+_)+', '');
+  });
+  bandsNative = bandsNative.rename(newNames);
+
+  // 1km → 0.1° 聚合
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  var bands01 = bandsNative.reduceResolution({
+    reducer: reducer,
+    bestEffort: true,
+    maxPixels: RR_MAXPIX
+  });
+
+  // 去除 _median/_mean 后缀 & 再清前缀
+  var afterNames = bands01.bandNames();
+  var cleaned = afterNames.map(function(n){
+    n = ee.String(n);
+    n = n.replace('_median$', '').replace('_mean$', '');
+    n = n.replace('^(\\d+_)+', '');
+    return n;
+  });
+  bands01 = bands01.rename(cleaned);
+
+  // ★ 声明 0.1° 输出网格，再 clip（确保与 EVI/ERA5 同网格）
+  bands01 = bands01.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  bands01 = bands01.clip(roiSafe);
+
+  return bands01;
+}
+
+/* ===== 4) 一次性导出 ONE multi-band GeoTIFF ===== */
+var stack = buildLSTStack_2002_2025();
+
+print('Final band count:', stack.bandNames().size());
+print('First 20 bands:', stack.bandNames().slice(0, 20));
+print('Last  20 bands:', stack.bandNames().slice(-20));
+
+// 预览：首个波段（排序取第一个）
+var firstName = ee.String( ee.List(stack.bandNames().sort()).get(0) );
+Map.addLayer(stack.select([firstName]),
+             {min:-5, max:45},
+             CITY_NAME + ' LST sample (first band, 0.1°)', false);
+
+if (DO_EXPORT){
+  Export.image.toDrive({
+    image         : stack.toFloat(),
+    description   : CITY_NAME + '_LST_8day_0p1deg_' + START_YEAR + '_' + END_YEAR,
+    folder        : EXPORT_FOLDER_LST,
+    fileNamePrefix: CITY_NAME + '_LST_8day_0p1deg_' + START_YEAR + '_' + END_YEAR,
+    region        : roiSafe,                // 干净矩形更稳
+    crs           : EXPORT_CRS,
+    dimensions    : EXPORT_DIMS.getInfo(),  // 固定像素矩阵
+    maxPixels     : 1e13
+  });
+}
+
+print('✅ 已创建 ONE 导出任务：LST 2002–2025 合并（0.1°、80km、8-day）。到 Tasks 面板启动导出。');
+
+/**** Guangzhou | Nighttime Light (VIIRS VCMCFG 月度) | 0.1° 对齐 | 2013–2025 合并导出（ONE multi-band GeoTIFF） ****/
+
+/* ===== 参数 ===== */
+var CITY_NAME       = 'Guangzhou';
+var CITY_LON        = 113.2644;
+var CITY_LAT        = 23.1291;
+var CITY_BUFFER_KM  = 80;
+
+// VIIRS 月度通常从 2012/2013 左右开始；你要求从 2013–2025
+var START_YEAR      = 2013;
+var END_YEAR        = 2025;
+
+var EXPORT_CRS      = 'EPSG:4326';
+var DEG_PER_PIXEL   = 0.005;     // 0.1°
+var RR_MAXPIX       = 65535;
+var USE_MEDIAN_AGG  = true;
+var DO_EXPORT       = true;
+
+/* ===== ROI（干净 EPSG:4326 矩形） ===== */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+// 固定像素矩阵
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+var EXPORT_FOLDER_NTL = 'NTL_monthly_0p1deg_CITY_' + CITY_NAME;
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color:'blue'}, CITY_NAME + ' ROI rect', false);
+
+print('City:', CITY_NAME);
+print('Export dims (cols x rows at 0.1°):', EXPORT_DIMS);
+
+/* ===== 数据源 (VIIRS NTL 月度 VCMCFG) ===== */
+var NTL_IC = ee.ImageCollection("NOAA/VIIRS/DNB/MONTHLY_V1/VCMCFG")
+  .select(['avg_rad']);
+
+/* ===== 工具：YYYYMM 标签 ===== */
+function monthTag(im){
+  return ee.Date(im.get('system:time_start')).format('YYYYMM');
+}
+
+/* ===== 构建 2013–2025 的月度多波段影像（ONE stack） ===== */
+function buildNTLStack_2013_2025(){
+  var start = ee.Date.fromYMD(START_YEAR, 1, 1);
+  var end   = ee.Date.fromYMD(END_YEAR + 1, 1, 1);
+
+  var col = NTL_IC.filterDate(start, end)
+                  .filterBounds(roiSafe)
+                  .sort('system:time_start')
+                  .map(function(im){
+                    var tag = monthTag(im);
+                    return im.rename(ee.String('NTL_').cat(tag));
+                  });
+
+  var count = col.size();
+  print('Total monthly NTL images in range:', count);
+
+  var empty = ee.Image(0).updateMask(ee.Image(0)).rename('NTL_empty');
+
+  // 先 toBands（原生分辨率）→ 再 reduceResolution 到 0.1°
+  var bandsNative = ee.Image(ee.Algorithms.If(count.gt(0),
+    col.toBands(),
+    empty
+  ));
+
+  // 清理 toBands 前缀
+  var oldNames = bandsNative.bandNames();
+  var newNames = oldNames.map(function(n){
+    return ee.String(n).replace('^(\\d+_)+', '');
+  });
+  bandsNative = bandsNative.rename(newNames);
+
+  // reduceResolution → 0.1°
+  var reducer = USE_MEDIAN_AGG ? ee.Reducer.median() : ee.Reducer.mean();
+  var bands01 = bandsNative.reduceResolution({
+    reducer: reducer,
+    bestEffort: true,
+    maxPixels: RR_MAXPIX
+  });
+
+  // 去掉 _median/_mean 后缀
+  var afterNames = bands01.bandNames();
+  var cleaned = afterNames.map(function(n){
+    return ee.String(n).replace('_median$', '').replace('_mean$', '');
+  });
+  bands01 = bands01.rename(cleaned);
+
+  // 投影 & 裁剪
+  bands01 = bands01.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  bands01 = bands01.clip(roiSafe);
+
+  return bands01;
+}
+
+/* ===== 导出 ONE multi-band GeoTIFF ===== */
+var stack = buildNTLStack_2013_2025();
+
+print('Final band count:', stack.bandNames().size());
+print('First 12 bands:', stack.bandNames().slice(0, 12));
+print('Last  12 bands:', stack.bandNames().slice(-12));
+
+// 预览：第一个 band
+var firstName = ee.String(ee.List(stack.bandNames().sort()).get(0));
+Map.addLayer(stack.select([firstName]),
+             {min:0, max:50, palette:['black','orange','red']},
+             CITY_NAME + ' NTL sample (first band, 0.1°)', false);
+
+if (DO_EXPORT){
+  Export.image.toDrive({
+    image         : stack.toFloat(),
+    description   : CITY_NAME + '_NTL_monthly_0p1deg_' + START_YEAR + '_' + END_YEAR,
+    folder        : EXPORT_FOLDER_NTL,
+    fileNamePrefix: CITY_NAME + '_NTL_monthly_0p1deg_' + START_YEAR + '_' + END_YEAR,
+    region        : roiSafe,
+    crs           : EXPORT_CRS,
+    dimensions    : EXPORT_DIMS.getInfo(),
+    maxPixels     : 1e13
+  });
+}
+
+print('✅ 已创建 ONE 导出任务：NTL 月度合并（' + START_YEAR + '–' + END_YEAR + '，0.1°，80km）。到 Tasks 面板启动导出。');
+
+
+/**** City | MERRA-2 | 8 variables | 8-day | 0.1° | segmented export ****/
+
+/* =========================
+ * 0) Parameters
+ * ========================= */
+var CITY_NAME      = 'Guangzhou';
+var CITY_LON       = 113.2644;
+var CITY_LAT       = 23.1291;
+var CITY_BUFFER_KM = 80;
+
+var EXPORT_CRS     = 'EPSG:4326';
+var DEG_PER_PIXEL  = 0.1;     // 0.1°
+var DO_EXPORT      = true;
+
+var EXPORT_FOLDER  = 'MERRA2_8day_0p1deg_CITY_' + CITY_NAME;
+
+/* =========================
+ * 1) ROI
+ * ========================= */
+var cityPoint  = ee.Geometry.Point([CITY_LON, CITY_LAT]);
+var cityBuffer = cityPoint.buffer(CITY_BUFFER_KM * 1000);
+
+var b = cityBuffer.bounds();
+var coords = ee.List(b.coordinates().get(0));
+var xs = coords.map(function(pt){ return ee.List(pt).getNumber(0); });
+var ys = coords.map(function(pt){ return ee.List(pt).getNumber(1); });
+
+var lonMin = ee.Number(xs.reduce(ee.Reducer.min()));
+var lonMax = ee.Number(xs.reduce(ee.Reducer.max()));
+var latMin = ee.Number(ys.reduce(ee.Reducer.min()));
+var latMax = ee.Number(ys.reduce(ee.Reducer.max()));
+
+var roiSafe = ee.Geometry.Rectangle([lonMin, latMin, lonMax, latMax], EXPORT_CRS, false);
+
+var WIDTH_PX  = lonMax.subtract(lonMin).divide(DEG_PER_PIXEL).round();
+var HEIGHT_PX = latMax.subtract(latMin).divide(DEG_PER_PIXEL).round();
+var EXPORT_DIMS = ee.String(WIDTH_PX.format()).cat('x').cat(HEIGHT_PX.format());
+
+Map.centerObject(cityPoint, 8);
+Map.addLayer(roiSafe, {color: 'orange'}, CITY_NAME + ' ROI', false);
+print('Export dims:', EXPORT_DIMS);
+
+/* =========================
+ * 2) MERRA-2 collections
+ * ========================= */
+var MERRA_SLV = ee.ImageCollection('NASA/GSFC/MERRA/slv/2');
+var MERRA_RAD = ee.ImageCollection('NASA/GSFC/MERRA/rad/2');
+var MERRA_LND = ee.ImageCollection('NASA/GSFC/MERRA/lnd/2');
+
+/* Debug band names if needed */
+// print('SLV bands:', ee.Image(MERRA_SLV.first()).bandNames());
+// print('RAD bands:', ee.Image(MERRA_RAD.first()).bandNames());
+// print('LND bands:', ee.Image(MERRA_LND.first()).bandNames());
+
+/* =========================
+ * 3) Time helpers
+ * ========================= */
+function list8dayDatesBetween(startDate, endDate){
+  startDate = ee.Date(startDate);
+  endDate   = ee.Date(endDate);
+  var nDays = endDate.difference(startDate, 'day');
+  var steps = ee.List.sequence(0, nDays.subtract(1), 8);
+  return steps.map(function(d){
+    return startDate.advance(ee.Number(d), 'day');
+  });
+}
+
+function tagYYYYMMDD(date){
+  return ee.Date(date).format('YYYYMMdd');
+}
+
+/* =========================
+ * 4) VPD from T and Td
+ *    output: kPa
+ * ========================= */
+function vpdFromT_Td_C(tC, tdC){
+  return tC.expression(
+    '0.6108 * exp(17.27 * T / (T + 237.3)) - 0.6108 * exp(17.27 * Td / (Td + 237.3))',
+    {T: tC, Td: tdC}
+  ).rename('VPD_kPa');
+}
+
+/* =========================
+ * 5) Empty placeholder
+ * ========================= */
+function emptyBandsForTag(tag){
+  var e = ee.Image(0).updateMask(ee.Image(0));
+  return e.rename(ee.String('T2M_C_').cat(tag))
+    .addBands(e.rename(ee.String('TD_C_').cat(tag)))
+    .addBands(e.rename(ee.String('VPD_kPa_').cat(tag)))
+    .addBands(e.rename(ee.String('WIND10M_MS_').cat(tag)))
+    .addBands(e.rename(ee.String('SSRD_MJm2_').cat(tag)))
+    .addBands(e.rename(ee.String('TP_mm_').cat(tag)))
+    .addBands(e.rename(ee.String('SWVL1_m3m3_').cat(tag)))
+    .addBands(e.rename(ee.String('STL1_C_').cat(tag)));
+}
+
+/* =========================
+ * 6) Aggregate one 8-day window
+ * ========================= */
+function aggregate8dayWindow(dStart, slvSeg, radSeg, lndSeg){
+  dStart = ee.Date(dStart);
+  var dEnd = dStart.advance(8, 'day');
+  var tag  = tagYYYYMMDD(dStart);
+
+  var slv = slvSeg.filterDate(dStart, dEnd);
+  var rad = radSeg.filterDate(dStart, dEnd);
+  var lnd = lndSeg.filterDate(dStart, dEnd);
+
+  var hasData = slv.size().gt(0);
+
+  var out = ee.Image(ee.Algorithms.If(hasData, (function(){
+
+    // 1) T2M / TD / WIND
+    var T2M_C = slv.select('T2M').mean().subtract(273.15).rename('T2M_C');
+    var TD_C  = slv.select('T2MDEW').mean().subtract(273.15).rename('TD_C');
+
+    var U = slv.select('U10M').mean();
+    var V = slv.select('V10M').mean();
+    var WIND = U.hypot(V).rename('WIND10M_MS');
+
+    // 2) VPD
+    var VPD = vpdFromT_Td_C(T2M_C, TD_C);
+
+    // 3) SSRD
+    // SWGDN: hourly mean shortwave flux (W m^-2)
+    // 8-day accumulated energy:
+    // sum(hourly W m^-2) * 3600 sec / 1e6 = MJ m^-2
+    var SSRD_MJ = rad.select('SWGDN')
+      .sum()
+      .multiply(3600)
+      .divide(1e6)
+      .rename('SSRD_MJm2');
+
+    // 4) TP
+    // PRECTOTLAND is precipitation flux (kg m^-2 s^-1), 1 kg m^-2 = 1 mm
+    // 8-day accumulated precipitation:
+    // sum(hourly flux) * 3600 = mm
+    var TP_mm = lnd.select('PRECTOTLAND')
+      .sum()
+      .multiply(3600)
+      .rename('TP_mm');
+
+    // 5) SWVL1
+    // SFMC: surface soil wetness / moisture proxy
+    var SWVL1 = lnd.select('SFMC')
+      .mean()
+      .rename('SWVL1_m3m3');
+
+    // 6) STL1
+    // TSOIL1: soil temperature layer 1, convert K -> C
+    var STL1C = lnd.select('TSOIL1')
+      .mean()
+      .subtract(273.15)
+      .rename('STL1_C');
+
+    return T2M_C.rename(ee.String('T2M_C_').cat(tag))
+      .addBands(TD_C.rename(ee.String('TD_C_').cat(tag)))
+      .addBands(VPD.rename(ee.String('VPD_kPa_').cat(tag)))
+      .addBands(WIND.rename(ee.String('WIND10M_MS_').cat(tag)))
+      .addBands(SSRD_MJ.rename(ee.String('SSRD_MJm2_').cat(tag)))
+      .addBands(TP_mm.rename(ee.String('TP_mm_').cat(tag)))
+      .addBands(SWVL1.rename(ee.String('SWVL1_m3m3_').cat(tag)))
+      .addBands(STL1C.rename(ee.String('STL1_C_').cat(tag)));
+
+  })(), emptyBandsForTag(tag)));
+
+  return out;
+}
+
+/* =========================
+ * 7) Build one segment stack
+ * ========================= */
+function buildMERRA8dayStackSegment(startDate, endDate){
+  var slvSeg = MERRA_SLV.filterDate(startDate, endDate).filterBounds(roiSafe);
+  var radSeg = MERRA_RAD.filterDate(startDate, endDate).filterBounds(roiSafe);
+  var lndSeg = MERRA_LND.filterDate(startDate, endDate).filterBounds(roiSafe);
+
+  var dates8 = ee.List(list8dayDatesBetween(startDate, endDate));
+
+  var ic = ee.ImageCollection.fromImages(
+    dates8.map(function(d){
+      return aggregate8dayWindow(d, slvSeg, radSeg, lndSeg);
+    })
+  );
+
+  var img = ic.toBands();
+
+  // remove numeric prefixes from toBands()
+  var old = img.bandNames();
+  var neu = old.map(function(n){
+    return ee.String(n).replace('^(\\d+_)+', '');
+  });
+  img = img.rename(neu);
+
+  img = img.setDefaultProjection(EXPORT_CRS, null, DEG_PER_PIXEL);
+  img = img.clip(roiSafe);
+
+  return img;
+}
+
+/* =========================
+ * 8) Export one segment
+ * ========================= */
+function exportSegment(label, startDate, endDate){
+  var img = buildMERRA8dayStackSegment(startDate, endDate);
+
+  print('Segment', label, 'bands =', img.bandNames().size());
+  print('Segment', label, 'first 12 bands:', img.bandNames().slice(0, 12));
+
+  if (DO_EXPORT){
+    Export.image.toDrive({
+      image         : img.toFloat(),
+      description   : CITY_NAME + '_MERRA2main_8day_0p1deg_' + label,
+      folder        : EXPORT_FOLDER,
+      fileNamePrefix: CITY_NAME + '_MERRA2main_8day_0p1deg_' + label,
+      region        : roiSafe,
+      crs           : EXPORT_CRS,
+      dimensions    : EXPORT_DIMS.getInfo(),
+      maxPixels     : 1e13
+    });
+  }
+}
+
+/* =========================
+ * 9) Export 3 segments
+ * ========================= */
+exportSegment('2002_2010', ee.Date('2002-01-01'), ee.Date('2011-01-01'));
+exportSegment('2011_2018', ee.Date('2011-01-01'), ee.Date('2019-01-01'));
+exportSegment('2019_2025', ee.Date('2019-01-01'), ee.Date('2026-01-01'));
+
+print('✅ MERRA-2 8-day segmented export tasks created.');
