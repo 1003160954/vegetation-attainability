@@ -1,0 +1,1473 @@
+# -*- coding: utf-8 -*-
+# ============================================================
+# Peak-position analysis for Pr(HighCC) ~ VPD under SSRD strata
+# Purpose:
+#   1) Estimate empirical peak VPD of Pr(HighCC) under low/mid/high SSRD
+#   2) Test whether current cities / patches are still before the peak
+#   3) Link relative-to-peak position to city divergence types
+# ============================================================
+
+import os
+import json
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import kruskal
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 0) Config
+# ============================================================
+FULL_FP = "/content/drive/MyDrive/Second_research/MERRA/hybrid/GlobalUrbanCooling_dataset_v2_dualCE_full.parquet"
+OUT_DIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/post_fig4_peak_position"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+SOURCE_NAME = "ERA5"   # "ERA5" or "MERRA2"
+
+BASELINE_YEARS = list(range(2002, 2007))
+EARLY_YEARS    = list(range(2002, 2007))
+RECENT_YEARS   = list(range(2019, 2026))
+
+ACTIVE_Q = 0.60
+HIGHCC_Q = 0.80
+
+# 峰值分析参数
+N_VPD_BINS = 20              # 每个SSRD层里VPD分箱数
+MIN_BIN_N  = 2000            # 每个箱最少样本，太少就不稳
+ROLLING_K  = 3               # rolling smooth窗口
+NEAR_WIDTH = 0.20            # 判定“near peak”的相对窗口（kPa）
+
+DPI = 500
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.titlesize": 12,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "figure.dpi": 180,
+    "savefig.dpi": 300,
+    "svg.fonttype": "none",
+})
+
+# ============================================================
+# 1) Load data
+# ============================================================
+df_all = pd.read_parquet(FULL_FP).copy()
+df_all["date"] = pd.to_datetime(df_all["date"], errors="coerce")
+
+if "year" not in df_all.columns and "Year" in df_all.columns:
+    df_all["year"] = df_all["Year"].astype(int)
+if "month" not in df_all.columns and "Month" in df_all.columns:
+    df_all["month"] = df_all["Month"].astype(int)
+
+required_common = [
+    "city", "date", "year", "month",
+    "pix_y", "pix_x",
+    "EVI", "LAI", "DIST_WATER_km", "LC"
+]
+
+if SOURCE_NAME == "ERA5":
+    required_source = ["cooling_efficiency_ERA5", "VPD_KPa".lower(), "SSRD_MJm2", "SWVL1_m3m3"]
+# fix possible typo robustly below
+
+# robust column selection
+if SOURCE_NAME == "ERA5":
+    ce_col = "cooling_efficiency_ERA5"
+    vpd_col = "VPD_kPa"
+    ssrd_col = "SSRD_MJm2"
+    swvl_col = "SWVL1_m3m3"
+else:
+    ce_col = "cooling_efficiency_MERRA2"
+    vpd_col = "MERRA2hyb_VPD_kPa"
+    ssrd_col = "MERRA2hyb_SSRD_MJm2"
+    swvl_col = "MERRA2hyb_SWVL1_m3m3"
+
+missing = [c for c in ["city", "date", "year", "month", "pix_y", "pix_x", "EVI", ce_col, vpd_col, ssrd_col] if c not in df_all.columns]
+if missing:
+    raise ValueError(f"Missing required columns: {missing}")
+
+df = df_all.copy()
+df["CE"] = df[ce_col]
+df["VPD"] = df[vpd_col]
+df["SSRD"] = df[ssrd_col]
+df["SWVL1"] = df[swvl_col] if swvl_col in df.columns else np.nan
+
+df["spatial_id"] = (
+    df["city"].astype(str) + "_" +
+    df["pix_y"].astype(str) + "_" +
+    df["pix_x"].astype(str)
+)
+
+keep_cols = [
+    "city", "date", "year", "month", "spatial_id",
+    "CE", "VPD", "SSRD", "SWVL1", "EVI", "LAI", "DIST_WATER_km", "LC"
+]
+df = df[keep_cols].replace([np.inf, -np.inf], np.nan).copy()
+df = df.dropna(subset=["city", "date", "year", "month", "spatial_id", "CE", "VPD", "SSRD", "EVI"])
+
+print("Loaded rows:", df.shape)
+print("Cities:", df["city"].nunique())
+print("Unique spatial_id:", df["spatial_id"].nunique())
+
+# ============================================================
+# 2) Define city-specific summer using baseline VPD + SSRD proxy
+# ============================================================
+tmp = df[df["year"].isin(BASELINE_YEARS)].copy()
+monthly_heat = tmp.groupby(["city", "month"], as_index=False)[["VPD", "SSRD"]].mean()
+
+def z_by_city(df_in, col):
+    out = []
+    for city, sub in df_in.groupby("city"):
+        x = sub[col].values
+        sd = np.std(x)
+        z = np.zeros_like(x, dtype=float) if sd == 0 else (x - np.mean(x)) / sd
+        sub2 = sub.copy()
+        sub2[col + "_z"] = z
+        out.append(sub2)
+    return pd.concat(out, axis=0)
+
+monthly_heat = z_by_city(monthly_heat, "VPD")
+monthly_heat = z_by_city(monthly_heat, "SSRD")
+monthly_heat["heat_metric"] = monthly_heat["VPD_z"] + monthly_heat["SSRD_z"]
+
+monthly_heat["rank_desc"] = monthly_heat.groupby("city")["heat_metric"].rank(method="first", ascending=False)
+summer_months = monthly_heat[monthly_heat["rank_desc"] <= 3][["city", "month"]].copy()
+summer_months["is_summer"] = 1
+
+df = df.merge(summer_months, on=["city", "month"], how="left")
+df["is_summer"] = df["is_summer"].fillna(0).astype(int)
+summer_df = df[df["is_summer"] == 1].copy()
+
+print("Summer subset:", summer_df.shape)
+
+# ============================================================
+# 3) Fixed baseline thresholds: active and HighCC
+# ============================================================
+baseline_summer = summer_df[summer_df["year"].isin(BASELINE_YEARS)].copy()
+
+city_thr = (
+    baseline_summer.groupby("city")["CE"]
+    .quantile([ACTIVE_Q, HIGHCC_Q])
+    .unstack()
+    .reset_index()
+    .rename(columns={ACTIVE_Q: "ce_q60_base", HIGHCC_Q: "ce_q80_base"})
+)
+
+summer_df = summer_df.merge(city_thr, on="city", how="left")
+summer_df["active"] = (summer_df["CE"] > summer_df["ce_q60_base"]).astype(np.int8)
+summer_df["HighCC"] = (summer_df["CE"] > summer_df["ce_q80_base"]).astype(np.int8)
+
+# ============================================================
+# 4) SSRD strata based on baseline summer terciles
+# ============================================================
+ssrd_q = (
+    baseline_summer.groupby("city")["SSRD"]
+    .quantile([0.333333, 0.666667])
+    .unstack()
+    .reset_index()
+    .rename(columns={0.333333: "ssrd_q33", 0.666667: "ssrd_q67"})
+)
+summer_df = summer_df.merge(ssrd_q, on="city", how="left")
+
+def classify_ssrd_regime(row):
+    if row["SSRD"] <= row["ssrd_q33"]:
+        return "lowE"
+    elif row["SSRD"] <= row["ssrd_q67"]:
+        return "midE"
+    else:
+        return "highE"
+
+summer_df["energy_regime"] = summer_df.apply(classify_ssrd_regime, axis=1)
+
+print("\nEnergy regime proportions:")
+print(summer_df["energy_regime"].value_counts(normalize=True).round(4))
+
+# ============================================================
+# 5) Estimate empirical peak of Pr(HighCC) ~ VPD under each SSRD regime
+# ============================================================
+curve_rows = []
+peak_rows = []
+
+for ereg, sub in summer_df.groupby("energy_regime"):
+    sub = sub.dropna(subset=["VPD", "HighCC"]).copy()
+    if len(sub) < MIN_BIN_N * 5:
+        print(f"Skip {ereg}: too few rows ({len(sub)})")
+        continue
+
+    # global binning within this SSRD regime
+    sub["vpd_bin"] = pd.qcut(sub["VPD"], q=N_VPD_BINS, duplicates="drop")
+
+    curve = (
+        sub.groupby("vpd_bin", as_index=False)
+        .agg(
+            vpd_mid=("VPD", "median"),
+            p_highcc=("HighCC", "mean"),
+            n=("HighCC", "size")
+        )
+        .sort_values("vpd_mid")
+        .reset_index(drop=True)
+    )
+
+    curve = curve[curve["n"] >= MIN_BIN_N].copy()
+    if len(curve) < 5:
+        print(f"Skip {ereg}: too few valid bins after MIN_BIN_N")
+        continue
+
+    curve["p_highcc_smooth"] = curve["p_highcc"].rolling(window=ROLLING_K, center=True, min_periods=1).mean()
+    curve["energy_regime"] = ereg
+    curve_rows.append(curve)
+
+    # peak location
+    peak_idx = curve["p_highcc_smooth"].idxmax()
+    peak_vpd = curve.loc[peak_idx, "vpd_mid"]
+    peak_prob = curve.loc[peak_idx, "p_highcc_smooth"]
+
+    peak_rows.append([ereg, peak_vpd, peak_prob, len(curve), curve["vpd_mid"].min(), curve["vpd_mid"].max()])
+
+peak_curve = pd.concat(curve_rows, axis=0, ignore_index=True)
+peak_locs = pd.DataFrame(
+    peak_rows,
+    columns=["energy_regime", "peak_vpd", "peak_prob", "n_bins_used", "vpd_min", "vpd_max"]
+)
+
+peak_curve.to_csv(os.path.join(OUT_DIR, "peak_curve_by_ssrd.csv"), index=False)
+peak_locs.to_csv(os.path.join(OUT_DIR, "peak_locations_by_ssrd.csv"), index=False)
+
+print("\nPeak locations by SSRD regime:")
+print(peak_locs.round(4))
+
+# ============================================================
+# 6) Relative-to-peak position at city scale
+# ============================================================
+# early and recent city-scale mean VPD within each energy regime
+city_period_energy = (
+    summer_df.groupby(["city", "year", "energy_regime"], as_index=False)
+    .agg(
+        VPD_mean=("VPD", "mean"),
+        SSRD_mean=("SSRD", "mean"),
+        P_active=("active", "mean"),
+        PrHighCC=("HighCC", "mean")
+    )
+)
+
+city_period_energy["period"] = np.where(city_period_energy["year"].isin(EARLY_YEARS), "early",
+                                 np.where(city_period_energy["year"].isin(RECENT_YEARS), "recent", "other"))
+city_period_energy = city_period_energy[city_period_energy["period"].isin(["early", "recent"])].copy()
+
+city_period_energy = city_period_energy.merge(peak_locs[["energy_regime", "peak_vpd"]], on="energy_regime", how="left")
+city_period_energy["delta_to_peak"] = city_period_energy["VPD_mean"] - city_period_energy["peak_vpd"]
+
+# summarize by city and period
+city_pos = (
+    city_period_energy.groupby(["city", "period"], as_index=False)
+    .agg(
+        VPD_mean=("VPD_mean", "mean"),
+        peak_vpd=("peak_vpd", "mean"),
+        delta_to_peak=("delta_to_peak", "mean"),
+        P_active=("P_active", "mean"),
+        PrHighCC=("PrHighCC", "mean")
+    )
+)
+
+city_pos.to_csv(os.path.join(OUT_DIR, "city_position_vs_peak.csv"), index=False)
+
+# classify position
+def classify_position(x, near_width=NEAR_WIDTH):
+    if pd.isna(x):
+        return np.nan
+    if x < -near_width:
+        return "before_peak"
+    elif x > near_width:
+        return "after_peak"
+    else:
+        return "near_peak"
+
+city_pos["position_class"] = city_pos["delta_to_peak"].apply(classify_position)
+print("\nCity-scale position counts:")
+print(city_pos.groupby(["period", "position_class"]).size())
+
+# ============================================================
+# 7) Relative-to-peak position at patch scale
+# ============================================================
+patch_period_energy = (
+    summer_df.groupby(["city", "year", "spatial_id", "energy_regime"], as_index=False)
+    .agg(
+        VPD_mean=("VPD", "mean"),
+        patch_highcc_rate=("HighCC", "mean"),
+        patch_active_rate=("active", "mean")
+    )
+)
+
+patch_period_energy["period"] = np.where(patch_period_energy["year"].isin(EARLY_YEARS), "early",
+                                  np.where(patch_period_energy["year"].isin(RECENT_YEARS), "recent", "other"))
+patch_period_energy = patch_period_energy[patch_period_energy["period"].isin(["early", "recent"])].copy()
+
+patch_period_energy = patch_period_energy.merge(peak_locs[["energy_regime", "peak_vpd"]], on="energy_regime", how="left")
+patch_period_energy["delta_to_peak"] = patch_period_energy["VPD_mean"] - patch_period_energy["peak_vpd"]
+patch_period_energy["position_class"] = patch_period_energy["delta_to_peak"].apply(classify_position)
+
+patch_pos_summary = (
+    patch_period_energy.groupby(["city", "period", "position_class"], as_index=False)
+    .size()
+    .rename(columns={"size": "n_patch"})
+)
+
+# convert to fractions
+total_patch = (
+    patch_period_energy.groupby(["city", "period"], as_index=False)
+    .size()
+    .rename(columns={"size": "n_total_patch"})
+)
+
+patch_pos_summary = patch_pos_summary.merge(total_patch, on=["city", "period"], how="left")
+patch_pos_summary["frac_patch"] = patch_pos_summary["n_patch"] / patch_pos_summary["n_total_patch"]
+patch_pos_summary.to_csv(os.path.join(OUT_DIR, "patch_position_vs_peak_summary.csv"), index=False)
+
+print("\nPatch-scale position fractions (global mean):")
+print(
+    patch_pos_summary.groupby(["period", "position_class"])["frac_patch"]
+    .mean()
+    .round(4)
+)
+
+# ============================================================
+# 8) Link city divergence types to relative-to-peak position
+# ============================================================
+# first rebuild city divergence table
+city_year_meanatt = (
+    summer_df.groupby(["city", "year"], as_index=False)["HighCC"]
+    .mean()
+    .rename(columns={"HighCC": "PrHighCC_all"})
+)
+
+# moderate demand
+city_year_meanDemand = (
+    summer_df[summer_df["energy_regime"].isin(["lowE", "midE", "highE"])]
+    .groupby(["city", "year"], as_index=False)["HighCC"]
+    .mean()
+    .rename(columns={"HighCC": "PrHighCC_meanDemand"})
+)
+
+# extreme demand = top decile VPD relative to baseline
+vpd_q90 = (
+    baseline_summer.groupby("city")["VPD"]
+    .quantile(0.90)
+    .reset_index()
+    .rename(columns={"VPD": "vpd_q90"})
+)
+summer_df2 = summer_df.merge(vpd_q90, on="city", how="left")
+summer_df2["is_extreme_demand"] = (summer_df2["VPD"] > summer_df2["vpd_q90"]).astype(int)
+
+city_year_extreme = (
+    summer_df2[summer_df2["is_extreme_demand"] == 1]
+    .groupby(["city", "year"], as_index=False)["HighCC"]
+    .mean()
+    .rename(columns={"HighCC": "PrHighCC_extremeDemand"})
+)
+
+city_year_att = city_year_meanDemand.merge(city_year_extreme, on=["city", "year"], how="outer")
+
+city_att_early = (
+    city_year_att[city_year_att["year"].isin(EARLY_YEARS)]
+    .groupby("city", as_index=False)[["PrHighCC_meanDemand", "PrHighCC_extremeDemand"]]
+    .mean()
+    .rename(columns={
+        "PrHighCC_meanDemand": "mean_att_early",
+        "PrHighCC_extremeDemand": "extreme_att_early"
+    })
+)
+
+city_att_recent = (
+    city_year_att[city_year_att["year"].isin(RECENT_YEARS)]
+    .groupby("city", as_index=False)[["PrHighCC_meanDemand", "PrHighCC_extremeDemand"]]
+    .mean()
+    .rename(columns={
+        "PrHighCC_meanDemand": "mean_att_recent",
+        "PrHighCC_extremeDemand": "extreme_att_recent"
+    })
+)
+
+city_div = city_att_early.merge(city_att_recent, on="city", how="inner")
+city_div["d_mean"] = city_div["mean_att_recent"] - city_div["mean_att_early"]
+city_div["d_extreme"] = city_div["extreme_att_recent"] - city_div["extreme_att_early"]
+
+def classify_city(row):
+    if row["d_mean"] >= 0 and row["d_extreme"] >= 0:
+        return "gain_both"
+    elif row["d_mean"] >= 0 and row["d_extreme"] < 0:
+        return "gain_mean_lose_extreme"
+    elif row["d_mean"] < 0 and row["d_extreme"] >= 0:
+        return "lose_mean_gain_extreme"
+    else:
+        return "lose_both"
+
+city_div["divergence_type"] = city_div.apply(classify_city, axis=1)
+
+# merge city peak position
+city_pos_wide = city_pos.pivot(index="city", columns="period", values="delta_to_peak").reset_index()
+city_pos_wide.columns = ["city", "delta_to_peak_early", "delta_to_peak_recent"]
+city_div = city_div.merge(city_pos_wide, on="city", how="left")
+city_div["d_delta_to_peak"] = city_div["delta_to_peak_recent"] - city_div["delta_to_peak_early"]
+
+# merge patch fractions
+patch_frac_wide = (
+    patch_pos_summary.pivot_table(index=["city", "period"], columns="position_class", values="frac_patch", aggfunc="mean")
+    .reset_index()
+)
+patch_frac_wide.columns.name = None
+patch_frac_wide = patch_frac_wide.rename(columns={
+    "before_peak": "frac_before_peak",
+    "near_peak": "frac_near_peak",
+    "after_peak": "frac_after_peak"
+})
+
+patch_early = patch_frac_wide[patch_frac_wide["period"] == "early"].drop(columns=["period"]).rename(columns={
+    "frac_before_peak": "frac_before_peak_early",
+    "frac_near_peak": "frac_near_peak_early",
+    "frac_after_peak": "frac_after_peak_early"
+})
+patch_recent = patch_frac_wide[patch_frac_wide["period"] == "recent"].drop(columns=["period"]).rename(columns={
+    "frac_before_peak": "frac_before_peak_recent",
+    "frac_near_peak": "frac_near_peak_recent",
+    "frac_after_peak": "frac_after_peak_recent"
+})
+
+city_div = city_div.merge(patch_early, on="city", how="left")
+city_div = city_div.merge(patch_recent, on="city", how="left")
+
+for col in ["frac_before_peak", "frac_near_peak", "frac_after_peak"]:
+    city_div[f"d_{col}"] = city_div[f"{col}_recent"] - city_div[f"{col}_early"]
+
+city_div.to_csv(os.path.join(OUT_DIR, "city_divergence_with_peak_position.csv"), index=False)
+
+print("\nCounts by divergence type:")
+print(city_div["divergence_type"].value_counts())
+
+print("\nMean relative-to-peak position by divergence type:")
+print(
+    city_div.groupby("divergence_type")[[
+        "delta_to_peak_early", "delta_to_peak_recent", "d_delta_to_peak",
+        "d_frac_before_peak", "d_frac_near_peak", "d_frac_after_peak"
+    ]].mean().round(4)
+)
+
+# ============================================================
+# 9) Group comparison stats
+# ============================================================
+vars_for_kw = [
+    "delta_to_peak_early", "delta_to_peak_recent", "d_delta_to_peak",
+    "d_frac_before_peak", "d_frac_near_peak", "d_frac_after_peak"
+]
+
+kw_rows = []
+for v in vars_for_kw:
+    subs = [g[v].dropna().values for _, g in city_div.groupby("divergence_type")]
+    if len(subs) >= 2 and all(len(x) > 0 for x in subs):
+        stat, p = kruskal(*subs)
+    else:
+        stat, p = np.nan, np.nan
+    kw_rows.append([v, stat, p])
+
+kw_df = pd.DataFrame(kw_rows, columns=["variable", "kruskal_stat", "p_value"])
+kw_df.to_csv(os.path.join(OUT_DIR, "peak_position_group_stats.csv"), index=False)
+
+print("\nPeak-position group comparison stats:")
+print(kw_df.sort_values("p_value").round(4))
+
+# ============================================================
+# 10) Plotting
+# ============================================================
+def save_plot(fig, name):
+    fig.savefig(os.path.join(OUT_DIR, f"{name}.png"), dpi=DPI, bbox_inches="tight", facecolor="white")
+    fig.savefig(os.path.join(OUT_DIR, f"{name}.pdf"), bbox_inches="tight", facecolor="white")
+    plt.show()
+    plt.close(fig)
+
+# A. Pr(HighCC)-VPD curves under SSRD strata
+fig, ax = plt.subplots(figsize=(8.2, 5.2))
+for ereg, sub in peak_curve.groupby("energy_regime"):
+    ax.plot(sub["vpd_mid"], sub["p_highcc_smooth"], marker="o", lw=1.6, label=ereg)
+    pk = peak_locs[peak_locs["energy_regime"] == ereg]
+    if len(pk) > 0:
+        ax.axvline(pk["peak_vpd"].iloc[0], linestyle="--", alpha=0.5)
+
+ax.set_xlabel("VPD")
+ax.set_ylabel("Smoothed Pr(HighCC)")
+ax.set_title("Empirical peak of Pr(HighCC) under SSRD strata")
+ax.legend(frameon=False)
+ax.grid(alpha=0.25)
+save_plot(fig, "peak_curve_by_ssrd")
+
+# B. City-scale relative-to-peak histogram
+for period in ["early", "recent"]:
+    sub = city_pos[city_pos["period"] == period].copy()
+    fig, ax = plt.subplots(figsize=(7.4, 4.8))
+    ax.hist(sub["delta_to_peak"].dropna(), bins=20)
+    ax.axvline(0, color="k", linestyle="--")
+    ax.axvline(-NEAR_WIDTH, color="gray", linestyle=":")
+    ax.axvline(NEAR_WIDTH, color="gray", linestyle=":")
+    ax.set_xlabel("VPD - peak VPD")
+    ax.set_ylabel("Number of cities")
+    ax.set_title(f"City-scale relative-to-peak position ({period})")
+    ax.grid(alpha=0.25)
+    save_plot(fig, f"city_relative_to_peak_{period}")
+
+# C. Patch before/near/after peak fractions
+patch_global = (
+    patch_pos_summary.groupby(["period", "position_class"], as_index=False)["frac_patch"]
+    .mean()
+)
+
+fig, ax = plt.subplots(figsize=(7.6, 4.8))
+for period in ["early", "recent"]:
+    sub = patch_global[patch_global["period"] == period]
+    x = np.arange(len(sub))
+    ax.plot(x, sub["frac_patch"], marker="o", lw=1.6, label=period)
+ax.set_xticks(np.arange(3))
+ax.set_xticklabels(["after_peak", "before_peak", "near_peak"])
+ax.set_ylabel("Mean fraction across cities")
+ax.set_title("Patch-scale relative-to-peak composition")
+ax.legend(frameon=False)
+ax.grid(alpha=0.25)
+save_plot(fig, "patch_relative_to_peak_composition")
+
+# D. Boxplots by divergence type
+order = ["gain_both", "gain_mean_lose_extreme", "lose_mean_gain_extreme", "lose_both"]
+for v in vars_for_kw:
+    fig, ax = plt.subplots(figsize=(8.2, 4.8))
+    data = [city_div.loc[city_div["divergence_type"] == g, v].dropna().values for g in order]
+    ax.boxplot(data, labels=order, showfliers=False)
+    ax.set_ylabel(v)
+    ax.set_title(f"{v} across divergence types")
+    ax.tick_params(axis="x", rotation=18)
+    ax.grid(axis="y", alpha=0.25)
+    save_plot(fig, f"box_{v}_by_divergence")
+
+# ============================================================
+# 11) Save summary
+# ============================================================
+summary = {
+    "source": SOURCE_NAME,
+    "full_fp": FULL_FP,
+    "spatial_id": "city + pix_y + pix_x",
+    "thresholds": {
+        "active": f"baseline-summer city-specific Q{int(ACTIVE_Q*100)}",
+        "HighCC": f"baseline-summer city-specific Q{int(HIGHCC_Q*100)}"
+    },
+    "peak_definition": f"empirical smoothed peak from {N_VPD_BINS} VPD bins within each SSRD regime",
+    "near_width": NEAR_WIDTH
+}
+with open(os.path.join(OUT_DIR, "peak_position_summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f, ensure_ascii=False, indent=2)
+
+print("\n✅ Saved to:", OUT_DIR)
+print("Key tables:")
+print(" - peak_curve_by_ssrd.csv")
+print(" - peak_locations_by_ssrd.csv")
+print(" - city_position_vs_peak.csv")
+print(" - patch_position_vs_peak_summary.csv")
+print(" - city_divergence_with_peak_position.csv")
+print(" - peak_position_group_stats.csv")
+print("Key figures:")
+print(" - peak_curve_by_ssrd.png/.pdf")
+print(" - city_relative_to_peak_early.png/.pdf")
+print(" - city_relative_to_peak_recent.png/.pdf")
+print(" - patch_relative_to_peak_composition.png/.pdf")
+print(" - box_*_by_divergence.png/.pdf")
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Summer + High-SSRD-only peak-position analysis
+# Purpose:
+#   1) Restrict the analysis to city-specific summer only
+#   2) Use only high-SSRD conditions as the main mechanism window
+#   3) Estimate empirical peak of Pr(HighCC) ~ VPD in summer high-SSRD
+#   4) Recompute city / patch relative-to-peak positions
+#   5) Print key numeric outputs directly
+# ============================================================
+
+import os
+import json
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import kruskal
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 0) Config
+# ============================================================
+FULL_FP = "/content/drive/MyDrive/Second_research/MERRA/hybrid/GlobalUrbanCooling_dataset_v2_dualCE_full.parquet"
+OUT_DIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/post_fig4_peak_position_summer_highE"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+SOURCE_NAME = "ERA5"   # "ERA5" or "MERRA2"
+
+BASELINE_YEARS = list(range(2002, 2007))
+EARLY_YEARS    = list(range(2002, 2007))
+RECENT_YEARS   = list(range(2019, 2026))
+
+ACTIVE_Q = 0.60
+HIGHCC_Q = 0.80
+
+# peak-estimation params
+N_VPD_BINS = 20
+MIN_BIN_N  = 1500
+ROLLING_K  = 3
+NEAR_WIDTH = 0.20   # kPa
+
+DPI = 500
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10,
+    "axes.titlesize": 12,
+    "axes.labelsize": 10,
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "legend.fontsize": 9,
+    "figure.dpi": 180,
+    "savefig.dpi": 300,
+    "svg.fonttype": "none",
+})
+
+# ============================================================
+# 1) Load data
+# ============================================================
+df_all = pd.read_parquet(FULL_FP).copy()
+df_all["date"] = pd.to_datetime(df_all["date"], errors="coerce")
+
+if "year" not in df_all.columns and "Year" in df_all.columns:
+    df_all["year"] = df_all["Year"].astype(int)
+if "month" not in df_all.columns and "Month" in df_all.columns:
+    df_all["month"] = df_all["Month"].astype(int)
+
+if SOURCE_NAME == "ERA5":
+    ce_col   = "cooling_efficiency_ERA5"
+    vpd_col  = "VPD_kPa"
+    ssrd_col = "SSRD_MJm2"
+    swvl_col = "SWVL1_m3m3"
+else:
+    ce_col   = "cooling_efficiency_MERRA2"
+    vpd_col  = "MERRA2hyb_VPD_kPa"
+    ssrd_col = "MERRA2hyb_SSRD_MJm2"
+    swvl_col = "MERRA2hyb_SWVL1_m3m3"
+
+required_cols = [
+    "city", "date", "year", "month", "pix_y", "pix_x",
+    "EVI", ce_col, vpd_col, ssrd_col
+]
+missing = [c for c in required_cols if c not in df_all.columns]
+if missing:
+    raise ValueError(f"Missing required columns: {missing}")
+
+df = df_all.copy()
+df["CE"]   = df[ce_col]
+df["VPD"]  = df[vpd_col]
+df["SSRD"] = df[ssrd_col]
+df["SWVL1"] = df[swvl_col] if swvl_col in df.columns else np.nan
+
+df["spatial_id"] = (
+    df["city"].astype(str) + "_" +
+    df["pix_y"].astype(str) + "_" +
+    df["pix_x"].astype(str)
+)
+
+keep_cols = [
+    "city", "date", "year", "month", "spatial_id",
+    "CE", "VPD", "SSRD", "SWVL1", "EVI"
+]
+df = df[keep_cols].replace([np.inf, -np.inf], np.nan).copy()
+df = df.dropna(subset=["city", "date", "year", "month", "spatial_id", "CE", "VPD", "SSRD", "EVI"])
+
+print("Loaded rows:", df.shape)
+print("Cities:", df["city"].nunique())
+print("Unique spatial_id:", df["spatial_id"].nunique())
+
+# ============================================================
+# 2) Define city-specific summer
+#    Use baseline VPD + SSRD proxy as before to stay consistent
+# ============================================================
+tmp = df[df["year"].isin(BASELINE_YEARS)].copy()
+monthly_heat = tmp.groupby(["city", "month"], as_index=False)[["VPD", "SSRD"]].mean()
+
+def z_by_city(df_in, col):
+    out = []
+    for city, sub in df_in.groupby("city"):
+        x = sub[col].values
+        sd = np.std(x)
+        z = np.zeros_like(x, dtype=float) if sd == 0 else (x - np.mean(x)) / sd
+        sub2 = sub.copy()
+        sub2[col + "_z"] = z
+        out.append(sub2)
+    return pd.concat(out, axis=0)
+
+monthly_heat = z_by_city(monthly_heat, "VPD")
+monthly_heat = z_by_city(monthly_heat, "SSRD")
+monthly_heat["heat_metric"] = monthly_heat["VPD_z"] + monthly_heat["SSRD_z"]
+
+monthly_heat["rank_desc"] = monthly_heat.groupby("city")["heat_metric"].rank(method="first", ascending=False)
+summer_months = monthly_heat[monthly_heat["rank_desc"] <= 3][["city", "month"]].copy()
+summer_months["is_summer"] = 1
+
+df = df.merge(summer_months, on=["city", "month"], how="left")
+df["is_summer"] = df["is_summer"].fillna(0).astype(int)
+summer_df = df[df["is_summer"] == 1].copy()
+
+print("Summer subset:", summer_df.shape)
+
+# ============================================================
+# 3) Fixed thresholds: active / HighCC
+# ============================================================
+baseline_summer = summer_df[summer_df["year"].isin(BASELINE_YEARS)].copy()
+
+city_thr = (
+    baseline_summer.groupby("city")["CE"]
+    .quantile([ACTIVE_Q, HIGHCC_Q])
+    .unstack()
+    .reset_index()
+    .rename(columns={ACTIVE_Q: "ce_q60_base", HIGHCC_Q: "ce_q80_base"})
+)
+summer_df = summer_df.merge(city_thr, on="city", how="left")
+summer_df["active"] = (summer_df["CE"] > summer_df["ce_q60_base"]).astype(np.int8)
+summer_df["HighCC"] = (summer_df["CE"] > summer_df["ce_q80_base"]).astype(np.int8)
+
+# ============================================================
+# 4) Within-summer SSRD strata, then keep only highE
+# ============================================================
+ssrd_q = (
+    baseline_summer.groupby("city")["SSRD"]
+    .quantile([0.333333, 0.666667])
+    .unstack()
+    .reset_index()
+    .rename(columns={0.333333: "ssrd_q33", 0.666667: "ssrd_q67"})
+)
+summer_df = summer_df.merge(ssrd_q, on="city", how="left")
+
+def classify_ssrd_regime(row):
+    if row["SSRD"] <= row["ssrd_q33"]:
+        return "lowE"
+    elif row["SSRD"] <= row["ssrd_q67"]:
+        return "midE"
+    else:
+        return "highE"
+
+summer_df["energy_regime"] = summer_df.apply(classify_ssrd_regime, axis=1)
+
+print("\nSummer energy regime proportions:")
+print(summer_df["energy_regime"].value_counts(normalize=True).round(4))
+
+highE_df = summer_df[summer_df["energy_regime"] == "highE"].copy()
+print("\nSummer + highE subset:", highE_df.shape)
+
+# ============================================================
+# 5) Estimate empirical peak of Pr(HighCC) ~ VPD under summer highE
+# ============================================================
+sub = highE_df.dropna(subset=["VPD", "HighCC"]).copy()
+sub["vpd_bin"] = pd.qcut(sub["VPD"], q=N_VPD_BINS, duplicates="drop")
+
+peak_curve = (
+    sub.groupby("vpd_bin", as_index=False)
+    .agg(
+        vpd_mid=("VPD", "median"),
+        p_highcc=("HighCC", "mean"),
+        n=("HighCC", "size")
+    )
+    .sort_values("vpd_mid")
+    .reset_index(drop=True)
+)
+
+peak_curve = peak_curve[peak_curve["n"] >= MIN_BIN_N].copy()
+peak_curve["p_highcc_smooth"] = peak_curve["p_highcc"].rolling(window=ROLLING_K, center=True, min_periods=1).mean()
+
+peak_idx = peak_curve["p_highcc_smooth"].idxmax()
+peak_vpd = float(peak_curve.loc[peak_idx, "vpd_mid"])
+peak_prob = float(peak_curve.loc[peak_idx, "p_highcc_smooth"])
+
+peak_curve.to_csv(os.path.join(OUT_DIR, "peak_curve_summer_highE.csv"), index=False)
+pd.DataFrame([{
+    "energy_regime": "highE",
+    "peak_vpd": peak_vpd,
+    "peak_prob": peak_prob,
+    "n_bins_used": len(peak_curve),
+    "vpd_min": peak_curve["vpd_mid"].min(),
+    "vpd_max": peak_curve["vpd_mid"].max()
+}]).to_csv(os.path.join(OUT_DIR, "peak_location_summer_highE.csv"), index=False)
+
+print("\nEstimated peak under summer highE:")
+print({
+    "peak_vpd": round(peak_vpd, 4),
+    "peak_prob": round(peak_prob, 4),
+    "n_bins_used": int(len(peak_curve)),
+    "vpd_range": (round(float(peak_curve["vpd_mid"].min()), 4), round(float(peak_curve["vpd_mid"].max()), 4))
+})
+
+# ============================================================
+# 6) City-scale relative-to-peak (summer highE only)
+# ============================================================
+city_year_highE = (
+    highE_df.groupby(["city", "year"], as_index=False)
+    .agg(
+        VPD_mean=("VPD", "mean"),
+        SSRD_mean=("SSRD", "mean"),
+        P_active=("active", "mean"),
+        PrHighCC=("HighCC", "mean")
+    )
+)
+
+city_year_highE["period"] = np.where(city_year_highE["year"].isin(EARLY_YEARS), "early",
+                              np.where(city_year_highE["year"].isin(RECENT_YEARS), "recent", "other"))
+city_year_highE = city_year_highE[city_year_highE["period"].isin(["early", "recent"])].copy()
+
+city_pos = (
+    city_year_highE.groupby(["city", "period"], as_index=False)
+    .agg(
+        VPD_mean=("VPD_mean", "mean"),
+        P_active=("P_active", "mean"),
+        PrHighCC=("PrHighCC", "mean")
+    )
+)
+
+city_pos["peak_vpd"] = peak_vpd
+city_pos["delta_to_peak"] = city_pos["VPD_mean"] - city_pos["peak_vpd"]
+
+def classify_position(x, near_width=NEAR_WIDTH):
+    if pd.isna(x):
+        return np.nan
+    if x < -near_width:
+        return "before_peak"
+    elif x > near_width:
+        return "after_peak"
+    else:
+        return "near_peak"
+
+city_pos["position_class"] = city_pos["delta_to_peak"].apply(classify_position)
+city_pos.to_csv(os.path.join(OUT_DIR, "city_position_summer_highE.csv"), index=False)
+
+print("\nCity-scale position counts (summer highE):")
+print(city_pos.groupby(["period", "position_class"]).size())
+
+print("\nCity-scale delta_to_peak summary:")
+print(city_pos.groupby("period")["delta_to_peak"].describe().round(4))
+
+# ============================================================
+# 7) Patch-scale relative-to-peak (summer highE only)
+# ============================================================
+patch_year_highE = (
+    highE_df.groupby(["city", "year", "spatial_id"], as_index=False)
+    .agg(
+        VPD_mean=("VPD", "mean"),
+        patch_highcc_rate=("HighCC", "mean"),
+        patch_active_rate=("active", "mean")
+    )
+)
+
+patch_year_highE["period"] = np.where(patch_year_highE["year"].isin(EARLY_YEARS), "early",
+                               np.where(patch_year_highE["year"].isin(RECENT_YEARS), "recent", "other"))
+patch_year_highE = patch_year_highE[patch_year_highE["period"].isin(["early", "recent"])].copy()
+
+patch_year_highE["peak_vpd"] = peak_vpd
+patch_year_highE["delta_to_peak"] = patch_year_highE["VPD_mean"] - patch_year_highE["peak_vpd"]
+patch_year_highE["position_class"] = patch_year_highE["delta_to_peak"].apply(classify_position)
+
+# 这里是互斥分类，所以比例一定加总为1
+patch_pos_summary = (
+    patch_year_highE.groupby(["city", "period", "position_class"], as_index=False)
+    .size()
+    .rename(columns={"size": "n_patch"})
+)
+
+patch_total = (
+    patch_year_highE.groupby(["city", "period"], as_index=False)
+    .size()
+    .rename(columns={"size": "n_total_patch"})
+)
+
+patch_pos_summary = patch_pos_summary.merge(patch_total, on=["city", "period"], how="left")
+patch_pos_summary["frac_patch"] = patch_pos_summary["n_patch"] / patch_pos_summary["n_total_patch"]
+patch_pos_summary.to_csv(os.path.join(OUT_DIR, "patch_position_summer_highE_summary.csv"), index=False)
+
+print("\nPatch-scale position fractions (global mean, summer highE):")
+print(
+    patch_pos_summary.groupby(["period", "position_class"])["frac_patch"]
+    .mean()
+    .round(4)
+)
+
+# check if composition sums to 1
+check_comp = (
+    patch_pos_summary.groupby(["city", "period"], as_index=False)["frac_patch"]
+    .sum()
+)
+print("\nComposition check (should be ~1):")
+print(check_comp["frac_patch"].describe().round(6))
+
+# ============================================================
+# 8) Rebuild city divergence types (same as before)
+# ============================================================
+# mean-demand = all summer conditions (consistent with previous city-level setup)
+city_year_meanatt = (
+    summer_df.groupby(["city", "year"], as_index=False)["HighCC"]
+    .mean()
+    .rename(columns={"HighCC": "PrHighCC_meanDemand"})
+)
+
+# extreme-demand = baseline top decile VPD
+vpd_q90 = (
+    baseline_summer.groupby("city")["VPD"]
+    .quantile(0.90)
+    .reset_index()
+    .rename(columns={"VPD": "vpd_q90"})
+)
+summer_df2 = summer_df.merge(vpd_q90, on="city", how="left")
+summer_df2["is_extreme_demand"] = (summer_df2["VPD"] > summer_df2["vpd_q90"]).astype(int)
+
+city_year_extreme = (
+    summer_df2[summer_df2["is_extreme_demand"] == 1]
+    .groupby(["city", "year"], as_index=False)["HighCC"]
+    .mean()
+    .rename(columns={"HighCC": "PrHighCC_extremeDemand"})
+)
+
+city_year_att = city_year_meanatt.merge(city_year_extreme, on=["city", "year"], how="outer")
+
+city_att_early = (
+    city_year_att[city_year_att["year"].isin(EARLY_YEARS)]
+    .groupby("city", as_index=False)[["PrHighCC_meanDemand", "PrHighCC_extremeDemand"]]
+    .mean()
+    .rename(columns={
+        "PrHighCC_meanDemand": "mean_att_early",
+        "PrHighCC_extremeDemand": "extreme_att_early"
+    })
+)
+
+city_att_recent = (
+    city_year_att[city_year_att["year"].isin(RECENT_YEARS)]
+    .groupby("city", as_index=False)[["PrHighCC_meanDemand", "PrHighCC_extremeDemand"]]
+    .mean()
+    .rename(columns={
+        "PrHighCC_meanDemand": "mean_att_recent",
+        "PrHighCC_extremeDemand": "extreme_att_recent"
+    })
+)
+
+city_div = city_att_early.merge(city_att_recent, on="city", how="inner")
+city_div["d_mean"] = city_div["mean_att_recent"] - city_div["mean_att_early"]
+city_div["d_extreme"] = city_div["extreme_att_recent"] - city_div["extreme_att_early"]
+
+def classify_city(row):
+    if row["d_mean"] >= 0 and row["d_extreme"] >= 0:
+        return "gain_both"
+    elif row["d_mean"] >= 0 and row["d_extreme"] < 0:
+        return "gain_mean_lose_extreme"
+    elif row["d_mean"] < 0 and row["d_extreme"] >= 0:
+        return "lose_mean_gain_extreme"
+    else:
+        return "lose_both"
+
+city_div["divergence_type"] = city_div.apply(classify_city, axis=1)
+
+# merge city highE position
+city_pos_wide = city_pos.pivot(index="city", columns="period", values="delta_to_peak").reset_index()
+city_pos_wide.columns = ["city", "delta_to_peak_early", "delta_to_peak_recent"]
+city_div = city_div.merge(city_pos_wide, on="city", how="left")
+city_div["d_delta_to_peak"] = city_div["delta_to_peak_recent"] - city_div["delta_to_peak_early"]
+
+# merge patch fractions
+patch_wide = (
+    patch_pos_summary.pivot_table(index=["city", "period"], columns="position_class", values="frac_patch", aggfunc="mean")
+    .reset_index()
+)
+patch_wide.columns.name = None
+patch_wide = patch_wide.rename(columns={
+    "before_peak": "frac_before_peak",
+    "near_peak": "frac_near_peak",
+    "after_peak": "frac_after_peak"
+})
+
+patch_early = patch_wide[patch_wide["period"] == "early"].drop(columns=["period"]).rename(columns={
+    "frac_before_peak": "frac_before_peak_early",
+    "frac_near_peak": "frac_near_peak_early",
+    "frac_after_peak": "frac_after_peak_early"
+})
+
+patch_recent = patch_wide[patch_wide["period"] == "recent"].drop(columns=["period"]).rename(columns={
+    "frac_before_peak": "frac_before_peak_recent",
+    "frac_near_peak": "frac_near_peak_recent",
+    "frac_after_peak": "frac_after_peak_recent"
+})
+
+city_div = city_div.merge(patch_early, on="city", how="left")
+city_div = city_div.merge(patch_recent, on="city", how="left")
+
+for col in ["frac_before_peak", "frac_near_peak", "frac_after_peak"]:
+    city_div[f"d_{col}"] = city_div[f"{col}_recent"] - city_div[f"{col}_early"]
+
+city_div.to_csv(os.path.join(OUT_DIR, "city_divergence_with_peak_position_summer_highE.csv"), index=False)
+
+print("\nCounts by divergence type:")
+print(city_div["divergence_type"].value_counts())
+
+print("\nMean relative-to-peak position by divergence type (summer highE):")
+print(
+    city_div.groupby("divergence_type")[[
+        "delta_to_peak_early", "delta_to_peak_recent", "d_delta_to_peak",
+        "d_frac_before_peak", "d_frac_near_peak", "d_frac_after_peak"
+    ]].mean().round(4)
+)
+
+# ============================================================
+# 9) Group comparison stats
+# ============================================================
+vars_for_kw = [
+    "delta_to_peak_early",
+    "delta_to_peak_recent",
+    "d_delta_to_peak",
+    "d_frac_before_peak",
+    "d_frac_near_peak",
+    "d_frac_after_peak"
+]
+
+kw_rows = []
+for v in vars_for_kw:
+    subs = [g[v].dropna().values for _, g in city_div.groupby("divergence_type")]
+    if len(subs) >= 2 and all(len(x) > 0 for x in subs):
+        stat, p = kruskal(*subs)
+    else:
+        stat, p = np.nan, np.nan
+    kw_rows.append([v, stat, p])
+
+kw_df = pd.DataFrame(kw_rows, columns=["variable", "kruskal_stat", "p_value"])
+kw_df.to_csv(os.path.join(OUT_DIR, "peak_position_group_stats_summer_highE.csv"), index=False)
+
+print("\nPeak-position group comparison stats (summer highE):")
+print(kw_df.sort_values("p_value").round(4))
+
+# ============================================================
+# 10) Plotting
+# ============================================================
+def save_plot(fig, name):
+    fig.savefig(os.path.join(OUT_DIR, f"{name}.png"), dpi=DPI, bbox_inches="tight", facecolor="white")
+    fig.savefig(os.path.join(OUT_DIR, f"{name}.pdf"), bbox_inches="tight", facecolor="white")
+    plt.show()
+    plt.close(fig)
+
+# A. peak curve
+fig, ax = plt.subplots(figsize=(8.0, 5.0))
+ax.plot(peak_curve["vpd_mid"], peak_curve["p_highcc_smooth"], marker="o", lw=1.6)
+ax.axvline(peak_vpd, linestyle="--", color="k")
+ax.set_xlabel("VPD")
+ax.set_ylabel("Smoothed Pr(HighCC)")
+ax.set_title("Summer high-SSRD empirical peak of Pr(HighCC)")
+ax.grid(alpha=0.25)
+save_plot(fig, "peak_curve_summer_highE")
+
+# B. city hist
+for period in ["early", "recent"]:
+    sub = city_pos[city_pos["period"] == period].copy()
+    fig, ax = plt.subplots(figsize=(7.6, 4.8))
+    ax.hist(sub["delta_to_peak"].dropna(), bins=20)
+    ax.axvline(0, color="k", linestyle="--")
+    ax.axvline(-NEAR_WIDTH, color="gray", linestyle=":")
+    ax.axvline(NEAR_WIDTH, color="gray", linestyle=":")
+    ax.set_xlabel("VPD - peak VPD (summer highE)")
+    ax.set_ylabel("Number of cities")
+    ax.set_title(f"City-scale relative-to-peak position ({period}, summer highE)")
+    ax.grid(alpha=0.25)
+    save_plot(fig, f"city_relative_to_peak_{period}_summer_highE")
+
+# C. patch composition
+patch_global = (
+    patch_pos_summary.groupby(["period", "position_class"], as_index=False)["frac_patch"]
+    .mean()
+)
+
+fig, ax = plt.subplots(figsize=(7.6, 4.8))
+for period in ["early", "recent"]:
+    sub = patch_global[patch_global["period"] == period].set_index("position_class").reindex(["before_peak", "near_peak", "after_peak"]).reset_index()
+    x = np.arange(len(sub))
+    ax.plot(x, sub["frac_patch"], marker="o", lw=1.6, label=period)
+ax.set_xticks(np.arange(3))
+ax.set_xticklabels(["before_peak", "near_peak", "after_peak"])
+ax.set_ylabel("Mean fraction across cities")
+ax.set_title("Patch-scale relative-to-peak composition (summer highE)")
+ax.legend(frameon=False)
+ax.grid(alpha=0.25)
+save_plot(fig, "patch_relative_to_peak_composition_summer_highE")
+
+# D. boxplots by divergence type
+order = ["gain_both", "gain_mean_lose_extreme", "lose_mean_gain_extreme", "lose_both"]
+for v in vars_for_kw:
+    fig, ax = plt.subplots(figsize=(8.2, 4.8))
+    data = [city_div.loc[city_div["divergence_type"] == g, v].dropna().values for g in order]
+    ax.boxplot(data, labels=order, showfliers=False)
+    ax.set_ylabel(v)
+    ax.set_title(f"{v} across divergence types (summer highE)")
+    ax.tick_params(axis="x", rotation=18)
+    ax.grid(axis="y", alpha=0.25)
+    save_plot(fig, f"box_{v}_by_divergence_summer_highE")
+
+# ============================================================
+# 11) Save summary
+# ============================================================
+summary = {
+    "source": SOURCE_NAME,
+    "window": "summer + high SSRD only",
+    "peak_definition": f"empirical smoothed peak from {N_VPD_BINS} VPD bins",
+    "peak_vpd": peak_vpd,
+    "near_width": NEAR_WIDTH
+}
+with open(os.path.join(OUT_DIR, "peak_position_summer_highE_summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f, ensure_ascii=False, indent=2)
+
+print("\n✅ Saved to:", OUT_DIR)
+print("Key tables:")
+print(" - peak_curve_summer_highE.csv")
+print(" - peak_location_summer_highE.csv")
+print(" - city_position_summer_highE.csv")
+print(" - patch_position_summer_highE_summary.csv")
+print(" - city_divergence_with_peak_position_summer_highE.csv")
+print(" - peak_position_group_stats_summer_highE.csv")
+print("Key figures:")
+print(" - peak_curve_summer_highE.png/.pdf")
+print(" - city_relative_to_peak_early_summer_highE.png/.pdf")
+print(" - city_relative_to_peak_recent_summer_highE.png/.pdf")
+print(" - patch_relative_to_peak_composition_summer_highE.png/.pdf")
+print(" - box_*_by_divergence_summer_highE.png/.pdf")
+
+# ============================================================
+# Nature-style storytelling figures for urban vegetation cooling
+# Author-side plotting code
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Rectangle
+from scipy.stats import gaussian_kde
+
+# -----------------------------
+# 0) Paths
+# -----------------------------
+BASE1 = "/content/drive/MyDrive/Second_research/MERRA/hybrid/post_fig4_logic_closure_v2"
+BASE2 = "/content/drive/MyDrive/Second_research/MERRA/hybrid/post_fig4_patchlevel_citypix"
+BASE3 = "/content/drive/MyDrive/Second_research/MERRA/hybrid/post_fig4_peak_position_summer_highE"
+OUTDIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/_nature_story_figs"
+os.makedirs(OUTDIR, exist_ok=True)
+
+# -----------------------------
+# 1) Global plot style
+# -----------------------------
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",   # Colab里通常没有 Arial，导出后可在 AI/PPT 替换
+    "font.size": 8,
+    "axes.titlesize": 9,
+    "axes.labelsize": 8,
+    "xtick.labelsize": 7,
+    "ytick.labelsize": 7,
+    "legend.fontsize": 7,
+    "figure.dpi": 200,
+    "savefig.dpi": 400,
+    "axes.linewidth": 0.8
+})
+
+# Nature双栏宽度大致 180 mm ≈ 7.1 in
+FIG_W = 7.1
+
+def savefig_all(fig, name):
+    fig.savefig(os.path.join(OUTDIR, f"{name}.png"), bbox_inches="tight", facecolor="white")
+    fig.savefig(os.path.join(OUTDIR, f"{name}.pdf"), bbox_inches="tight", facecolor="white")
+    plt.show()
+    plt.close(fig)
+
+# ============================================================
+# 2) Read data
+# ============================================================
+exp1_reg = pd.read_csv(os.path.join(BASE1, "exp1_vpd_regime_series.csv"))
+exp1_dec = pd.read_csv(os.path.join(BASE1, "exp1_vpd_decomposition.csv"))
+exp1_dec2 = pd.read_csv(os.path.join(BASE1, "exp1_vpd_ssrd_decomposition.csv"))
+city_div = pd.read_csv(os.path.join(BASE1, "exp3_city_divergence_table.csv"))
+scenario = pd.read_csv(os.path.join(BASE1, "exp4_scenario_exposure_shift.csv"))
+
+patch_summary = pd.read_csv(os.path.join(BASE2, "patch_summary_global.csv"))
+patch_div = pd.read_csv(os.path.join(BASE2, "city_divergence_with_patch_metrics.csv"))
+patch_kw = pd.read_csv(os.path.join(BASE2, "patch_group_comparison_stats.csv"))
+
+peak_curve = pd.read_csv(os.path.join(BASE3, "peak_curve_summer_highE.csv"))
+city_pos = pd.read_csv(os.path.join(BASE3, "city_position_summer_highE.csv"))
+patch_peak = pd.read_csv(os.path.join(BASE3, "patch_position_summer_highE_summary.csv"))
+peak_div = pd.read_csv(os.path.join(BASE3, "city_divergence_with_peak_position_summer_highE.csv"))
+peak_kw = pd.read_csv(os.path.join(BASE3, "peak_position_group_stats_summer_highE.csv"))
+
+# ============================================================
+# 3) Helper functions
+# ============================================================
+def bootstrap_ci_mean(x, n_boot=1000, seed=42):
+    rng = np.random.default_rng(seed)
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return np.nan, np.nan, np.nan
+    boots = []
+    for _ in range(n_boot):
+        s = rng.choice(x, size=len(x), replace=True)
+        boots.append(np.mean(s))
+    return np.mean(x), np.percentile(boots, 2.5), np.percentile(boots, 97.5)
+
+def add_panel_label(ax, label):
+    ax.text(-0.12, 1.04, label, transform=ax.transAxes,
+            fontsize=10, fontweight="bold", va="bottom", ha="left")
+
+def strip_top_right(ax):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+# ============================================================
+# 4) Build derived data for Figure A
+# ============================================================
+
+# A1: rebuild city-level yearly P(active) from exp1_vpd_regime_series
+tmp = exp1_reg.copy()
+# p_active_city ≈ sum_r p_regime * p_active_cond
+city_year_like = (
+    tmp.groupby("year", as_index=False)
+    .apply(lambda g: pd.Series({
+        "P_active_global": np.sum(g["p_regime"] * g["p_active_cond"])
+    }))
+    .reset_index(drop=True)
+)
+
+# 如果想保留原 exp1_decomposition 的 P_active 就直接用
+if "P_active" in exp1_dec.columns:
+    pactive_series = exp1_dec[["year", "P_active"]].copy()
+else:
+    pactive_series = city_year_like.rename(columns={"P_active_global": "P_active"})
+
+# A2: demand decomposition
+dec_plot = exp1_dec.copy()
+
+# A3: patch summary long -> easier plotting
+patch_plot = patch_summary.copy()
+
+# A4: divergence scatter
+div_plot = city_div.copy()
+
+# ============================================================
+# 5) Figure A: Global rise, but not uniform futures
+# ============================================================
+fig = plt.figure(figsize=(FIG_W, 7.8))
+gs = GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.28)
+
+# ---------------- A1 ----------------
+ax = fig.add_subplot(gs[0, 0])
+add_panel_label(ax, "A")
+
+# 用城市分解表重建每年各 regime 的 conditional 点，展示原始散点感
+for reg, sub in exp1_reg.groupby("demand_regime"):
+    ax.scatter(sub["year"], sub["p_active_cond"], s=10, alpha=0.25)
+
+ax.plot(pactive_series["year"], pactive_series["P_active"], lw=2.0, color="black")
+
+ax.set_xlabel("Year")
+ax.set_ylabel("Global mean P(active)")
+ax.set_title("Global activation rose over time")
+strip_top_right(ax)
+
+# ---------------- A2 ----------------
+ax = fig.add_subplot(gs[0, 1])
+add_panel_label(ax, "B")
+
+x = dec_plot["year"].values
+y1 = dec_plot["freq_effect"].values
+y2 = dec_plot["act_effect"].values
+
+ax.fill_between(x, 0, y1, alpha=0.55, label="Background-frequency effect")
+ax.fill_between(x, y1, y1 + y2, alpha=0.55, label="Within-background activation effect")
+ax.plot(x, y1 + y2, color="black", lw=1.8)
+
+ax.set_xlabel("Year")
+ax.set_ylabel("Contribution to ΔP(active)")
+ax.set_title("Why global activation increased")
+ax.legend(frameon=False, loc="upper left")
+strip_top_right(ax)
+
+# ---------------- A3 ----------------
+subgs = gs[1, 0].subgridspec(1, 3, wspace=0.28)
+metrics = ["HAF", "PHF", "GiniHighCC"]
+titles = ["HighCC area fraction", "Persistent HighCC fraction", "HighCC concentration"]
+
+for i, (m, ttl) in enumerate(zip(metrics, titles)):
+    ax = fig.add_subplot(subgs[0, i])
+    if i == 0:
+        add_panel_label(ax, "C")
+
+    for reg in ["low", "moderate", "high"]:
+        sub = patch_plot[patch_plot["demand_regime"] == reg].copy()
+        if len(sub) == 0:
+            continue
+        # early vs recent
+        early = sub[sub["period"] == "early"][m].values
+        recent = sub[sub["period"] == "recent"][m].values
+        if len(early) and len(recent):
+            ax.plot([0, 1], [np.mean(early), np.mean(recent)], lw=1.6, alpha=0.9, label=reg if i == 0 else None)
+
+    ax.set_xticks([0, 1])
+    ax.set_xticklabels(["Early", "Recent"])
+    ax.set_title(ttl)
+    if i == 0:
+        ax.set_ylabel("Mean across cities")
+        ax.legend(frameon=False, loc="best")
+    strip_top_right(ax)
+
+# ---------------- A4 ----------------
+ax = fig.add_subplot(gs[1, 1])
+add_panel_label(ax, "D")
+
+color_map = {
+    "gain_both": "#1f77b4",
+    "gain_mean_lose_extreme": "#ff7f0e",
+    "lose_mean_gain_extreme": "#d62728",
+    "lose_both": "#2ca02c",
+}
+
+for k, sub in div_plot.groupby("divergence_type"):
+    ax.scatter(sub["d_mean"], sub["d_extreme"], s=28, alpha=0.75, color=color_map.get(k, "gray"), label=k)
+
+ax.axhline(0, color="k", lw=0.8)
+ax.axvline(0, color="k", lw=0.8)
+ax.set_xlabel("Δ mean-demand Pr(HighCC)")
+ax.set_ylabel("Δ extreme-demand Pr(HighCC)")
+ax.set_title("Cities diverged under demanding conditions")
+ax.legend(frameon=False, loc="upper left")
+strip_top_right(ax)
+
+savefig_all(fig, "FigA_global_rise_but_unequal_futures")
+
+# ============================================================
+# 6) Build derived data for Figure B
+# ============================================================
+
+# B1 peak curve already exists
+peak_vpd = peak_curve.loc[peak_curve["p_highcc_smooth"].idxmax(), "vpd_mid"]
+
+# B2 dumbbell input
+city_pos_wide = city_pos.pivot(index="city", columns="period", values="delta_to_peak").reset_index()
+city_pos_wide.columns.name = None
+city_pos_wide.columns = ["city", "early", "recent"]
+city_pos_wide = city_pos_wide.sort_values("recent").reset_index(drop=True)
+city_pos_wide["rank"] = np.arange(len(city_pos_wide))
+
+# merge divergence type
+city_pos_wide = city_pos_wide.merge(
+    peak_div[["city", "divergence_type"]],
+    on="city", how="left"
+)
+
+# B3 / B4
+peak_box = peak_div.copy()
+
+# patch composition by city type
+patch_comp = patch_peak.copy()
+patch_comp = patch_comp.merge(
+    peak_div[["city", "divergence_type"]],
+    on="city", how="left"
+)
+
+# ============================================================
+# 7) Figure B: Approaching the high-radiation peak window
+# ============================================================
+fig = plt.figure(figsize=(FIG_W, 8.1))
+gs = GridSpec(2, 2, figure=fig, hspace=0.35, wspace=0.28)
+
+# ---------------- B1 ----------------
+ax = fig.add_subplot(gs[0, 0])
+add_panel_label(ax, "A")
+
+ax.scatter(peak_curve["vpd_mid"], peak_curve["p_highcc"], s=20, alpha=0.35, label="Binned observations")
+ax.plot(peak_curve["vpd_mid"], peak_curve["p_highcc_smooth"], lw=2.0, color="black", label="Smoothed curve")
+ax.axvline(peak_vpd, color="#d62728", lw=1.4, ls="--", label=f"Peak ≈ {peak_vpd:.2f}")
+ax.set_xlabel("VPD (summer high-SSRD)")
+ax.set_ylabel("Pr(HighCC)")
+ax.set_title("A high-radiation attainability peak emerges")
+ax.legend(frameon=False, loc="upper left")
+strip_top_right(ax)
+
+# ---------------- B2 ----------------
+ax = fig.add_subplot(gs[0, 1])
+add_panel_label(ax, "B")
+
+for _, row in city_pos_wide.iterrows():
+    c = color_map.get(row["divergence_type"], "gray")
+    ax.plot([0, 1], [row["early"], row["recent"]], color=c, alpha=0.45, lw=1.0)
+    ax.scatter([0, 1], [row["early"], row["recent"]], color=c, s=10, alpha=0.85)
+
+ax.axhline(0, color="k", lw=0.8, ls="--")
+ax.set_xticks([0, 1])
+ax.set_xticklabels(["Early", "Recent"])
+ax.set_ylabel("VPD - peak VPD")
+ax.set_title("Cities moved closer to the peak at different rates")
+strip_top_right(ax)
+
+# ---------------- B3 ----------------
+ax = fig.add_subplot(gs[1, 0])
+add_panel_label(ax, "C")
+
+order = ["gain_both", "gain_mean_lose_extreme", "lose_mean_gain_extreme", "lose_both"]
+data = [peak_box.loc[peak_box["divergence_type"] == g, "d_delta_to_peak"].dropna().values for g in order]
+bp = ax.boxplot(data, labels=order, showfliers=False, patch_artist=True)
+for patch, g in zip(bp["boxes"], order):
+    patch.set_facecolor(color_map[g])
+    patch.set_alpha(0.45)
+
+for i, g in enumerate(order, start=1):
+    y = peak_box.loc[peak_box["divergence_type"] == g, "d_delta_to_peak"].dropna().values
+    x = np.random.normal(i, 0.05, size=len(y))
+    ax.scatter(x, y, s=10, alpha=0.55, color=color_map[g])
+
+ax.axhline(0, color="k", lw=0.8)
+ax.set_ylabel("Δ(VPD - peak VPD)")
+ax.set_title("Divergence types differ in peak-approach speed")
+ax.tick_params(axis="x", rotation=18)
+strip_top_right(ax)
+
+# ---------------- B4 ----------------
+ax = fig.add_subplot(gs[1, 1])
+add_panel_label(ax, "D")
+
+comp = (
+    patch_comp.groupby(["divergence_type", "period", "position_class"], as_index=False)["frac_patch"]
+    .mean()
+)
+
+# 只画 recent，做成 100% stacked bars
+bar_order = ["before_peak", "near_peak", "after_peak"]
+xpos = np.arange(len(order))
+bottom = np.zeros(len(order))
+
+for cls, col in zip(bar_order, ["#4daf4a", "#ffcc00", "#e41a1c"]):
+    vals = []
+    for g in order:
+        v = comp[(comp["divergence_type"] == g) & (comp["period"] == "recent") & (comp["position_class"] == cls)]["frac_patch"]
+        vals.append(float(v.iloc[0]) if len(v) else 0.0)
+    ax.bar(xpos, vals, bottom=bottom, label=cls, color=col, alpha=0.85)
+    bottom += np.array(vals)
+
+ax.set_xticks(xpos)
+ax.set_xticklabels(order, rotation=18)
+ax.set_ylabel("Patch fraction (recent)")
+ax.set_title("Patch networks occupy different peak-window states")
+ax.legend(frameon=False, loc="upper right")
+strip_top_right(ax)
+
+savefig_all(fig, "FigB_approaching_the_high_radiation_peak_window")
+
+print("Saved to:", OUTDIR)
