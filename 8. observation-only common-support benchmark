@@ -1,0 +1,4701 @@
+# ============================================================
+# Revision experiments 3 & 4
+#
+# Experiment 3:
+#   HighCE and active-cooling threshold sensitivity
+#   using existing model-derived CE.
+#
+# Experiment 4:
+#   Fast global observed common-support benchmark
+#   using real low-EVI observations to construct empirical CE.
+#
+# Outputs:
+#   - HighCE threshold sensitivity
+#   - active threshold sensitivity
+#   - Fig.3 robustness curves
+#   - common-support empirical Fig.3
+#   - empirical P(active) early vs recent with bootstrap CI
+#   - empirical city divergence
+# ============================================================
+
+import os
+import gc
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr, wilcoxon
+
+# ============================================================
+# 0. Paths and settings
+# ============================================================
+
+RAW_FP = "/content/drive/MyDrive/Second_research/derived_datasets/GlobalUrbanCooling_dataset_v2.parquet"
+
+CE_CANDIDATES = [
+    "/content/drive/MyDrive/Second_research/MERRA/hybrid/GlobalUrbanCooling_dataset_v2_dualCE_full.parquet",
+    "/content/drive/MyDrive/Second_research/derived_datasets/GlobalUrbanCooling_dataset_v2_dualCE_full.parquet",
+    "/content/drive/MyDrive/Second_research/derived_datasets/GlobalUrbanCooling_dataset_v2.parquet",
+]
+
+OUTDIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_exp3_threshold_exp4_common_support"
+os.makedirs(OUTDIR, exist_ok=True)
+
+BASELINE_YEARS = list(range(2002, 2007))
+RECENT_YEARS   = [2019, 2022, 2025]
+
+TOPK_HOT_MONTHS = 3
+
+# Experiment 3 thresholds
+HIGHCE_Q_LIST = [0.70, 0.75, 0.80, 0.85, 0.90]   # top 30%, 25%, 20%, 15%, 10%
+ACTIVE_Q_LIST = [0.50, 0.60, 0.70]
+
+# Experiment 4 observed common-support settings
+ABS_LOW_EVI_MAX = 0.25
+MIN_DEVI = 0.05
+CE_ABS_MAX = 100.0
+MIN_REF_N_STRICT = 30
+MIN_REF_N_RELAX = 50
+
+# sampling for speed
+MAX_TARGET_PER_CITY_YEAR = 8000
+RANDOM_STATE = 42
+
+# Fig. 3 settings
+N_VPD_BINS = 12
+MIN_OBS_PER_CITY_BIN = 30
+MIN_CITY_PER_BIN = 15
+
+# Bootstrap
+BOOT_N = 500
+
+DPI = 600
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 11,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 180,
+    "savefig.dpi": DPI,
+})
+
+COL = {
+    "low": "#1597A5",
+    "mid": "#FFC24B",
+    "high": "#F66F69",
+    "dark": "#0E606B",
+    "grey": "#8C8C8C",
+    "black": "#222222",
+    "coral": "#F66F69",
+}
+
+SSRD_ORDER = ["low", "mid", "high"]
+SSRD_LABEL = {
+    "low": "Low radiation",
+    "mid": "Medium radiation",
+    "high": "High radiation",
+}
+
+# ============================================================
+# 1. Helper functions
+# ============================================================
+
+def existing_path(paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("No existing file found:\n" + "\n".join(paths))
+
+
+def pick_col(df, candidates, required=True):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise ValueError(f"Cannot find any of {candidates}\nAvailable columns:\n{df.columns.tolist()}")
+    return None
+
+
+def savefig(fig, name):
+    png = os.path.join(OUTDIR, f"{name}.png")
+    pdf = os.path.join(OUTDIR, f"{name}.pdf")
+    fig.savefig(png, dpi=DPI, bbox_inches="tight", facecolor="white")
+    fig.savefig(pdf, bbox_inches="tight", facecolor="white")
+    print("Saved:", png)
+
+
+def classify_period(y):
+    if y in BASELINE_YEARS:
+        return "early"
+    if y in RECENT_YEARS:
+        return "recent"
+    return "middle"
+
+
+def topk_months_by_baseline_t2m(g, month_col, t2m_col, k=3):
+    m = g.groupby(month_col)[t2m_col].mean().sort_values(ascending=False)
+    return sorted(m.index.astype(int).tolist()[:k])
+
+
+def city_tercile_labels(s):
+    r = s.rank(method="average", pct=True)
+    out = pd.Series(index=s.index, dtype="object")
+    out[r <= 1/3] = "low"
+    out[(r > 1/3) & (r <= 2/3)] = "mid"
+    out[r > 2/3] = "high"
+    return out
+
+
+def city_percentile_bins(s, n_bins=12):
+    r = s.rank(method="average", pct=True)
+    b = np.ceil(r * n_bins).astype(int)
+    b = np.clip(b, 1, n_bins)
+    return b
+
+
+def classify_quad(x, y):
+    if not np.isfinite(x) or not np.isfinite(y):
+        return "missing"
+    if x >= 0 and y >= 0:
+        return "gain_both"
+    if x >= 0 and y < 0:
+        return "gain_avg_lose_extreme"
+    if x < 0 and y < 0:
+        return "lose_both"
+    return "lose_avg_gain_extreme"
+
+
+def bootstrap_paired_delta(city_period, value_col, boot_n=500, seed=42):
+    wide = city_period.pivot(index="city", columns="period", values=value_col)
+    wide = wide.dropna(subset=["early", "recent"]).copy()
+
+    if len(wide) == 0:
+        return None
+
+    e = wide["early"].to_numpy(float)
+    r = wide["recent"].to_numpy(float)
+    d = r - e
+    n = len(wide)
+
+    rng = np.random.default_rng(seed)
+    boot_e = np.empty(boot_n)
+    boot_r = np.empty(boot_n)
+    boot_d = np.empty(boot_n)
+
+    for b in range(boot_n):
+        idx = rng.integers(0, n, n)
+        boot_e[b] = np.nanmean(e[idx])
+        boot_r[b] = np.nanmean(r[idx])
+        boot_d[b] = np.nanmean(d[idx])
+
+    try:
+        _, p_w = wilcoxon(r, e)
+    except Exception:
+        p_w = np.nan
+
+    return {
+        "n_cities": int(n),
+        "early_mean": float(np.nanmean(e)),
+        "early_lo95": float(np.nanpercentile(boot_e, 2.5)),
+        "early_hi95": float(np.nanpercentile(boot_e, 97.5)),
+        "recent_mean": float(np.nanmean(r)),
+        "recent_lo95": float(np.nanpercentile(boot_r, 2.5)),
+        "recent_hi95": float(np.nanpercentile(boot_r, 97.5)),
+        "delta_mean": float(np.nanmean(d)),
+        "delta_lo95": float(np.nanpercentile(boot_d, 2.5)),
+        "delta_hi95": float(np.nanpercentile(boot_d, 97.5)),
+        "n_increase": int(np.sum(d > 0)),
+        "wilcoxon_p": float(p_w) if np.isfinite(p_w) else np.nan,
+    }
+
+
+def bootstrap_fig3_city_median(city_bin, metric_col, boot_n=500, seed=42):
+    rng = np.random.default_rng(seed)
+    rows = []
+
+    cities = np.array(sorted(city_bin["city"].unique()))
+    n_city = len(cities)
+
+    keys = city_bin[["SSRD_group", "vpd_bin"]].drop_duplicates()
+    keys = keys.sort_values(["SSRD_group", "vpd_bin"])
+
+    for _, key in keys.iterrows():
+        ssrd = key["SSRD_group"]
+        vb = key["vpd_bin"]
+
+        sub = city_bin[(city_bin["SSRD_group"] == ssrd) & (city_bin["vpd_bin"] == vb)]
+
+        if sub["city"].nunique() < MIN_CITY_PER_BIN:
+            continue
+
+        vals_by_city = sub.set_index("city")[metric_col].to_dict()
+        vals = np.array([vals_by_city.get(c, np.nan) for c in cities], dtype=float)
+
+        obs = np.nanmedian(vals)
+        boots = np.empty(boot_n)
+
+        for b in range(boot_n):
+            idx = rng.integers(0, n_city, n_city)
+            boots[b] = np.nanmedian(vals[idx])
+
+        rows.append({
+            "SSRD_group": ssrd,
+            "vpd_bin": int(vb),
+            "VPD_mid": sub["VPD_mid"].median(),
+            f"{metric_col}_med": obs,
+            f"{metric_col}_lo95": np.nanpercentile(boots, 2.5),
+            f"{metric_col}_hi95": np.nanpercentile(boots, 97.5),
+            "n_cities": sub["city"].nunique(),
+            "n_obs": sub["n_obs"].sum(),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def compute_fig3_city_bin(df, metric_col, high_state_col):
+    d = df.copy()
+    d["SSRD_group"] = d.groupby("city")["SSRD_MJm2"].transform(city_tercile_labels)
+    d["vpd_bin"] = d.groupby("city")["VPD_kPa"].transform(lambda s: city_percentile_bins(s, N_VPD_BINS))
+
+    city_bin = (
+        d.groupby(["city", "SSRD_group", "vpd_bin"])
+        .agg(
+            VPD_mid=("VPD_kPa", "median"),
+            metric_p90=(metric_col, lambda x: np.nanquantile(x, 0.90)),
+            Pr_HighState=(high_state_col, "mean"),
+            n_obs=(high_state_col, "size"),
+        )
+        .reset_index()
+    )
+
+    city_bin = city_bin[city_bin["n_obs"] >= MIN_OBS_PER_CITY_BIN].copy()
+    return city_bin
+
+
+def aggregate_fig3_no_boot(city_bin):
+    g = (
+        city_bin.groupby(["SSRD_group", "vpd_bin"])
+        .agg(
+            VPD_mid=("VPD_mid", "median"),
+            metric_p90_med=("metric_p90", "median"),
+            metric_p90_lo=("metric_p90", lambda x: np.nanquantile(x, 0.25)),
+            metric_p90_hi=("metric_p90", lambda x: np.nanquantile(x, 0.75)),
+            Pr_HighState_med=("Pr_HighState", "median"),
+            Pr_HighState_lo=("Pr_HighState", lambda x: np.nanquantile(x, 0.25)),
+            Pr_HighState_hi=("Pr_HighState", lambda x: np.nanquantile(x, 0.75)),
+            n_cities=("city", "nunique"),
+            n_obs=("n_obs", "sum"),
+        )
+        .reset_index()
+    )
+    return g[g["n_cities"] >= MIN_CITY_PER_BIN].copy()
+
+
+# ============================================================
+# 2. Experiment 3: threshold sensitivity using existing model CE
+# ============================================================
+
+print("\n" + "=" * 100)
+print("EXPERIMENT 3: HighCE and active threshold sensitivity")
+print("=" * 100)
+
+CE_FP = existing_path(CE_CANDIDATES)
+print("Using CE file:", CE_FP)
+
+df0 = pd.read_parquet(CE_FP)
+print("Loaded:", df0.shape)
+
+city_col  = pick_col(df0, ["city"])
+year_col  = pick_col(df0, ["Year", "year"])
+month_col = pick_col(df0, ["Month", "month"])
+t2m_col   = pick_col(df0, ["T2M_C", "MERRA2hyb_T2M_C"])
+vpd_col   = pick_col(df0, ["VPD_kPa", "MERRA2hyb_VPD_kPa"])
+ssrd_col  = pick_col(df0, ["SSRD_MJm2", "MERRA2hyb_SSRD_MJm2"])
+
+ce_cols = {}
+c = pick_col(df0, ["cooling_efficiency_ERA5", "cooling_efficiency", "ce_era_plot"], required=False)
+if c is not None:
+    ce_cols["ERA5"] = c
+c = pick_col(df0, ["cooling_efficiency_MERRA2", "ce_mer_plot"], required=False)
+if c is not None:
+    ce_cols["MERRA2"] = c
+
+if not ce_cols:
+    raise ValueError("No CE column found.")
+
+keep_cols = [city_col, year_col, month_col, t2m_col, vpd_col, ssrd_col] + list(ce_cols.values())
+keep_cols = list(dict.fromkeys(keep_cols))
+
+ce_df = df0[keep_cols].copy()
+del df0
+gc.collect()
+
+for c in keep_cols:
+    if c != city_col:
+        ce_df[c] = pd.to_numeric(ce_df[c], errors="coerce")
+
+ce_df = ce_df.dropna(subset=keep_cols).copy()
+ce_df = ce_df.rename(columns={
+    city_col: "city",
+    year_col: "Year",
+    month_col: "Month",
+    t2m_col: "T2M_C",
+    vpd_col: "VPD_kPa",
+    ssrd_col: "SSRD_MJm2",
+})
+
+ce_cols_renamed = {}
+for source, col in ce_cols.items():
+    if col in ce_df.columns:
+        new_col = f"CE_{source}"
+        ce_df = ce_df.rename(columns={col: new_col})
+        ce_cols_renamed[source] = new_col
+
+ce_df["Year"] = ce_df["Year"].astype(int)
+ce_df["Month"] = ce_df["Month"].astype(int)
+
+# city-specific summer months from baseline T2M
+base = ce_df[ce_df["Year"].isin(BASELINE_YEARS)].copy()
+summer_rows = []
+
+for city, g in base.groupby("city"):
+    months = topk_months_by_baseline_t2m(g, "Month", "T2M_C", TOPK_HOT_MONTHS)
+    for m in months:
+        summer_rows.append({"city": city, "Month": m, "is_summer": 1})
+
+summer_months = pd.DataFrame(summer_rows)
+summer_months.to_csv(os.path.join(OUTDIR, "exp3_city_specific_summer_months.csv"), index=False)
+
+ce_summer = ce_df.merge(summer_months, on=["city", "Month"], how="left")
+ce_summer = ce_summer[ce_summer["is_summer"] == 1].drop(columns=["is_summer"]).copy()
+
+print("CE summer shape:", ce_summer.shape)
+print("CE sources:", ce_cols_renamed)
+
+# ----------------------------
+# 2.1 HighCE threshold sensitivity: Fig.3 curves + city divergence
+# ----------------------------
+
+highce_fig3_rows = []
+highce_summary_rows = []
+div_rows = []
+
+for source, ce_col in ce_cols_renamed.items():
+
+    for high_q in HIGHCE_Q_LIST:
+
+        d = ce_summer.copy()
+        d = d[np.isfinite(d[ce_col])].copy()
+
+        thr = (
+            d.groupby("city")[ce_col]
+            .quantile(high_q)
+            .rename("high_thr")
+            .reset_index()
+        )
+
+        d = d.merge(thr, on="city", how="left")
+        d["HighCE_sens"] = (d[ce_col] >= d["high_thr"]).astype(int)
+        d["period"] = d["Year"].apply(classify_period)
+
+        city_bin = compute_fig3_city_bin(d, ce_col, "HighCE_sens")
+        global_bin = aggregate_fig3_no_boot(city_bin)
+
+        global_bin["source"] = source
+        global_bin["high_q"] = high_q
+        global_bin["top_fraction"] = 1 - high_q
+        highce_fig3_rows.append(global_bin)
+
+        # summarize Fig.3 structure
+        for ssrd in SSRD_ORDER:
+            sub = global_bin[global_bin["SSRD_group"] == ssrd].sort_values("vpd_bin")
+            if len(sub) < 3:
+                continue
+
+            peak_row = sub.loc[sub["Pr_HighState_med"].idxmax()]
+
+            highce_summary_rows.append({
+                "source": source,
+                "high_q": high_q,
+                "top_fraction": 1 - high_q,
+                "SSRD_group": ssrd,
+                "CE_p90_lowVPD": sub.iloc[0]["metric_p90_med"],
+                "CE_p90_highVPD": sub.iloc[-1]["metric_p90_med"],
+                "CE_p90_change": sub.iloc[-1]["metric_p90_med"] - sub.iloc[0]["metric_p90_med"],
+                "PrHigh_lowVPD": sub.iloc[0]["Pr_HighState_med"],
+                "PrHigh_highVPD": sub.iloc[-1]["Pr_HighState_med"],
+                "PrHigh_peak": peak_row["Pr_HighState_med"],
+                "PrHigh_peak_bin": int(peak_row["vpd_bin"]),
+                "n_curve_points": len(sub),
+            })
+
+        # city divergence under this threshold
+        d["VPD_group"] = d.groupby("city")["VPD_kPa"].transform(city_tercile_labels)
+
+        city_avg = (
+            d[d["period"].isin(["early", "recent"])]
+            .groupby(["city", "period"])
+            .agg(PrHigh_avg=("HighCE_sens", "mean"))
+            .reset_index()
+        )
+
+        city_ext = (
+            d[(d["VPD_group"] == "high") & (d["period"].isin(["early", "recent"]))]
+            .groupby(["city", "period"])
+            .agg(PrHigh_extreme=("HighCE_sens", "mean"))
+            .reset_index()
+        )
+
+        cd = city_avg.merge(city_ext, on=["city", "period"], how="outer")
+        wide = cd.pivot(index="city", columns="period")
+        wide.columns = [f"{a}_{b}" for a, b in wide.columns]
+        wide = wide.reset_index()
+
+        needed = [
+            "PrHigh_avg_early", "PrHigh_avg_recent",
+            "PrHigh_extreme_early", "PrHigh_extreme_recent",
+        ]
+        for x in needed:
+            if x not in wide.columns:
+                wide[x] = np.nan
+
+        wide["d_avg"] = wide["PrHigh_avg_recent"] - wide["PrHigh_avg_early"]
+        wide["d_extreme"] = wide["PrHigh_extreme_recent"] - wide["PrHigh_extreme_early"]
+        wide["div_type"] = [classify_quad(x, y) for x, y in zip(wide["d_avg"], wide["d_extreme"])]
+
+        valid = wide.dropna(subset=["d_avg", "d_extreme"]).copy()
+
+        if len(valid) > 5:
+            r, p = spearmanr(valid["d_avg"], valid["d_extreme"])
+        else:
+            r, p = np.nan, np.nan
+
+        counts = valid["div_type"].value_counts()
+
+        div_rows.append({
+            "source": source,
+            "high_q": high_q,
+            "top_fraction": 1 - high_q,
+            "n_cities": len(valid),
+            "spearman_r": r,
+            "spearman_p": p,
+            "gain_both": int(counts.get("gain_both", 0)),
+            "gain_avg_lose_extreme": int(counts.get("gain_avg_lose_extreme", 0)),
+            "lose_both": int(counts.get("lose_both", 0)),
+            "lose_avg_gain_extreme": int(counts.get("lose_avg_gain_extreme", 0)),
+        })
+
+highce_fig3 = pd.concat(highce_fig3_rows, ignore_index=True)
+highce_summary = pd.DataFrame(highce_summary_rows)
+div_sensitivity = pd.DataFrame(div_rows)
+
+highce_fig3.to_csv(os.path.join(OUTDIR, "exp3_highce_threshold_fig3_curves.csv"), index=False)
+highce_summary.to_csv(os.path.join(OUTDIR, "exp3_highce_threshold_fig3_summary.csv"), index=False)
+div_sensitivity.to_csv(os.path.join(OUTDIR, "exp3_highce_threshold_city_divergence.csv"), index=False)
+
+print("\nHighCE Fig.3 sensitivity summary:")
+print(highce_summary.head(30).to_string(index=False))
+
+print("\nHighCE city divergence sensitivity:")
+print(div_sensitivity.to_string(index=False))
+
+# ----------------------------
+# 2.2 Active threshold sensitivity
+# ----------------------------
+
+active_rows = []
+
+for source, ce_col in ce_cols_renamed.items():
+
+    for active_q in ACTIVE_Q_LIST:
+
+        d = ce_summer.copy()
+        d = d[np.isfinite(d[ce_col])].copy()
+
+        base_d = d[d["Year"].isin(BASELINE_YEARS)].copy()
+
+        thr = (
+            base_d.groupby("city")[ce_col]
+            .quantile(active_q)
+            .rename("active_thr")
+            .reset_index()
+        )
+
+        d = d.merge(thr, on="city", how="left")
+        d["active_sens"] = (d[ce_col] > d["active_thr"]).astype(int)
+        d["period"] = d["Year"].apply(classify_period)
+
+        city_year = (
+            d.groupby(["city", "Year"])
+            .agg(Pactive=("active_sens", "mean"), n_obs=("active_sens", "size"))
+            .reset_index()
+        )
+
+        city_year["period"] = city_year["Year"].apply(classify_period)
+
+        city_period = (
+            city_year[city_year["period"].isin(["early", "recent"])]
+            .groupby(["city", "period"])
+            .agg(Pactive=("Pactive", "mean"))
+            .reset_index()
+        )
+
+        ci = bootstrap_paired_delta(city_period, "Pactive", BOOT_N, RANDOM_STATE)
+
+        if ci is None:
+            continue
+
+        active_rows.append({
+            "source": source,
+            "active_q": active_q,
+            **ci
+        })
+
+active_sensitivity = pd.DataFrame(active_rows)
+active_sensitivity.to_csv(os.path.join(OUTDIR, "exp3_active_threshold_sensitivity.csv"), index=False)
+
+print("\nActive threshold sensitivity:")
+print(active_sensitivity.to_string(index=False))
+
+# ----------------------------
+# 2.3 Plot Experiment 3 overview
+# ----------------------------
+
+default_source = "ERA5" if "ERA5" in ce_cols_renamed else list(ce_cols_renamed.keys())[0]
+
+plot_hq = highce_summary[
+    (highce_summary["source"] == default_source) &
+    (highce_summary["SSRD_group"] == "high")
+].copy()
+
+fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+for q in HIGHCE_Q_LIST:
+    sub = plot_hq[plot_hq["high_q"] == q]
+    if sub.empty:
+        continue
+
+    ax.scatter(
+        1 - q,
+        sub["CE_p90_change"].median(),
+        s=80,
+        color=COL["dark"]
+    )
+
+ax.axhline(0, color=COL["black"], lw=1)
+ax.set_xlabel("HighCE top fraction")
+ax.set_ylabel("P90 CE change, high VPD − low VPD\n(high-radiation regime)")
+ax.set_title("HighCE threshold sensitivity of potential gradient")
+ax.grid(axis="y", alpha=0.18)
+
+savefig(fig, "exp3_highce_threshold_potential_gradient")
+plt.show()
+
+fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+sub = active_sensitivity[active_sensitivity["source"] == default_source].copy()
+
+ax.errorbar(
+    sub["active_q"],
+    sub["delta_mean"],
+    yerr=[
+        sub["delta_mean"] - sub["delta_lo95"],
+        sub["delta_hi95"] - sub["delta_mean"]
+    ],
+    fmt="o",
+    lw=2,
+    capsize=4,
+    color=COL["dark"]
+)
+
+ax.axhline(0, color=COL["black"], lw=1)
+ax.set_xticks(ACTIVE_Q_LIST)
+ax.set_xticklabels([f"Q{int(q*100)}" for q in ACTIVE_Q_LIST])
+ax.set_xlabel("Active cooling baseline threshold")
+ax.set_ylabel("Recent − early P(active)")
+ax.set_title("Active threshold sensitivity")
+ax.grid(axis="y", alpha=0.18)
+
+savefig(fig, "exp3_active_threshold_sensitivity")
+plt.show()
+
+# ============================================================
+# 3. Experiment 4: fast observed common-support benchmark
+# ============================================================
+
+print("\n" + "=" * 100)
+print("EXPERIMENT 4: Observed common-support / matching benchmark")
+print("=" * 100)
+
+raw = pd.read_parquet(RAW_FP)
+print("Raw loaded:", raw.shape)
+
+needed = [
+    "city", "Year", "Month", "LST", "EVI",
+    "T2M_C", "TD_C", "VPD_kPa", "SSRD_MJm2",
+    "WIND10M_MS", "TP_mm", "SWVL1_m3m3", "STL1_C",
+    "DEM", "DIST_WATER_km", "LC", "is_core_ntl"
+]
+
+needed = [c for c in needed if c in raw.columns]
+missing = [c for c in ["city", "Year", "Month", "LST", "EVI", "T2M_C", "VPD_kPa", "SSRD_MJm2"] if c not in raw.columns]
+if missing:
+    raise ValueError(f"Missing required columns in raw data: {missing}")
+
+df = raw[needed].copy()
+del raw
+gc.collect()
+
+for c in needed:
+    if c != "city":
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+df = df.dropna(subset=needed).copy()
+df["Year"] = df["Year"].astype(int)
+df["Month"] = df["Month"].astype(int)
+
+print("Raw after clean:", df.shape)
+print("Cities:", df["city"].nunique())
+
+# city-specific summer
+base = df[df["Year"].isin(BASELINE_YEARS)].copy()
+
+summer_rows = []
+for city, g in base.groupby("city"):
+    months = topk_months_by_baseline_t2m(g, "Month", "T2M_C", TOPK_HOT_MONTHS)
+    for m in months:
+        summer_rows.append({"city": city, "Month": m, "is_summer": 1})
+
+summer_months = pd.DataFrame(summer_rows)
+summer_months.to_csv(os.path.join(OUTDIR, "exp4_city_specific_summer_months.csv"), index=False)
+
+df = df.merge(summer_months, on=["city", "Month"], how="left")
+df = df[df["is_summer"] == 1].drop(columns=["is_summer"]).copy()
+
+print("Common-support summer rows:", df.shape)
+
+# sample targets for speed
+rng = np.random.default_rng(RANDOM_STATE)
+parts = []
+for (city, year), g in df.groupby(["city", "Year"]):
+    if len(g) > MAX_TARGET_PER_CITY_YEAR:
+        idx = rng.choice(g.index.to_numpy(), MAX_TARGET_PER_CITY_YEAR, replace=False)
+        parts.append(df.loc[idx])
+    else:
+        parts.append(g)
+
+target = pd.concat(parts, ignore_index=True)
+print("Target sample:", target.shape)
+
+# ------------------------------------------------------------
+# 3.1 Build stratified background cells
+# ------------------------------------------------------------
+
+# Binning variables globally for common support.
+# These bins are deliberately not too fine to maintain enough support.
+def add_bins(d):
+    d = d.copy()
+
+    d["T2M_bin"] = np.searchsorted(np.nanquantile(d["T2M_C"], [1/3, 2/3]), d["T2M_C"], side="right") + 1
+    d["VPD_bin_bg"] = np.searchsorted(np.nanquantile(d["VPD_kPa"], [1/3, 2/3]), d["VPD_kPa"], side="right") + 1
+    d["SSRD_bin_bg"] = np.searchsorted(np.nanquantile(d["SSRD_MJm2"], [1/3, 2/3]), d["SSRD_MJm2"], side="right") + 1
+
+    if "SWVL1_m3m3" in d.columns:
+        d["SM_bin"] = np.searchsorted(np.nanquantile(d["SWVL1_m3m3"], [1/3, 2/3]), d["SWVL1_m3m3"], side="right") + 1
+    else:
+        d["SM_bin"] = 2
+
+    if "DEM" in d.columns:
+        d["DEM_bin"] = np.searchsorted(np.nanquantile(d["DEM"], [1/3, 2/3]), d["DEM"], side="right") + 1
+    else:
+        d["DEM_bin"] = 2
+
+    if "DIST_WATER_km" in d.columns:
+        x = np.log1p(np.maximum(d["DIST_WATER_km"].to_numpy(float), 0))
+        d["WATER_bin"] = np.searchsorted(np.nanquantile(x, [1/3, 2/3]), x, side="right") + 1
+    else:
+        d["WATER_bin"] = 2
+
+    return d
+
+df = add_bins(df)
+target = add_bins(target)
+
+strict_keys = [
+    "Month", "T2M_bin", "VPD_bin_bg", "SSRD_bin_bg",
+    "SM_bin", "DEM_bin", "WATER_bin", "LC", "is_core_ntl"
+]
+strict_keys = [k for k in strict_keys if k in df.columns]
+
+relax_keys = [
+    "Month", "T2M_bin", "VPD_bin_bg", "SSRD_bin_bg",
+    "SM_bin", "LC", "is_core_ntl"
+]
+relax_keys = [k for k in relax_keys if k in df.columns]
+
+# low-EVI reference pool, global
+ref = df[df["EVI"] <= ABS_LOW_EVI_MAX].copy()
+
+print("Global low-EVI reference pool:", ref.shape)
+print("Reference EVI summary:")
+print(ref["EVI"].describe())
+
+# strict reference cell
+ref_strict = (
+    ref.groupby(strict_keys)
+    .agg(
+        n_ref=("LST", "size"),
+        LST_ref=("LST", "median"),
+        EVI_ref=("EVI", "median")
+    )
+    .reset_index()
+)
+
+ref_strict = ref_strict[ref_strict["n_ref"] >= MIN_REF_N_STRICT].copy()
+ref_strict["match_level"] = "strict"
+
+# relaxed reference cell
+ref_relax = (
+    ref.groupby(relax_keys)
+    .agg(
+        n_ref=("LST", "size"),
+        LST_ref=("LST", "median"),
+        EVI_ref=("EVI", "median")
+    )
+    .reset_index()
+)
+
+ref_relax = ref_relax[ref_relax["n_ref"] >= MIN_REF_N_RELAX].copy()
+ref_relax["match_level"] = "relaxed"
+
+# merge strict first
+emp = target.merge(ref_strict, on=strict_keys, how="left")
+
+# fill missing with relaxed match
+missing_mask = emp["LST_ref"].isna()
+
+if missing_mask.any():
+    fallback_cols = relax_keys + ["n_ref", "LST_ref", "EVI_ref", "match_level"]
+    fallback = target.loc[missing_mask].merge(ref_relax[fallback_cols], on=relax_keys, how="left")
+
+    for col in ["n_ref", "LST_ref", "EVI_ref", "match_level"]:
+        emp.loc[missing_mask, col] = fallback[col].values
+
+emp["empirical_dEVI"] = emp["EVI"] - emp["EVI_ref"]
+emp["empirical_CS"] = emp["LST_ref"] - emp["LST"]
+emp["empirical_CE"] = emp["empirical_CS"] / emp["empirical_dEVI"]
+
+emp = emp[
+    np.isfinite(emp["empirical_CE"]) &
+    np.isfinite(emp["empirical_dEVI"]) &
+    (emp["empirical_dEVI"] >= MIN_DEVI) &
+    (emp["empirical_CE"].abs() <= CE_ABS_MAX)
+].copy()
+
+emp["period"] = emp["Year"].apply(classify_period)
+
+emp.to_parquet(os.path.join(OUTDIR, "exp4_common_support_empirical_CE.parquet"), index=False)
+
+print("\nCommon-support empirical observations:", emp.shape)
+print("Cities:", emp["city"].nunique())
+print("Period counts:")
+print(emp["period"].value_counts())
+print("Match level:")
+print(emp["match_level"].value_counts(dropna=False))
+print("EVI_ref summary:")
+print(emp["EVI_ref"].describe())
+
+# ------------------------------------------------------------
+# 3.2 Apply same definitions: active and HighCE
+# ------------------------------------------------------------
+
+thr_active = (
+    emp[emp["Year"].isin(BASELINE_YEARS)]
+    .groupby("city")["empirical_CE"]
+    .quantile(0.60)
+    .rename("active_thr")
+    .reset_index()
+)
+
+emp = emp.merge(thr_active, on="city", how="left")
+emp["Emp_active"] = (emp["empirical_CE"] > emp["active_thr"]).astype(int)
+
+thr_high = (
+    emp.groupby("city")["empirical_CE"]
+    .quantile(0.80)
+    .rename("high_thr")
+    .reset_index()
+)
+
+emp = emp.merge(thr_high, on="city", how="left")
+emp["Emp_HighCE"] = (emp["empirical_CE"] >= emp["high_thr"]).astype(int)
+
+emp.to_parquet(os.path.join(OUTDIR, "exp4_common_support_empirical_CE_with_states.parquet"), index=False)
+
+# P(active)
+city_year = (
+    emp.groupby(["city", "Year"])
+    .agg(
+        Emp_Pactive=("Emp_active", "mean"),
+        Emp_PrHighCE=("Emp_HighCE", "mean"),
+        n_obs=("Emp_active", "size"),
+        Emp_CE_median=("empirical_CE", "median"),
+        Emp_CS_median=("empirical_CS", "median")
+    )
+    .reset_index()
+)
+
+city_year["period"] = city_year["Year"].apply(classify_period)
+
+global_year = (
+    city_year.groupby("Year")
+    .agg(
+        Emp_Pactive_city_mean=("Emp_Pactive", "mean"),
+        Emp_Pactive_city_median=("Emp_Pactive", "median"),
+        n_cities=("city", "nunique"),
+        n_obs=("n_obs", "sum")
+    )
+    .reset_index()
+)
+
+city_period = (
+    city_year[city_year["period"].isin(["early", "recent"])]
+    .groupby(["city", "period"])
+    .agg(
+        Emp_Pactive=("Emp_Pactive", "mean"),
+        Emp_PrHighCE=("Emp_PrHighCE", "mean"),
+        n_years=("Year", "nunique")
+    )
+    .reset_index()
+)
+
+global_period = (
+    city_period.groupby("period")
+    .agg(
+        Emp_Pactive_city_mean=("Emp_Pactive", "mean"),
+        Emp_Pactive_city_median=("Emp_Pactive", "median"),
+        Emp_PrHighCE_city_mean=("Emp_PrHighCE", "mean"),
+        n_cities=("city", "nunique")
+    )
+    .reset_index()
+)
+
+pactive_ci = bootstrap_paired_delta(city_period, "Emp_Pactive", BOOT_N, RANDOM_STATE)
+
+global_year.to_csv(os.path.join(OUTDIR, "exp4_common_support_global_year_pactive.csv"), index=False)
+city_period.to_csv(os.path.join(OUTDIR, "exp4_common_support_city_period.csv"), index=False)
+global_period.to_csv(os.path.join(OUTDIR, "exp4_common_support_global_period.csv"), index=False)
+pd.DataFrame([pactive_ci]).to_csv(os.path.join(OUTDIR, "exp4_common_support_pactive_CI.csv"), index=False)
+
+print("\nCommon-support global annual P(active):")
+print(global_year.to_string(index=False))
+print("\nCommon-support global period:")
+print(global_period.to_string(index=False))
+print("\nCommon-support P(active) CI:")
+print(pactive_ci)
+
+# ------------------------------------------------------------
+# 3.3 Common-support Fig.3
+# ------------------------------------------------------------
+
+city_bin_emp = compute_fig3_city_bin(emp, "empirical_CE", "Emp_HighCE")
+fig3_potential = bootstrap_fig3_city_median(city_bin_emp, "metric_p90", BOOT_N, RANDOM_STATE + 1)
+fig3_attain = bootstrap_fig3_city_median(city_bin_emp, "Pr_HighState", BOOT_N, RANDOM_STATE + 2)
+
+fig3_emp = fig3_potential.merge(
+    fig3_attain,
+    on=["SSRD_group", "vpd_bin", "VPD_mid", "n_cities", "n_obs"],
+    how="outer"
+)
+
+city_bin_emp.to_csv(os.path.join(OUTDIR, "exp4_common_support_fig3_city_bins.csv"), index=False)
+fig3_emp.to_csv(os.path.join(OUTDIR, "exp4_common_support_fig3_curves_CI.csv"), index=False)
+
+print("\nCommon-support Fig.3 curves:")
+print(fig3_emp.head(30).to_string(index=False))
+
+# ------------------------------------------------------------
+# 3.4 Common-support city divergence
+# ------------------------------------------------------------
+
+emp["VPD_group"] = emp.groupby("city")["VPD_kPa"].transform(city_tercile_labels)
+
+city_avg = (
+    emp[emp["period"].isin(["early", "recent"])]
+    .groupby(["city", "period"])
+    .agg(PrHigh_avg=("Emp_HighCE", "mean"))
+    .reset_index()
+)
+
+city_ext = (
+    emp[(emp["VPD_group"] == "high") & (emp["period"].isin(["early", "recent"]))]
+    .groupby(["city", "period"])
+    .agg(PrHigh_extreme=("Emp_HighCE", "mean"))
+    .reset_index()
+)
+
+cd = city_avg.merge(city_ext, on=["city", "period"], how="outer")
+wide = cd.pivot(index="city", columns="period")
+wide.columns = [f"{a}_{b}" for a, b in wide.columns]
+wide = wide.reset_index()
+
+wide["d_avg"] = wide["PrHigh_avg_recent"] - wide["PrHigh_avg_early"]
+wide["d_extreme"] = wide["PrHigh_extreme_recent"] - wide["PrHigh_extreme_early"]
+wide["div_type"] = [classify_quad(x, y) for x, y in zip(wide["d_avg"], wide["d_extreme"])]
+
+valid_div = wide.dropna(subset=["d_avg", "d_extreme"]).copy()
+r_div, p_div = spearmanr(valid_div["d_avg"], valid_div["d_extreme"])
+
+counts = valid_div["div_type"].value_counts()
+
+div_summary = pd.DataFrame([{
+    "n_cities": len(valid_div),
+    "spearman_r": r_div,
+    "spearman_p": p_div,
+    "gain_both": int(counts.get("gain_both", 0)),
+    "gain_avg_lose_extreme": int(counts.get("gain_avg_lose_extreme", 0)),
+    "lose_both": int(counts.get("lose_both", 0)),
+    "lose_avg_gain_extreme": int(counts.get("lose_avg_gain_extreme", 0)),
+}])
+
+valid_div.to_csv(os.path.join(OUTDIR, "exp4_common_support_city_divergence.csv"), index=False)
+div_summary.to_csv(os.path.join(OUTDIR, "exp4_common_support_city_divergence_summary.csv"), index=False)
+
+print("\nCommon-support city divergence:")
+print(div_summary.to_string(index=False))
+
+# ------------------------------------------------------------
+# 3.5 Potential-high / attainability-low city diagnostic
+# ------------------------------------------------------------
+
+city_overall = (
+    emp.groupby("city")
+    .agg(
+        emp_potential_p90=("empirical_CE", lambda x: np.nanquantile(x, 0.90)),
+        emp_attainability=("Emp_HighCE", "mean"),
+        n_obs=("Emp_HighCE", "size")
+    )
+    .reset_index()
+)
+
+pot_med = city_overall["emp_potential_p90"].median()
+att_med = city_overall["emp_attainability"].median()
+
+city_overall["potential_attainability_type"] = np.where(
+    (city_overall["emp_potential_p90"] >= pot_med) & (city_overall["emp_attainability"] < att_med),
+    "high_potential_low_attainability",
+    np.where(
+        (city_overall["emp_potential_p90"] >= pot_med) & (city_overall["emp_attainability"] >= att_med),
+        "high_potential_high_attainability",
+        np.where(
+            (city_overall["emp_potential_p90"] < pot_med) & (city_overall["emp_attainability"] < att_med),
+            "low_potential_low_attainability",
+            "low_potential_high_attainability"
+        )
+    )
+)
+
+city_overall.to_csv(os.path.join(OUTDIR, "exp4_city_potential_attainability_types.csv"), index=False)
+
+print("\nPotential-attainability city type counts:")
+print(city_overall["potential_attainability_type"].value_counts())
+
+# ============================================================
+# 4. Figures for Experiment 4
+# ============================================================
+
+# Fig: common-support P(active)
+paired = city_period.pivot(index="city", columns="period", values="Emp_Pactive").dropna()
+paired["delta"] = paired["recent"] - paired["early"]
+
+fig, ax = plt.subplots(figsize=(5.8, 5.2))
+
+for _, row in paired.iterrows():
+    color = COL["dark"] if row["delta"] > 0 else COL["grey"]
+    ax.plot([0, 1], [row["early"], row["recent"]], color=color, alpha=0.25, lw=0.8)
+
+ax.scatter(np.zeros(len(paired)), paired["early"], s=28, color=COL["grey"], alpha=0.75,
+           edgecolor="white", linewidth=0.4)
+ax.scatter(np.ones(len(paired)), paired["recent"], s=28, color=COL["dark"], alpha=0.85,
+           edgecolor="white", linewidth=0.4)
+
+ax.errorbar(
+    [0, 1],
+    [pactive_ci["early_mean"], pactive_ci["recent_mean"]],
+    yerr=[
+        [pactive_ci["early_mean"] - pactive_ci["early_lo95"],
+         pactive_ci["recent_mean"] - pactive_ci["recent_lo95"]],
+        [pactive_ci["early_hi95"] - pactive_ci["early_mean"],
+         pactive_ci["recent_hi95"] - pactive_ci["recent_mean"]],
+    ],
+    color=COL["coral"],
+    lw=3,
+    marker="o",
+    ms=8,
+    capsize=4,
+    label="City bootstrap mean",
+)
+
+ax.set_xticks([0, 1])
+ax.set_xticklabels(["Early\n2002–2006", "Recent\n2019–2025"])
+ax.set_ylabel("Empirical P(active)")
+ax.set_title("Common-support observed benchmark")
+
+txt = (
+    f"Mean: {pactive_ci['early_mean']:.3f} → {pactive_ci['recent_mean']:.3f}\n"
+    f"Δ = {pactive_ci['delta_mean']:.3f} "
+    f"[{pactive_ci['delta_lo95']:.3f}, {pactive_ci['delta_hi95']:.3f}]\n"
+    f"Increasing cities: {pactive_ci['n_increase']}/{pactive_ci['n_cities']}\n"
+    f"Wilcoxon P = {pactive_ci['wilcoxon_p']:.2g}"
+)
+
+ax.text(
+    0.03, 0.97, txt,
+    transform=ax.transAxes,
+    ha="left",
+    va="top",
+    fontsize=9.5,
+    bbox=dict(facecolor="white", edgecolor="none", alpha=0.85),
+)
+
+ax.grid(axis="y", alpha=0.18)
+ax.legend(frameon=False, loc="lower right")
+
+savefig(fig, "exp4_common_support_pactive_CI")
+plt.show()
+
+# Fig: common-support Fig3
+fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.9), constrained_layout=True)
+
+for ssrd in SSRD_ORDER:
+    sub = fig3_emp[fig3_emp["SSRD_group"] == ssrd].sort_values("VPD_mid")
+    if sub.empty:
+        continue
+
+    color = COL[ssrd]
+
+    axes[0].plot(
+        sub["VPD_mid"],
+        sub["metric_p90_med"],
+        marker="o",
+        lw=2,
+        color=color,
+        label=SSRD_LABEL[ssrd],
+    )
+    axes[0].fill_between(
+        sub["VPD_mid"],
+        sub["metric_p90_lo95"],
+        sub["metric_p90_hi95"],
+        color=color,
+        alpha=0.15,
+        linewidth=0,
+    )
+
+    axes[1].plot(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med"],
+        marker="o",
+        lw=2,
+        color=color,
+        label=SSRD_LABEL[ssrd],
+    )
+    axes[1].fill_between(
+        sub["VPD_mid"],
+        sub["Pr_HighState_lo95"],
+        sub["Pr_HighState_hi95"],
+        color=color,
+        alpha=0.15,
+        linewidth=0,
+    )
+
+axes[0].set_xlabel("VPD (kPa)")
+axes[0].set_ylabel("P90 empirical CE")
+axes[0].set_title("Empirical cooling potential")
+
+axes[1].set_xlabel("VPD (kPa)")
+axes[1].set_ylabel("Pr(Empirical HighCE)")
+axes[1].set_title("Empirical cooling attainability")
+
+for ax in axes:
+    ax.grid(axis="y", alpha=0.18)
+    ax.legend(frameon=False)
+
+fig.suptitle("Observed common-support benchmark: potential versus attainability", fontsize=14)
+
+savefig(fig, "exp4_common_support_fig3_CI")
+plt.show()
+
+# Fig: city divergence
+fig, ax = plt.subplots(figsize=(6.3, 5.7))
+
+color_map = {
+    "gain_both": COL["dark"],
+    "gain_avg_lose_extreme": COL["mid"],
+    "lose_both": COL["grey"],
+    "lose_avg_gain_extreme": COL["high"],
+}
+
+for g, sub in valid_div.groupby("div_type"):
+    ax.scatter(
+        sub["d_avg"],
+        sub["d_extreme"],
+        s=55,
+        alpha=0.8,
+        color=color_map.get(g, COL["grey"]),
+        label=g.replace("_", " "),
+        edgecolor="white",
+        linewidth=0.7,
+    )
+
+ax.axhline(0, color=COL["black"], lw=1)
+ax.axvline(0, color=COL["black"], lw=1)
+ax.set_xlabel("Δ empirical Pr(HighCE), average warm season")
+ax.set_ylabel("Δ empirical Pr(HighCE), high-VPD background")
+ax.set_title("Common-support city divergence")
+
+ax.text(
+    0.02, 0.98,
+    f"Spearman r = {r_div:.3f}\nP = {p_div:.2g}\nN = {len(valid_div)}",
+    transform=ax.transAxes,
+    ha="left",
+    va="top",
+    fontsize=9.5,
+    bbox=dict(facecolor="white", edgecolor="none", alpha=0.85),
+)
+
+ax.legend(frameon=False, fontsize=8, loc="lower right")
+ax.grid(alpha=0.15)
+
+savefig(fig, "exp4_common_support_city_divergence")
+plt.show()
+
+# ============================================================
+# 5. Save summary
+# ============================================================
+
+summary = {
+    "experiment_3": {
+        "description": "HighCE and active threshold sensitivity using model-derived CE",
+        "ce_sources": ce_cols_renamed,
+        "highce_thresholds": HIGHCE_Q_LIST,
+        "active_thresholds": ACTIVE_Q_LIST,
+        "outputs": [
+            "exp3_highce_threshold_fig3_curves.csv",
+            "exp3_highce_threshold_fig3_summary.csv",
+            "exp3_highce_threshold_city_divergence.csv",
+            "exp3_active_threshold_sensitivity.csv",
+        ],
+    },
+    "experiment_4": {
+        "description": "Observed common-support benchmark using global low-EVI reference cells",
+        "low_evi_reference": f"EVI <= {ABS_LOW_EVI_MAX}",
+        "strict_keys": strict_keys,
+        "relaxed_keys": relax_keys,
+        "n_empirical_observations": int(len(emp)),
+        "n_cities": int(emp["city"].nunique()),
+        "reference_EVI_summary": emp["EVI_ref"].describe().to_dict(),
+        "pactive_ci": pactive_ci,
+        "city_divergence": div_summary.to_dict(orient="records"),
+        "outputs": [
+            "exp4_common_support_empirical_CE.parquet",
+            "exp4_common_support_pactive_CI.csv",
+            "exp4_common_support_fig3_curves_CI.csv",
+            "exp4_common_support_city_divergence_summary.csv",
+            "exp4_city_potential_attainability_types.csv",
+        ],
+    },
+}
+
+with open(os.path.join(OUTDIR, "revision_exp3_exp4_summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2)
+
+print("\n✅ Experiments 3 and 4 completed.")
+print("Outputs saved to:", OUTDIR)
+
+# ============================================================
+# Fig. 3 observed common-support replication and limitation diagnostics
+#
+# Purpose:
+#   Reproduce the core Fig. 3 structure using observed common-support empirical CE:
+#     1) P90 empirical CE increases with VPD, especially under high SSRD.
+#     2) Pr(Empirical HighCE) shows a peak / plateau / decline after controlling
+#        for soil-moisture composition.
+#
+# Key idea:
+#   The raw observed common-support curve may look too monotonic because
+#   high-VPD bins can be compositionally biased toward moisture-supported samples.
+#   We therefore compute:
+#     A. Raw city-balanced observed Fig. 3
+#     B. Soil-moisture-balanced observed Fig. 3
+#     C. Soil-moisture-stratified observed Fig. 3
+#     D. Diagnostics quantifying limitations of the observation-only benchmark
+#
+# Input:
+#   exp4_common_support_empirical_CE_with_states.parquet
+# ============================================================
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 0. Paths and settings
+# ============================================================
+
+EMP_CANDIDATES = [
+    "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_exp3_threshold_exp4_common_support/exp4_common_support_empirical_CE_with_states.parquet",
+    "/content/drive/MyDrive/Second_research/MERRA/hybrid/global_observed_analogue_fast_fig3/exp4_common_support_empirical_CE_with_states.parquet",
+    "/content/drive/MyDrive/Second_research/MERRA/hybrid/global_observed_analogue_empirical_CE_CI/global_observed_analogue_empirical_CE_with_states.parquet",
+]
+
+OUTDIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_fig3_observed_replication_final"
+os.makedirs(OUTDIR, exist_ok=True)
+
+# Fig. 3 settings
+N_VPD_BINS = 12
+MIN_OBS_PER_CITY_BIN = 30
+MIN_OBS_PER_CITY_SM_BIN = 15
+MIN_CITY_PER_BIN = 15
+MIN_SM_STRATA_PER_CITY_BIN = 2
+
+# Bootstrap over cities
+BOOT_N = 500
+RANDOM_STATE = 42
+
+# Main columns
+CITY_COL = "city"
+YEAR_COL = "Year"
+VPD_COL = "VPD_kPa"
+SSRD_COL = "SSRD_MJm2"
+SM_COL_CANDIDATES = ["SWVL1_m3m3", "SM", "soil_moisture", "SWVL1"]
+CE_COL = "empirical_CE"
+HIGH_COL = "Emp_HighCE"
+
+DPI = 600
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 11,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 180,
+    "savefig.dpi": DPI,
+})
+
+COL = {
+    "low": "#1597A5",
+    "mid": "#FFC24B",
+    "high": "#F66F69",
+    "dark": "#0E606B",
+    "grey": "#8C8C8C",
+    "black": "#222222",
+    "balanced": "#0E606B",
+    "raw": "#8C8C8C",
+}
+
+SSRD_ORDER = ["low", "mid", "high"]
+SSRD_LABEL = {
+    "low": "Low radiation",
+    "mid": "Medium radiation",
+    "high": "High radiation",
+}
+
+SM_ORDER = ["low", "mid", "high"]
+SM_LABEL = {
+    "low": "Low soil moisture",
+    "mid": "Medium soil moisture",
+    "high": "High soil moisture",
+}
+
+# ============================================================
+# 1. Helper functions
+# ============================================================
+
+def existing_path(paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("No empirical CE file found:\n" + "\n".join(paths))
+
+
+def pick_col(df, candidates, required=True):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    if required:
+        raise ValueError(f"Cannot find any of {candidates}\nAvailable columns:\n{df.columns.tolist()}")
+    return None
+
+
+def savefig(fig, name):
+    png = os.path.join(OUTDIR, f"{name}.png")
+    pdf = os.path.join(OUTDIR, f"{name}.pdf")
+    fig.savefig(png, dpi=DPI, bbox_inches="tight", facecolor="white")
+    fig.savefig(pdf, bbox_inches="tight", facecolor="white")
+    print("Saved:", png)
+
+
+def city_tercile_labels(s):
+    r = s.rank(method="average", pct=True)
+    out = pd.Series(index=s.index, dtype="object")
+    out[r <= 1/3] = "low"
+    out[(r > 1/3) & (r <= 2/3)] = "mid"
+    out[r > 2/3] = "high"
+    return out
+
+
+def global_vpd_bins(df, vpd_col, n_bins):
+    """
+    Absolute global VPD bins based on pooled empirical quantiles.
+    This avoids city-relative high VPD meaning different absolute stress levels.
+    """
+    x = df[vpd_col].to_numpy(float)
+    x = x[np.isfinite(x)]
+    cuts = np.nanquantile(x, np.linspace(0, 1, n_bins + 1)[1:-1])
+    bins = np.searchsorted(cuts, df[vpd_col].to_numpy(float), side="right") + 1
+    return bins, cuts
+
+
+def bootstrap_city_median_curve(city_bin, metric_col, boot_n=500, seed=42):
+    """
+    Bootstrap cross-city median curve for one metric.
+    city_bin must contain:
+      city, SSRD_group, vpd_bin, VPD_mid, metric_col, n_obs
+    """
+    rng = np.random.default_rng(seed)
+    cities = np.array(sorted(city_bin[CITY_COL].unique()))
+    n_city = len(cities)
+    rows = []
+
+    keys = (
+        city_bin[["SSRD_group", "vpd_bin"]]
+        .drop_duplicates()
+        .sort_values(["SSRD_group", "vpd_bin"])
+    )
+
+    for _, key in keys.iterrows():
+        ssrd = key["SSRD_group"]
+        vb = int(key["vpd_bin"])
+
+        sub = city_bin[(city_bin["SSRD_group"] == ssrd) & (city_bin["vpd_bin"] == vb)].copy()
+        if sub[CITY_COL].nunique() < MIN_CITY_PER_BIN:
+            continue
+
+        vals_by_city = sub.set_index(CITY_COL)[metric_col].to_dict()
+        vals = np.array([vals_by_city.get(c, np.nan) for c in cities], dtype=float)
+
+        obs = np.nanmedian(vals)
+        boots = np.empty(boot_n)
+
+        for b in range(boot_n):
+            idx = rng.integers(0, n_city, n_city)
+            boots[b] = np.nanmedian(vals[idx])
+
+        rows.append({
+            "SSRD_group": ssrd,
+            "vpd_bin": vb,
+            "VPD_mid": sub["VPD_mid"].median(),
+            f"{metric_col}_med": obs,
+            f"{metric_col}_lo95": np.nanpercentile(boots, 2.5),
+            f"{metric_col}_hi95": np.nanpercentile(boots, 97.5),
+            "n_cities": sub[CITY_COL].nunique(),
+            "n_obs": sub["n_obs"].sum(),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def combine_fig3_curves(p90_curve, pr_curve):
+    return p90_curve.merge(
+        pr_curve,
+        on=["SSRD_group", "vpd_bin", "VPD_mid", "n_cities", "n_obs"],
+        how="outer"
+    )
+
+
+def shape_diagnostics(fig3_df, label):
+    """
+    Summarize:
+      - P90 increase from low to high VPD
+      - Pr(HighCE) peak position
+      - peak-minus-last decline metric
+      - CI width
+    """
+    rows = []
+
+    for ssrd in SSRD_ORDER:
+        sub = fig3_df[fig3_df["SSRD_group"] == ssrd].sort_values("vpd_bin").copy()
+        if len(sub) < 3:
+            continue
+
+        first = sub.iloc[0]
+        last = sub.iloc[-1]
+
+        peak_idx = sub["Pr_HighState_med"].idxmax()
+        peak = sub.loc[peak_idx]
+
+        rows.append({
+            "curve_type": label,
+            "SSRD_group": ssrd,
+            "n_points": len(sub),
+            "VPD_first": first["VPD_mid"],
+            "VPD_last": last["VPD_mid"],
+            "P90_first": first["metric_p90_med"],
+            "P90_last": last["metric_p90_med"],
+            "P90_change_last_minus_first": last["metric_p90_med"] - first["metric_p90_med"],
+            "Pr_first": first["Pr_HighState_med"],
+            "Pr_last": last["Pr_HighState_med"],
+            "Pr_peak": peak["Pr_HighState_med"],
+            "Pr_peak_bin": int(peak["vpd_bin"]),
+            "Pr_peak_VPD": peak["VPD_mid"],
+            "Pr_peak_minus_last": peak["Pr_HighState_med"] - last["Pr_HighState_med"],
+            "Pr_nonmonotonic_or_plateau": (peak["vpd_bin"] < last["vpd_bin"]) and ((peak["Pr_HighState_med"] - last["Pr_HighState_med"]) > 0.005),
+            "mean_P90_CI_width": np.nanmean(sub["metric_p90_hi95"] - sub["metric_p90_lo95"]),
+            "mean_Pr_CI_width": np.nanmean(sub["Pr_HighState_hi95"] - sub["Pr_HighState_lo95"]),
+            "min_n_cities": sub["n_cities"].min(),
+            "median_n_cities": sub["n_cities"].median(),
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# 2. Load observed common-support empirical CE
+# ============================================================
+
+EMP_FP = existing_path(EMP_CANDIDATES)
+print("Using empirical file:", EMP_FP)
+
+emp = pd.read_parquet(EMP_FP)
+print("Loaded:", emp.shape)
+print("Columns:", emp.columns.tolist())
+
+SM_COL = pick_col(emp, SM_COL_CANDIDATES, required=True)
+
+required = [CITY_COL, VPD_COL, SSRD_COL, SM_COL, CE_COL, HIGH_COL]
+missing = [c for c in required if c not in emp.columns]
+if missing:
+    raise ValueError(f"Missing required columns in empirical file: {missing}")
+
+emp = emp.dropna(subset=required).copy()
+
+for c in [VPD_COL, SSRD_COL, SM_COL, CE_COL, HIGH_COL]:
+    emp[c] = pd.to_numeric(emp[c], errors="coerce")
+
+emp = emp[
+    np.isfinite(emp[VPD_COL]) &
+    np.isfinite(emp[SSRD_COL]) &
+    np.isfinite(emp[SM_COL]) &
+    np.isfinite(emp[CE_COL]) &
+    np.isfinite(emp[HIGH_COL])
+].copy()
+
+print("After finite filter:", emp.shape)
+print("Cities:", emp[CITY_COL].nunique())
+print("Using soil moisture column:", SM_COL)
+
+# ============================================================
+# 3. Define Fig. 3 bins
+#    SSRD: city-specific terciles
+#    VPD: absolute global bins
+#    SM: city-specific terciles
+# ============================================================
+
+emp["SSRD_group"] = emp.groupby(CITY_COL)[SSRD_COL].transform(city_tercile_labels)
+emp["SM_group"] = emp.groupby(CITY_COL)[SM_COL].transform(city_tercile_labels)
+
+emp["vpd_bin"], vpd_cuts = global_vpd_bins(emp, VPD_COL, N_VPD_BINS)
+
+with open(os.path.join(OUTDIR, "vpd_bin_edges.json"), "w", encoding="utf-8") as f:
+    json.dump({"vpd_cuts": vpd_cuts.tolist()}, f, indent=2)
+
+print("VPD cuts:", vpd_cuts)
+
+# ============================================================
+# 4. Raw observed Fig. 3
+# ============================================================
+
+raw_city_bin = (
+    emp.groupby([CITY_COL, "SSRD_group", "vpd_bin"])
+    .agg(
+        VPD_mid=(VPD_COL, "median"),
+        metric_p90=(CE_COL, lambda x: np.nanquantile(x, 0.90)),
+        Pr_HighState=(HIGH_COL, "mean"),
+        n_obs=(HIGH_COL, "size"),
+        SM_median=(SM_COL, "median")
+    )
+    .reset_index()
+)
+
+raw_city_bin = raw_city_bin[raw_city_bin["n_obs"] >= MIN_OBS_PER_CITY_BIN].copy()
+
+raw_p90 = bootstrap_city_median_curve(raw_city_bin, "metric_p90", BOOT_N, RANDOM_STATE)
+raw_pr = bootstrap_city_median_curve(raw_city_bin, "Pr_HighState", BOOT_N, RANDOM_STATE + 1)
+raw_fig3 = combine_fig3_curves(raw_p90, raw_pr)
+
+raw_city_bin.to_csv(os.path.join(OUTDIR, "raw_observed_fig3_city_bins.csv"), index=False)
+raw_fig3.to_csv(os.path.join(OUTDIR, "raw_observed_fig3_curves_CI.csv"), index=False)
+
+# ============================================================
+# 5. Soil-moisture-balanced observed Fig. 3
+#
+# Step 1: within each city × SSRD × VPD × SM group compute P90 CE and Pr(HighCE)
+# Step 2: for each city × SSRD × VPD, average equally across SM strata
+# Step 3: aggregate city-balanced curves using cross-city median + bootstrap CI
+# ============================================================
+
+city_sm_bin = (
+    emp.groupby([CITY_COL, "SSRD_group", "vpd_bin", "SM_group"])
+    .agg(
+        VPD_mid=(VPD_COL, "median"),
+        metric_p90=(CE_COL, lambda x: np.nanquantile(x, 0.90)),
+        Pr_HighState=(HIGH_COL, "mean"),
+        n_obs=(HIGH_COL, "size"),
+        SM_median=(SM_COL, "median")
+    )
+    .reset_index()
+)
+
+city_sm_bin = city_sm_bin[city_sm_bin["n_obs"] >= MIN_OBS_PER_CITY_SM_BIN].copy()
+
+# Count how many SM strata are available per city × SSRD × VPD
+sm_support = (
+    city_sm_bin.groupby([CITY_COL, "SSRD_group", "vpd_bin"])
+    .agg(
+        n_sm_strata=("SM_group", "nunique"),
+        total_obs=("n_obs", "sum")
+    )
+    .reset_index()
+)
+
+city_sm_bin = city_sm_bin.merge(
+    sm_support,
+    on=[CITY_COL, "SSRD_group", "vpd_bin"],
+    how="left"
+)
+
+city_sm_bin = city_sm_bin[city_sm_bin["n_sm_strata"] >= MIN_SM_STRATA_PER_CITY_BIN].copy()
+
+balanced_city_bin = (
+    city_sm_bin.groupby([CITY_COL, "SSRD_group", "vpd_bin"])
+    .agg(
+        VPD_mid=("VPD_mid", "median"),
+        metric_p90=("metric_p90", "mean"),
+        Pr_HighState=("Pr_HighState", "mean"),
+        n_obs=("total_obs", "max"),
+        n_sm_strata=("n_sm_strata", "max"),
+        SM_median=("SM_median", "median")
+    )
+    .reset_index()
+)
+
+balanced_city_bin = balanced_city_bin[balanced_city_bin["n_obs"] >= MIN_OBS_PER_CITY_BIN].copy()
+
+balanced_p90 = bootstrap_city_median_curve(balanced_city_bin, "metric_p90", BOOT_N, RANDOM_STATE + 2)
+balanced_pr = bootstrap_city_median_curve(balanced_city_bin, "Pr_HighState", BOOT_N, RANDOM_STATE + 3)
+balanced_fig3 = combine_fig3_curves(balanced_p90, balanced_pr)
+
+city_sm_bin.to_csv(os.path.join(OUTDIR, "moisture_stratified_city_sm_bins.csv"), index=False)
+balanced_city_bin.to_csv(os.path.join(OUTDIR, "moisture_balanced_city_bins.csv"), index=False)
+balanced_fig3.to_csv(os.path.join(OUTDIR, "moisture_balanced_observed_fig3_curves_CI.csv"), index=False)
+
+# ============================================================
+# 6. Soil-moisture-stratified curves
+#    This directly shows why raw observed Pr(HighCE) may look monotonic.
+# ============================================================
+
+sm_city_bin = (
+    emp.groupby([CITY_COL, "SSRD_group", "SM_group", "vpd_bin"])
+    .agg(
+        VPD_mid=(VPD_COL, "median"),
+        metric_p90=(CE_COL, lambda x: np.nanquantile(x, 0.90)),
+        Pr_HighState=(HIGH_COL, "mean"),
+        n_obs=(HIGH_COL, "size")
+    )
+    .reset_index()
+)
+
+sm_city_bin = sm_city_bin[sm_city_bin["n_obs"] >= MIN_OBS_PER_CITY_SM_BIN].copy()
+
+sm_global = (
+    sm_city_bin.groupby(["SSRD_group", "SM_group", "vpd_bin"])
+    .agg(
+        VPD_mid=("VPD_mid", "median"),
+        metric_p90_med=("metric_p90", "median"),
+        metric_p90_lo=("metric_p90", lambda x: np.nanquantile(x, 0.25)),
+        metric_p90_hi=("metric_p90", lambda x: np.nanquantile(x, 0.75)),
+        Pr_HighState_med=("Pr_HighState", "median"),
+        Pr_HighState_lo=("Pr_HighState", lambda x: np.nanquantile(x, 0.25)),
+        Pr_HighState_hi=("Pr_HighState", lambda x: np.nanquantile(x, 0.75)),
+        n_cities=(CITY_COL, "nunique"),
+        n_obs=("n_obs", "sum")
+    )
+    .reset_index()
+)
+
+sm_global = sm_global[sm_global["n_cities"] >= MIN_CITY_PER_BIN].copy()
+
+sm_city_bin.to_csv(os.path.join(OUTDIR, "soil_moisture_stratified_city_bins.csv"), index=False)
+sm_global.to_csv(os.path.join(OUTDIR, "soil_moisture_stratified_global_curves.csv"), index=False)
+
+# ============================================================
+# 7. Limitation diagnostics
+# ============================================================
+
+raw_diag = shape_diagnostics(raw_fig3, "raw_observed")
+balanced_diag = shape_diagnostics(balanced_fig3, "moisture_balanced_observed")
+shape_diag = pd.concat([raw_diag, balanced_diag], ignore_index=True)
+
+# raw vs balanced differences by bin
+compare = raw_fig3.merge(
+    balanced_fig3,
+    on=["SSRD_group", "vpd_bin"],
+    suffixes=("_raw", "_balanced"),
+    how="inner"
+)
+
+compare["Pr_raw_minus_balanced"] = compare["Pr_HighState_med_raw"] - compare["Pr_HighState_med_balanced"]
+compare["P90_raw_minus_balanced"] = compare["metric_p90_med_raw"] - compare["metric_p90_med_balanced"]
+compare["Pr_CI_width_raw"] = compare["Pr_HighState_hi95_raw"] - compare["Pr_HighState_lo95_raw"]
+compare["Pr_CI_width_balanced"] = compare["Pr_HighState_hi95_balanced"] - compare["Pr_HighState_lo95_balanced"]
+compare["P90_CI_width_raw"] = compare["metric_p90_hi95_raw"] - compare["metric_p90_lo95_raw"]
+compare["P90_CI_width_balanced"] = compare["metric_p90_hi95_balanced"] - compare["metric_p90_lo95_balanced"]
+
+limitation_summary = (
+    compare.groupby("SSRD_group")
+    .agg(
+        mean_abs_Pr_raw_balanced_diff=("Pr_raw_minus_balanced", lambda x: np.nanmean(np.abs(x))),
+        max_abs_Pr_raw_balanced_diff=("Pr_raw_minus_balanced", lambda x: np.nanmax(np.abs(x))),
+        highVPD_Pr_raw_minus_balanced=("Pr_raw_minus_balanced", lambda x: x.iloc[-1]),
+        mean_Pr_CI_width_raw=("Pr_CI_width_raw", "mean"),
+        mean_Pr_CI_width_balanced=("Pr_CI_width_balanced", "mean"),
+        mean_P90_CI_width_raw=("P90_CI_width_raw", "mean"),
+        mean_P90_CI_width_balanced=("P90_CI_width_balanced", "mean"),
+        min_n_cities_raw=("n_cities_raw", "min"),
+        min_n_cities_balanced=("n_cities_balanced", "min")
+    )
+    .reset_index()
+)
+
+shape_diag.to_csv(os.path.join(OUTDIR, "fig3_shape_diagnostics_raw_vs_balanced.csv"), index=False)
+compare.to_csv(os.path.join(OUTDIR, "fig3_raw_vs_moisture_balanced_comparison.csv"), index=False)
+limitation_summary.to_csv(os.path.join(OUTDIR, "fig3_observed_method_limitation_summary.csv"), index=False)
+
+print("\nShape diagnostics:")
+print(shape_diag.to_string(index=False))
+
+print("\nObserved-method limitation summary:")
+print(limitation_summary.to_string(index=False))
+
+# ============================================================
+# 8. Figures
+# ============================================================
+
+# ------------------------------------------------------------
+# Fig 1. Final moisture-balanced observed Fig. 3
+# ------------------------------------------------------------
+
+fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.9), constrained_layout=True)
+
+for ssrd in SSRD_ORDER:
+    sub = balanced_fig3[balanced_fig3["SSRD_group"] == ssrd].sort_values("VPD_mid")
+    if sub.empty:
+        continue
+
+    color = COL[ssrd]
+
+    axes[0].plot(
+        sub["VPD_mid"],
+        sub["metric_p90_med"],
+        marker="o",
+        lw=2.1,
+        color=color,
+        label=SSRD_LABEL[ssrd]
+    )
+    axes[0].fill_between(
+        sub["VPD_mid"],
+        sub["metric_p90_lo95"],
+        sub["metric_p90_hi95"],
+        color=color,
+        alpha=0.15,
+        linewidth=0
+    )
+
+    axes[1].plot(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med"],
+        marker="o",
+        lw=2.1,
+        color=color,
+        label=SSRD_LABEL[ssrd]
+    )
+    axes[1].fill_between(
+        sub["VPD_mid"],
+        sub["Pr_HighState_lo95"],
+        sub["Pr_HighState_hi95"],
+        color=color,
+        alpha=0.15,
+        linewidth=0
+    )
+
+axes[0].set_xlabel("VPD (kPa)")
+axes[0].set_ylabel("P90 empirical CE")
+axes[0].set_title("Observed cooling potential\nmoisture-balanced")
+
+axes[1].set_xlabel("VPD (kPa)")
+axes[1].set_ylabel("Pr(Empirical HighCE)")
+axes[1].set_title("Observed cooling attainability\nmoisture-balanced")
+
+for ax in axes:
+    ax.grid(axis="y", alpha=0.18)
+    ax.legend(frameon=False)
+
+fig.suptitle("Observed common-support replication of Fig. 3", fontsize=14)
+savefig(fig, "fig3_observed_replication_moisture_balanced")
+plt.show()
+
+# ------------------------------------------------------------
+# Fig 2. Raw vs moisture-balanced Pr(HighCE)
+# ------------------------------------------------------------
+
+fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.4), constrained_layout=True)
+
+for ax, ssrd in zip(axes, SSRD_ORDER):
+    raw_sub = raw_fig3[raw_fig3["SSRD_group"] == ssrd].sort_values("VPD_mid")
+    bal_sub = balanced_fig3[balanced_fig3["SSRD_group"] == ssrd].sort_values("VPD_mid")
+
+    ax.plot(
+        raw_sub["VPD_mid"],
+        raw_sub["Pr_HighState_med"],
+        marker="o",
+        lw=1.8,
+        color=COL["raw"],
+        label="Raw observed"
+    )
+    ax.plot(
+        bal_sub["VPD_mid"],
+        bal_sub["Pr_HighState_med"],
+        marker="o",
+        lw=2.2,
+        color=COL["balanced"],
+        label="Moisture-balanced"
+    )
+
+    ax.set_title(SSRD_LABEL[ssrd])
+    ax.set_xlabel("VPD (kPa)")
+    ax.set_ylabel("Pr(Empirical HighCE)")
+    ax.grid(axis="y", alpha=0.18)
+    ax.legend(frameon=False, fontsize=9)
+
+fig.suptitle("Observation-only limitation: raw curves are affected by soil-moisture composition", fontsize=14)
+savefig(fig, "fig3_raw_vs_moisture_balanced_PrHighCE")
+plt.show()
+
+# ------------------------------------------------------------
+# Fig 3. Soil-moisture stratified Pr(HighCE), high-radiation panel
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(figsize=(7.2, 4.9))
+
+for sm in SM_ORDER:
+    sub = sm_global[
+        (sm_global["SSRD_group"] == "high") &
+        (sm_global["SM_group"] == sm)
+    ].sort_values("VPD_mid")
+
+    if sub.empty:
+        continue
+
+    color = COL[sm]
+
+    ax.plot(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med"],
+        marker="o",
+        lw=2.0,
+        color=color,
+        label=SM_LABEL[sm]
+    )
+    ax.fill_between(
+        sub["VPD_mid"],
+        sub["Pr_HighState_lo"],
+        sub["Pr_HighState_hi"],
+        color=color,
+        alpha=0.14,
+        linewidth=0
+    )
+
+ax.set_xlabel("VPD (kPa)")
+ax.set_ylabel("Pr(Empirical HighCE)")
+ax.set_title("High-radiation regime: observed attainability depends on soil moisture")
+ax.grid(axis="y", alpha=0.18)
+ax.legend(frameon=False)
+
+savefig(fig, "fig3_soil_moisture_stratified_PrHighCE_highSSRD")
+plt.show()
+
+# ------------------------------------------------------------
+# Fig 4. Limitation diagnostics: CI width and coverage
+# ------------------------------------------------------------
+
+fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.4), constrained_layout=True)
+
+# CI width comparison
+x = np.arange(len(SSRD_ORDER))
+width_raw = []
+width_bal = []
+for ssrd in SSRD_ORDER:
+    sub = limitation_summary[limitation_summary["SSRD_group"] == ssrd]
+    if len(sub):
+        width_raw.append(float(sub["mean_Pr_CI_width_raw"].iloc[0]))
+        width_bal.append(float(sub["mean_Pr_CI_width_balanced"].iloc[0]))
+    else:
+        width_raw.append(np.nan)
+        width_bal.append(np.nan)
+
+axes[0].bar(x - 0.18, width_raw, width=0.36, color=COL["raw"], label="Raw observed")
+axes[0].bar(x + 0.18, width_bal, width=0.36, color=COL["balanced"], label="Moisture-balanced")
+axes[0].set_xticks(x)
+axes[0].set_xticklabels([SSRD_LABEL[s] for s in SSRD_ORDER], rotation=20, ha="right")
+axes[0].set_ylabel("Mean 95% CI width\nPr(Empirical HighCE)")
+axes[0].set_title("Uncertainty of observed Fig. 3")
+axes[0].legend(frameon=False)
+axes[0].grid(axis="y", alpha=0.18)
+
+# City support
+min_raw = []
+min_bal = []
+for ssrd in SSRD_ORDER:
+    sub = limitation_summary[limitation_summary["SSRD_group"] == ssrd]
+    if len(sub):
+        min_raw.append(float(sub["min_n_cities_raw"].iloc[0]))
+        min_bal.append(float(sub["min_n_cities_balanced"].iloc[0]))
+    else:
+        min_raw.append(np.nan)
+        min_bal.append(np.nan)
+
+axes[1].bar(x - 0.18, min_raw, width=0.36, color=COL["raw"], label="Raw observed")
+axes[1].bar(x + 0.18, min_bal, width=0.36, color=COL["balanced"], label="Moisture-balanced")
+axes[1].set_xticks(x)
+axes[1].set_xticklabels([SSRD_LABEL[s] for s in SSRD_ORDER], rotation=20, ha="right")
+axes[1].set_ylabel("Minimum number of cities\nacross VPD bins")
+axes[1].set_title("Common-support coverage")
+axes[1].legend(frameon=False)
+axes[1].grid(axis="y", alpha=0.18)
+
+savefig(fig, "fig3_observed_method_uncertainty_and_coverage")
+plt.show()
+
+# ============================================================
+# 9. Save summary JSON
+# ============================================================
+
+summary = {
+    "input_empirical_file": EMP_FP,
+    "method": {
+        "raw_observed": "city-balanced common-support empirical CE by SSRD and absolute VPD bins",
+        "moisture_balanced": "within each city-SSRD-VPD bin, equal-weight low/mid/high soil-moisture strata before cross-city aggregation",
+        "soil_moisture_column": SM_COL,
+        "vpd_bins": "global absolute VPD quantile bins",
+        "ssrd_groups": "city-specific SSRD terciles",
+        "high_state": HIGH_COL,
+        "metric": CE_COL,
+    },
+    "settings": {
+        "N_VPD_BINS": N_VPD_BINS,
+        "MIN_OBS_PER_CITY_BIN": MIN_OBS_PER_CITY_BIN,
+        "MIN_OBS_PER_CITY_SM_BIN": MIN_OBS_PER_CITY_SM_BIN,
+        "MIN_CITY_PER_BIN": MIN_CITY_PER_BIN,
+        "MIN_SM_STRATA_PER_CITY_BIN": MIN_SM_STRATA_PER_CITY_BIN,
+        "BOOT_N": BOOT_N,
+    },
+    "main_outputs": {
+        "raw_fig3": "raw_observed_fig3_curves_CI.csv",
+        "moisture_balanced_fig3": "moisture_balanced_observed_fig3_curves_CI.csv",
+        "soil_moisture_stratified": "soil_moisture_stratified_global_curves.csv",
+        "shape_diagnostics": "fig3_shape_diagnostics_raw_vs_balanced.csv",
+        "limitation_summary": "fig3_observed_method_limitation_summary.csv",
+    },
+    "interpretation_note": (
+        "The moisture-balanced observed benchmark is intended to test whether the "
+        "potential-attainability structure can be recovered from observed data after "
+        "reducing soil-moisture composition bias. The raw observed curve quantifies the "
+        "limitation of observation-only common-support matching."
+    )
+}
+
+with open(os.path.join(OUTDIR, "fig3_observed_replication_summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2)
+
+print("\n✅ Fig. 3 observed replication completed.")
+print("Outputs saved to:", OUTDIR)
+print("\nKey outputs:")
+print(" - moisture_balanced_observed_fig3_curves_CI.csv")
+print(" - raw_observed_fig3_curves_CI.csv")
+print(" - soil_moisture_stratified_global_curves.csv")
+print(" - fig3_shape_diagnostics_raw_vs_balanced.csv")
+print(" - fig3_observed_method_limitation_summary.csv")
+print(" - fig3_observed_replication_moisture_balanced.png/.pdf")
+print(" - fig3_raw_vs_moisture_balanced_PrHighCE.png/.pdf")
+print(" - fig3_soil_moisture_stratified_PrHighCE_highSSRD.png/.pdf")
+print(" - fig3_observed_method_uncertainty_and_coverage.png/.pdf")
+
+# ============================================================
+# Replot observed Fig. 3 with more VPD points + smoothed curves
+#
+# Input:
+#   exp4_common_support_empirical_CE_with_states.parquet
+#
+# Purpose:
+#   Increase VPD bins from 12 to 20 and plot:
+#     - raw binned points
+#     - centered rolling-smoothed line
+#     - city bootstrap CI
+#
+# The statistical diagnostics remain based on unsmoothed bin values.
+# ============================================================
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 0. Settings
+# ============================================================
+
+EMP_FP = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_exp3_threshold_exp4_common_support/exp4_common_support_empirical_CE_with_states.parquet"
+
+OUTDIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_fig3_observed_replication_more_points"
+os.makedirs(OUTDIR, exist_ok=True)
+
+CITY_COL = "city"
+VPD_COL = "VPD_kPa"
+SSRD_COL = "SSRD_MJm2"
+SM_COL = "SWVL1_m3m3"
+CE_COL = "empirical_CE"
+HIGH_COL = "Emp_HighCE"
+
+# More bins than previous 40
+N_VPD_BINS = 40
+
+# Slightly relaxed support because bins are narrower
+MIN_OBS_PER_CITY_BIN = 20
+MIN_OBS_PER_CITY_SM_BIN = 10
+MIN_CITY_PER_BIN = 12
+MIN_SM_STRATA_PER_CITY_BIN = 2
+
+BOOT_N = 500
+RANDOM_STATE = 42
+SMOOTH_WINDOW = 3
+
+DPI = 600
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 11,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 180,
+    "savefig.dpi": DPI,
+})
+
+COL = {
+    "low": "#1597A5",
+    "mid": "#FFC24B",
+    "high": "#F66F69",
+    "dark": "#0E606B",
+    "grey": "#8C8C8C",
+    "black": "#222222",
+    "raw": "#9E9E9E",
+    "balanced": "#0E606B",
+}
+
+SSRD_ORDER = ["low", "mid", "high"]
+SSRD_LABEL = {
+    "low": "Low radiation",
+    "mid": "Medium radiation",
+    "high": "High radiation",
+}
+
+SM_ORDER = ["low", "mid", "high"]
+SM_LABEL = {
+    "low": "Low soil moisture",
+    "mid": "Medium soil moisture",
+    "high": "High soil moisture",
+}
+
+# ============================================================
+# 1. Helper functions
+# ============================================================
+
+def savefig(fig, name):
+    png = os.path.join(OUTDIR, f"{name}.png")
+    pdf = os.path.join(OUTDIR, f"{name}.pdf")
+    fig.savefig(png, dpi=DPI, bbox_inches="tight", facecolor="white")
+    fig.savefig(pdf, bbox_inches="tight", facecolor="white")
+    print("Saved:", png)
+
+
+def city_tercile_labels(s):
+    r = s.rank(method="average", pct=True)
+    out = pd.Series(index=s.index, dtype="object")
+    out[r <= 1/3] = "low"
+    out[(r > 1/3) & (r <= 2/3)] = "mid"
+    out[r > 2/3] = "high"
+    return out
+
+
+def global_vpd_bins(df, vpd_col, n_bins):
+    x = df[vpd_col].to_numpy(float)
+    x = x[np.isfinite(x)]
+    cuts = np.nanquantile(x, np.linspace(0, 1, n_bins + 1)[1:-1])
+    bins = np.searchsorted(cuts, df[vpd_col].to_numpy(float), side="right") + 1
+    return bins, cuts
+
+
+def bootstrap_city_median_curve(city_bin, metric_col, boot_n=500, seed=42):
+    rng = np.random.default_rng(seed)
+    cities = np.array(sorted(city_bin[CITY_COL].unique()))
+    n_city = len(cities)
+    rows = []
+
+    keys = (
+        city_bin[["SSRD_group", "vpd_bin"]]
+        .drop_duplicates()
+        .sort_values(["SSRD_group", "vpd_bin"])
+    )
+
+    for _, key in keys.iterrows():
+        ssrd = key["SSRD_group"]
+        vb = int(key["vpd_bin"])
+
+        sub = city_bin[
+            (city_bin["SSRD_group"] == ssrd) &
+            (city_bin["vpd_bin"] == vb)
+        ].copy()
+
+        if sub[CITY_COL].nunique() < MIN_CITY_PER_BIN:
+            continue
+
+        vals_by_city = sub.set_index(CITY_COL)[metric_col].to_dict()
+        vals = np.array([vals_by_city.get(c, np.nan) for c in cities], dtype=float)
+
+        obs = np.nanmedian(vals)
+        boots = np.empty(boot_n)
+
+        for b in range(boot_n):
+            idx = rng.integers(0, n_city, n_city)
+            boots[b] = np.nanmedian(vals[idx])
+
+        rows.append({
+            "SSRD_group": ssrd,
+            "vpd_bin": vb,
+            "VPD_mid": sub["VPD_mid"].median(),
+            f"{metric_col}_med": obs,
+            f"{metric_col}_lo95": np.nanpercentile(boots, 2.5),
+            f"{metric_col}_hi95": np.nanpercentile(boots, 97.5),
+            "n_cities": sub[CITY_COL].nunique(),
+            "n_obs": sub["n_obs"].sum(),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def combine_curves(p90_curve, pr_curve):
+    return p90_curve.merge(
+        pr_curve,
+        on=["SSRD_group", "vpd_bin", "VPD_mid", "n_cities", "n_obs"],
+        how="outer"
+    )
+
+
+def add_smooth(df, y_col, window=3):
+    out = df.sort_values("VPD_mid").copy()
+    out[f"{y_col}_smooth"] = (
+        out[y_col]
+        .rolling(window=window, center=True, min_periods=1)
+        .mean()
+    )
+    return out
+
+
+def shape_diagnostics(fig3_df, label):
+    rows = []
+
+    for ssrd in SSRD_ORDER:
+        sub = fig3_df[fig3_df["SSRD_group"] == ssrd].sort_values("vpd_bin").copy()
+        if len(sub) < 3:
+            continue
+
+        first = sub.iloc[0]
+        last = sub.iloc[-1]
+        peak = sub.loc[sub["Pr_HighState_med"].idxmax()]
+
+        rows.append({
+            "curve_type": label,
+            "SSRD_group": ssrd,
+            "n_points": len(sub),
+            "VPD_first": first["VPD_mid"],
+            "VPD_last": last["VPD_mid"],
+            "P90_first": first["metric_p90_med"],
+            "P90_last": last["metric_p90_med"],
+            "P90_change_last_minus_first": last["metric_p90_med"] - first["metric_p90_med"],
+            "Pr_first": first["Pr_HighState_med"],
+            "Pr_last": last["Pr_HighState_med"],
+            "Pr_peak": peak["Pr_HighState_med"],
+            "Pr_peak_bin": int(peak["vpd_bin"]),
+            "Pr_peak_VPD": peak["VPD_mid"],
+            "Pr_peak_minus_last": peak["Pr_HighState_med"] - last["Pr_HighState_med"],
+            "Pr_nonmonotonic_or_plateau": (
+                peak["vpd_bin"] < last["vpd_bin"]
+                and (peak["Pr_HighState_med"] - last["Pr_HighState_med"]) > 0.005
+            ),
+            "mean_P90_CI_width": np.nanmean(sub["metric_p90_hi95"] - sub["metric_p90_lo95"]),
+            "mean_Pr_CI_width": np.nanmean(sub["Pr_HighState_hi95"] - sub["Pr_HighState_lo95"]),
+            "min_n_cities": sub["n_cities"].min(),
+            "median_n_cities": sub["n_cities"].median(),
+        })
+
+    return pd.DataFrame(rows)
+
+# ============================================================
+# 2. Load data
+# ============================================================
+
+emp = pd.read_parquet(EMP_FP)
+print("Loaded:", emp.shape)
+
+required = [CITY_COL, VPD_COL, SSRD_COL, SM_COL, CE_COL, HIGH_COL]
+emp = emp.dropna(subset=required).copy()
+
+for c in [VPD_COL, SSRD_COL, SM_COL, CE_COL, HIGH_COL]:
+    emp[c] = pd.to_numeric(emp[c], errors="coerce")
+
+emp = emp[
+    np.isfinite(emp[VPD_COL]) &
+    np.isfinite(emp[SSRD_COL]) &
+    np.isfinite(emp[SM_COL]) &
+    np.isfinite(emp[CE_COL]) &
+    np.isfinite(emp[HIGH_COL])
+].copy()
+
+print("After finite filter:", emp.shape)
+print("Cities:", emp[CITY_COL].nunique())
+
+# ============================================================
+# 3. Binning
+# ============================================================
+
+emp["SSRD_group"] = emp.groupby(CITY_COL)[SSRD_COL].transform(city_tercile_labels)
+emp["SM_group"] = emp.groupby(CITY_COL)[SM_COL].transform(city_tercile_labels)
+emp["vpd_bin"], vpd_cuts = global_vpd_bins(emp, VPD_COL, N_VPD_BINS)
+
+with open(os.path.join(OUTDIR, "vpd_bin_edges_20bins.json"), "w", encoding="utf-8") as f:
+    json.dump({"vpd_cuts": vpd_cuts.tolist()}, f, indent=2)
+
+print("VPD cuts:", vpd_cuts)
+
+# ============================================================
+# 4. Raw observed Fig. 3
+# ============================================================
+
+raw_city_bin = (
+    emp.groupby([CITY_COL, "SSRD_group", "vpd_bin"])
+    .agg(
+        VPD_mid=(VPD_COL, "median"),
+        metric_p90=(CE_COL, lambda x: np.nanquantile(x, 0.90)),
+        Pr_HighState=(HIGH_COL, "mean"),
+        n_obs=(HIGH_COL, "size"),
+        SM_median=(SM_COL, "median")
+    )
+    .reset_index()
+)
+
+raw_city_bin = raw_city_bin[raw_city_bin["n_obs"] >= MIN_OBS_PER_CITY_BIN].copy()
+
+raw_p90 = bootstrap_city_median_curve(raw_city_bin, "metric_p90", BOOT_N, RANDOM_STATE)
+raw_pr = bootstrap_city_median_curve(raw_city_bin, "Pr_HighState", BOOT_N, RANDOM_STATE + 1)
+raw_fig3 = combine_curves(raw_p90, raw_pr)
+
+# ============================================================
+# 5. Moisture-balanced Fig. 3
+# ============================================================
+
+city_sm_bin = (
+    emp.groupby([CITY_COL, "SSRD_group", "vpd_bin", "SM_group"])
+    .agg(
+        VPD_mid=(VPD_COL, "median"),
+        metric_p90=(CE_COL, lambda x: np.nanquantile(x, 0.90)),
+        Pr_HighState=(HIGH_COL, "mean"),
+        n_obs=(HIGH_COL, "size"),
+        SM_median=(SM_COL, "median")
+    )
+    .reset_index()
+)
+
+city_sm_bin = city_sm_bin[city_sm_bin["n_obs"] >= MIN_OBS_PER_CITY_SM_BIN].copy()
+
+sm_support = (
+    city_sm_bin.groupby([CITY_COL, "SSRD_group", "vpd_bin"])
+    .agg(
+        n_sm_strata=("SM_group", "nunique"),
+        total_obs=("n_obs", "sum")
+    )
+    .reset_index()
+)
+
+city_sm_bin = city_sm_bin.merge(
+    sm_support,
+    on=[CITY_COL, "SSRD_group", "vpd_bin"],
+    how="left"
+)
+
+city_sm_bin = city_sm_bin[city_sm_bin["n_sm_strata"] >= MIN_SM_STRATA_PER_CITY_BIN].copy()
+
+balanced_city_bin = (
+    city_sm_bin.groupby([CITY_COL, "SSRD_group", "vpd_bin"])
+    .agg(
+        VPD_mid=("VPD_mid", "median"),
+        metric_p90=("metric_p90", "mean"),
+        Pr_HighState=("Pr_HighState", "mean"),
+        n_obs=("total_obs", "max"),
+        n_sm_strata=("n_sm_strata", "max"),
+        SM_median=("SM_median", "median")
+    )
+    .reset_index()
+)
+
+balanced_city_bin = balanced_city_bin[
+    balanced_city_bin["n_obs"] >= MIN_OBS_PER_CITY_BIN
+].copy()
+
+balanced_p90 = bootstrap_city_median_curve(balanced_city_bin, "metric_p90", BOOT_N, RANDOM_STATE + 2)
+balanced_pr = bootstrap_city_median_curve(balanced_city_bin, "Pr_HighState", BOOT_N, RANDOM_STATE + 3)
+balanced_fig3 = combine_curves(balanced_p90, balanced_pr)
+
+# ============================================================
+# 6. Soil-moisture stratified curves, mainly for high SSRD
+# ============================================================
+
+sm_city_bin = (
+    emp.groupby([CITY_COL, "SSRD_group", "SM_group", "vpd_bin"])
+    .agg(
+        VPD_mid=(VPD_COL, "median"),
+        metric_p90=(CE_COL, lambda x: np.nanquantile(x, 0.90)),
+        Pr_HighState=(HIGH_COL, "mean"),
+        n_obs=(HIGH_COL, "size")
+    )
+    .reset_index()
+)
+
+sm_city_bin = sm_city_bin[sm_city_bin["n_obs"] >= MIN_OBS_PER_CITY_SM_BIN].copy()
+
+sm_global = (
+    sm_city_bin.groupby(["SSRD_group", "SM_group", "vpd_bin"])
+    .agg(
+        VPD_mid=("VPD_mid", "median"),
+        metric_p90_med=("metric_p90", "median"),
+        metric_p90_lo=("metric_p90", lambda x: np.nanquantile(x, 0.25)),
+        metric_p90_hi=("metric_p90", lambda x: np.nanquantile(x, 0.75)),
+        Pr_HighState_med=("Pr_HighState", "median"),
+        Pr_HighState_lo=("Pr_HighState", lambda x: np.nanquantile(x, 0.25)),
+        Pr_HighState_hi=("Pr_HighState", lambda x: np.nanquantile(x, 0.75)),
+        n_cities=(CITY_COL, "nunique"),
+        n_obs=("n_obs", "sum")
+    )
+    .reset_index()
+)
+
+sm_global = sm_global[sm_global["n_cities"] >= MIN_CITY_PER_BIN].copy()
+
+# ============================================================
+# 7. Diagnostics and outputs
+# ============================================================
+
+raw_diag = shape_diagnostics(raw_fig3, "raw_observed_20bins")
+balanced_diag = shape_diagnostics(balanced_fig3, "moisture_balanced_observed_20bins")
+shape_diag = pd.concat([raw_diag, balanced_diag], ignore_index=True)
+
+raw_city_bin.to_csv(os.path.join(OUTDIR, "raw_observed_fig3_city_bins_20bins.csv"), index=False)
+raw_fig3.to_csv(os.path.join(OUTDIR, "raw_observed_fig3_curves_CI_20bins.csv"), index=False)
+city_sm_bin.to_csv(os.path.join(OUTDIR, "moisture_stratified_city_sm_bins_20bins.csv"), index=False)
+balanced_city_bin.to_csv(os.path.join(OUTDIR, "moisture_balanced_city_bins_20bins.csv"), index=False)
+balanced_fig3.to_csv(os.path.join(OUTDIR, "moisture_balanced_observed_fig3_curves_CI_20bins.csv"), index=False)
+sm_global.to_csv(os.path.join(OUTDIR, "soil_moisture_stratified_global_curves_20bins.csv"), index=False)
+shape_diag.to_csv(os.path.join(OUTDIR, "fig3_shape_diagnostics_20bins.csv"), index=False)
+
+print("\nShape diagnostics:")
+print(shape_diag.to_string(index=False))
+
+# ============================================================
+# 8. Figures
+# ============================================================
+
+# ------------------------------------------------------------
+# Fig 1. More-point moisture-balanced Fig. 3
+# raw points + smoothed line
+# ------------------------------------------------------------
+
+fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.9), constrained_layout=True)
+
+for ssrd in SSRD_ORDER:
+    sub = balanced_fig3[balanced_fig3["SSRD_group"] == ssrd].sort_values("VPD_mid").copy()
+    if sub.empty:
+        continue
+
+    sub = add_smooth(sub, "metric_p90_med", SMOOTH_WINDOW)
+    sub = add_smooth(sub, "Pr_HighState_med", SMOOTH_WINDOW)
+
+    color = COL[ssrd]
+
+    # Potential
+    axes[0].scatter(
+        sub["VPD_mid"],
+        sub["metric_p90_med"],
+        s=28,
+        color=color,
+        alpha=0.55
+    )
+    axes[0].plot(
+        sub["VPD_mid"],
+        sub["metric_p90_med_smooth"],
+        lw=2.4,
+        color=color,
+        label=SSRD_LABEL[ssrd]
+    )
+    axes[0].fill_between(
+        sub["VPD_mid"],
+        sub["metric_p90_lo95"],
+        sub["metric_p90_hi95"],
+        color=color,
+        alpha=0.12,
+        linewidth=0
+    )
+
+    # Attainability
+    axes[1].scatter(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med"],
+        s=28,
+        color=color,
+        alpha=0.55
+    )
+    axes[1].plot(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med_smooth"],
+        lw=2.4,
+        color=color,
+        label=SSRD_LABEL[ssrd]
+    )
+    axes[1].fill_between(
+        sub["VPD_mid"],
+        sub["Pr_HighState_lo95"],
+        sub["Pr_HighState_hi95"],
+        color=color,
+        alpha=0.12,
+        linewidth=0
+    )
+
+axes[0].set_xlabel("VPD (kPa)")
+axes[0].set_ylabel("P90 empirical CE")
+axes[0].set_title("Observed cooling potential\nmoisture-balanced")
+
+axes[1].set_xlabel("VPD (kPa)")
+axes[1].set_ylabel("Pr(Empirical HighCE)")
+axes[1].set_title("Observed cooling attainability\nmoisture-balanced")
+
+for ax in axes:
+    ax.grid(axis="y", alpha=0.18)
+    ax.legend(frameon=False)
+
+fig.suptitle(
+    f"Observed common-support replication of Fig. 3 ({N_VPD_BINS} VPD bins)",
+    fontsize=14
+)
+
+savefig(fig, "fig3_observed_replication_moisture_balanced_20bins_smoothed")
+plt.show()
+
+# ------------------------------------------------------------
+# Fig 2. Raw vs moisture-balanced Pr(HighCE), more points
+# ------------------------------------------------------------
+
+fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.4), constrained_layout=True)
+
+for ax, ssrd in zip(axes, SSRD_ORDER):
+    raw_sub = raw_fig3[raw_fig3["SSRD_group"] == ssrd].sort_values("VPD_mid").copy()
+    bal_sub = balanced_fig3[balanced_fig3["SSRD_group"] == ssrd].sort_values("VPD_mid").copy()
+
+    raw_sub = add_smooth(raw_sub, "Pr_HighState_med", SMOOTH_WINDOW)
+    bal_sub = add_smooth(bal_sub, "Pr_HighState_med", SMOOTH_WINDOW)
+
+    ax.scatter(
+        raw_sub["VPD_mid"],
+        raw_sub["Pr_HighState_med"],
+        s=24,
+        color=COL["raw"],
+        alpha=0.45
+    )
+    ax.plot(
+        raw_sub["VPD_mid"],
+        raw_sub["Pr_HighState_med_smooth"],
+        lw=1.8,
+        color=COL["raw"],
+        label="Raw observed"
+    )
+
+    ax.scatter(
+        bal_sub["VPD_mid"],
+        bal_sub["Pr_HighState_med"],
+        s=24,
+        color=COL["balanced"],
+        alpha=0.55
+    )
+    ax.plot(
+        bal_sub["VPD_mid"],
+        bal_sub["Pr_HighState_med_smooth"],
+        lw=2.3,
+        color=COL["balanced"],
+        label="Moisture-balanced"
+    )
+
+    ax.set_title(SSRD_LABEL[ssrd])
+    ax.set_xlabel("VPD (kPa)")
+    ax.set_ylabel("Pr(Empirical HighCE)")
+    ax.grid(axis="y", alpha=0.18)
+    ax.legend(frameon=False, fontsize=9)
+
+fig.suptitle(
+    "Raw versus moisture-balanced observed attainability",
+    fontsize=14
+)
+
+savefig(fig, "fig3_raw_vs_moisture_balanced_PrHighCE_20bins_smoothed")
+plt.show()
+
+# ------------------------------------------------------------
+# Fig 3. Soil-moisture stratified high-SSRD panel, more points
+# ------------------------------------------------------------
+
+fig, ax = plt.subplots(figsize=(7.4, 5.0))
+
+for sm in SM_ORDER:
+    sub = sm_global[
+        (sm_global["SSRD_group"] == "high") &
+        (sm_global["SM_group"] == sm)
+    ].sort_values("VPD_mid").copy()
+
+    if sub.empty:
+        continue
+
+    sub = add_smooth(sub, "Pr_HighState_med", SMOOTH_WINDOW)
+    color = COL[sm]
+
+    ax.scatter(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med"],
+        s=25,
+        color=color,
+        alpha=0.55
+    )
+    ax.plot(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med_smooth"],
+        lw=2.3,
+        color=color,
+        label=SM_LABEL[sm]
+    )
+    ax.fill_between(
+        sub["VPD_mid"],
+        sub["Pr_HighState_lo"],
+        sub["Pr_HighState_hi"],
+        color=color,
+        alpha=0.12,
+        linewidth=0
+    )
+
+ax.set_xlabel("VPD (kPa)")
+ax.set_ylabel("Pr(Empirical HighCE)")
+ax.set_title("High-radiation regime: soil moisture controls attainability")
+ax.grid(axis="y", alpha=0.18)
+ax.legend(frameon=False)
+
+savefig(fig, "fig3_soil_moisture_stratified_PrHighCE_highSSRD_20bins_smoothed")
+plt.show()
+
+# ============================================================
+# 9. Save summary
+# ============================================================
+
+summary = {
+    "input_file": EMP_FP,
+    "N_VPD_BINS": N_VPD_BINS,
+    "SMOOTH_WINDOW": SMOOTH_WINDOW,
+    "note": (
+        "Dots show unsmoothed city-balanced bin estimates. Lines show a centered "
+        "3-bin rolling mean for visualization only. Diagnostics are computed from "
+        "unsmoothed values."
+    ),
+    "outputs": {
+        "balanced_curves": "moisture_balanced_observed_fig3_curves_CI_20bins.csv",
+        "raw_curves": "raw_observed_fig3_curves_CI_20bins.csv",
+        "soil_moisture_stratified": "soil_moisture_stratified_global_curves_20bins.csv",
+        "diagnostics": "fig3_shape_diagnostics_20bins.csv"
+    }
+}
+
+with open(os.path.join(OUTDIR, "fig3_more_points_summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2)
+
+print("\n✅ More-point Fig. 3 observed replication completed.")
+print("Outputs saved to:", OUTDIR)
+
+# ============================================================
+# Quantify why the ML counterfactual framework is more stable
+# than the observed common-support benchmark
+#
+# This script does NOT recompute CE. It summarizes existing outputs:
+#   1) ML/model-derived Fig.3 curves if available
+#   2) observed common-support Fig.3 diagnostics
+#   3) raw-vs-moisture-balanced observed bias diagnostics
+#   4) 12-bin vs 40-bin observed shape sensitivity
+#
+# Outputs:
+#   method_advantage_quantification.csv
+#   method_advantage_summary.json
+#   fig_method_advantage_observed_limitations.png/.pdf
+# ============================================================
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 0. Paths
+# ============================================================
+
+OUTDIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/method_advantage_quantification"
+os.makedirs(OUTDIR, exist_ok=True)
+
+# Main ML/model-derived Fig.3 output candidates
+ML_FIG3_CSV_CANDIDATES = [
+    "/content/drive/MyDrive/Second_research/MERRA/hybrid/fig3_revised_maintext_fixed/fig3_metrics_ensemble.csv",
+    "/content/drive/MyDrive/Second_research/MERRA/hybrid/fig3_revised_maintext/fig3_metrics_ensemble.csv",
+    "/content/drive/MyDrive/Second_research/MERRA/hybrid/fig3_metrics_ensemble.csv",
+]
+
+# Observed common-support 12-bin diagnostics
+OBS12_SHAPE = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_fig3_observed_replication_final/fig3_shape_diagnostics_raw_vs_balanced.csv"
+OBS12_LIMIT = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_fig3_observed_replication_final/fig3_observed_method_limitation_summary.csv"
+OBS12_CURVE_BAL = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_fig3_observed_replication_final/moisture_balanced_observed_fig3_curves_CI.csv"
+OBS12_CURVE_RAW = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_fig3_observed_replication_final/raw_observed_fig3_curves_CI.csv"
+
+# Observed common-support 40-bin diagnostics
+OBS40_SHAPE = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_fig3_observed_replication_more_points/fig3_shape_diagnostics_20bins.csv"
+OBS40_CURVE_BAL = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_fig3_observed_replication_more_points/moisture_balanced_observed_fig3_curves_CI_20bins.csv"
+OBS40_CURVE_RAW = "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_fig3_observed_replication_more_points/raw_observed_fig3_curves_CI_20bins.csv"
+
+DPI = 600
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 11,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 180,
+    "savefig.dpi": DPI,
+})
+
+COL = {
+    "ml": "#0E606B",
+    "obs": "#F66F69",
+    "raw": "#8C8C8C",
+    "balanced": "#1597A5",
+    "black": "#222222",
+    "grey": "#8C8C8C",
+}
+
+SSRD_ORDER = ["low", "mid", "high"]
+
+# ============================================================
+# 1. Helpers
+# ============================================================
+
+def first_existing(paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    return None
+
+def read_if_exists(path):
+    if path is not None and os.path.exists(path):
+        return pd.read_csv(path)
+    return None
+
+def savefig(fig, name):
+    png = os.path.join(OUTDIR, f"{name}.png")
+    pdf = os.path.join(OUTDIR, f"{name}.pdf")
+    fig.savefig(png, dpi=DPI, bbox_inches="tight", facecolor="white")
+    fig.savefig(pdf, bbox_inches="tight", facecolor="white")
+    print("Saved:", png)
+
+def summarize_curve_table(df, method_label, curve_type="balanced"):
+    """
+    Generic summary for tables with columns:
+      SSRD_group, metric_p90_med or CE_p90_ens,
+      Pr_HighState_med or Pr_HighCE_ens,
+      CI columns, n_cities
+    """
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+
+    d = df.copy()
+
+    # Harmonize column names
+    if "CE_p90_ens" in d.columns:
+        d["metric_p90_med"] = d["CE_p90_ens"]
+    if "Pr_HighCE_ens" in d.columns:
+        d["Pr_HighState_med"] = d["Pr_HighCE_ens"]
+    if "CE_p90_lo" in d.columns and "CE_p90_hi" in d.columns:
+        d["metric_p90_lo95"] = d["CE_p90_lo"]
+        d["metric_p90_hi95"] = d["CE_p90_hi"]
+    if "Pr_HighCE_lo" in d.columns and "Pr_HighCE_hi" in d.columns:
+        d["Pr_HighState_lo95"] = d["Pr_HighCE_lo"]
+        d["Pr_HighState_hi95"] = d["Pr_HighCE_hi"]
+
+    rows = []
+    for ssrd in SSRD_ORDER:
+        sub = d[d["SSRD_group"] == ssrd].copy()
+        if len(sub) < 3:
+            continue
+
+        sort_col = "VPD_mid" if "VPD_mid" in sub.columns else "vpd_bin"
+        sub = sub.sort_values(sort_col)
+
+        first = sub.iloc[0]
+        last = sub.iloc[-1]
+        peak = sub.loc[sub["Pr_HighState_med"].idxmax()]
+
+        p90_width = np.nan
+        pr_width = np.nan
+        if "metric_p90_lo95" in sub.columns and "metric_p90_hi95" in sub.columns:
+            p90_width = np.nanmean(sub["metric_p90_hi95"] - sub["metric_p90_lo95"])
+        if "Pr_HighState_lo95" in sub.columns and "Pr_HighState_hi95" in sub.columns:
+            pr_width = np.nanmean(sub["Pr_HighState_hi95"] - sub["Pr_HighState_lo95"])
+
+        rows.append({
+            "method": method_label,
+            "curve_type": curve_type,
+            "SSRD_group": ssrd,
+            "n_points": len(sub),
+            "P90_change_last_minus_first": last["metric_p90_med"] - first["metric_p90_med"],
+            "Pr_peak_minus_last": peak["Pr_HighState_med"] - last["Pr_HighState_med"],
+            "Pr_peak": peak["Pr_HighState_med"],
+            "Pr_last": last["Pr_HighState_med"],
+            "Pr_peak_position": peak.get(sort_col, np.nan),
+            "mean_P90_CI_width": p90_width,
+            "mean_Pr_CI_width": pr_width,
+            "min_n_cities": sub["n_cities"].min() if "n_cities" in sub.columns else np.nan,
+            "median_n_cities": sub["n_cities"].median() if "n_cities" in sub.columns else np.nan
+        })
+
+    return pd.DataFrame(rows)
+
+# ============================================================
+# 2. Read files
+# ============================================================
+
+ml_path = first_existing(ML_FIG3_CSV_CANDIDATES)
+ml = read_if_exists(ml_path)
+
+obs12_shape = read_if_exists(OBS12_SHAPE)
+obs12_limit = read_if_exists(OBS12_LIMIT)
+obs12_bal = read_if_exists(OBS12_CURVE_BAL)
+obs12_raw = read_if_exists(OBS12_CURVE_RAW)
+
+obs40_shape = read_if_exists(OBS40_SHAPE)
+obs40_bal = read_if_exists(OBS40_CURVE_BAL)
+obs40_raw = read_if_exists(OBS40_CURVE_RAW)
+
+print("ML Fig3 file:", ml_path)
+print("obs12_shape:", None if obs12_shape is None else obs12_shape.shape)
+print("obs40_shape:", None if obs40_shape is None else obs40_shape.shape)
+
+# ============================================================
+# 3. Summarize all methods
+# ============================================================
+
+summary_parts = []
+
+if ml is not None:
+    # Note: this is reanalysis spread, not city bootstrap, if using ensemble file.
+    summary_parts.append(summarize_curve_table(ml, "model_counterfactual", "main_Fig3"))
+
+if obs12_bal is not None:
+    summary_parts.append(summarize_curve_table(obs12_bal, "observed_common_support", "moisture_balanced_12bin"))
+if obs12_raw is not None:
+    summary_parts.append(summarize_curve_table(obs12_raw, "observed_common_support", "raw_12bin"))
+
+if obs40_bal is not None:
+    summary_parts.append(summarize_curve_table(obs40_bal, "observed_common_support", "moisture_balanced_40bin"))
+if obs40_raw is not None:
+    summary_parts.append(summarize_curve_table(obs40_raw, "observed_common_support", "raw_40bin"))
+
+method_summary = pd.concat(summary_parts, ignore_index=True) if summary_parts else pd.DataFrame()
+method_summary.to_csv(os.path.join(OUTDIR, "method_advantage_curve_summary.csv"), index=False)
+
+# ============================================================
+# 4. Quantify observed-method limitations
+# ============================================================
+
+limitation_rows = []
+
+# composition sensitivity: raw vs moisture-balanced 12-bin
+if obs12_limit is not None:
+    for _, row in obs12_limit.iterrows():
+        limitation_rows.append({
+            "diagnostic": "raw_vs_moisture_balanced_Pr_difference",
+            "binning": "12bin",
+            "SSRD_group": row["SSRD_group"],
+            "value": row["mean_abs_Pr_raw_balanced_diff"],
+            "extra": "mean_abs_difference"
+        })
+        limitation_rows.append({
+            "diagnostic": "raw_vs_moisture_balanced_Pr_difference",
+            "binning": "12bin",
+            "SSRD_group": row["SSRD_group"],
+            "value": row["max_abs_Pr_raw_balanced_diff"],
+            "extra": "max_abs_difference"
+        })
+        limitation_rows.append({
+            "diagnostic": "highVPD_raw_minus_balanced_Pr",
+            "binning": "12bin",
+            "SSRD_group": row["SSRD_group"],
+            "value": row["highVPD_Pr_raw_minus_balanced"],
+            "extra": "highVPD_endpoint_bias"
+        })
+
+# bin sensitivity: compare observed 12 vs 40 balanced
+if obs12_shape is not None and obs40_shape is not None:
+    s12 = obs12_shape[obs12_shape["curve_type"].str.contains("moisture_balanced", na=False)].copy()
+    s40 = obs40_shape[obs40_shape["curve_type"].str.contains("moisture_balanced", na=False)].copy()
+
+    merged = s12.merge(
+        s40,
+        on="SSRD_group",
+        suffixes=("_12bin", "_40bin"),
+        how="inner"
+    )
+
+    for _, row in merged.iterrows():
+        limitation_rows.append({
+            "diagnostic": "binning_sensitivity_P90_change",
+            "binning": "12_vs_40",
+            "SSRD_group": row["SSRD_group"],
+            "value": row["P90_change_last_minus_first_40bin"] - row["P90_change_last_minus_first_12bin"],
+            "extra": "40bin_minus_12bin"
+        })
+        limitation_rows.append({
+            "diagnostic": "binning_sensitivity_Pr_peak_minus_last",
+            "binning": "12_vs_40",
+            "SSRD_group": row["SSRD_group"],
+            "value": row["Pr_peak_minus_last_40bin"] - row["Pr_peak_minus_last_12bin"],
+            "extra": "40bin_minus_12bin"
+        })
+        limitation_rows.append({
+            "diagnostic": "coverage_loss_with_more_bins",
+            "binning": "12_vs_40",
+            "SSRD_group": row["SSRD_group"],
+            "value": row["min_n_cities_40bin"] - row["min_n_cities_12bin"],
+            "extra": "min_city_40bin_minus_12bin"
+        })
+        limitation_rows.append({
+            "diagnostic": "uncertainty_change_Pr_CI_width",
+            "binning": "12_vs_40",
+            "SSRD_group": row["SSRD_group"],
+            "value": row["mean_Pr_CI_width_40bin"] - row["mean_Pr_CI_width_12bin"],
+            "extra": "Pr_CI_width_40bin_minus_12bin"
+        })
+
+limitations = pd.DataFrame(limitation_rows)
+limitations.to_csv(os.path.join(OUTDIR, "observed_method_limitation_quantification.csv"), index=False)
+
+# ============================================================
+# 5. Generate method advantage table
+# ============================================================
+
+adv_rows = []
+
+# Pull high SSRD key values for observed 40 and 12
+for label, df in [
+    ("observed_12bin", obs12_shape),
+    ("observed_40bin", obs40_shape),
+]:
+    if df is None:
+        continue
+    sub = df[(df["curve_type"].str.contains("moisture_balanced", na=False)) & (df["SSRD_group"] == "high")]
+    if len(sub):
+        r = sub.iloc[0]
+        adv_rows.append({
+            "criterion": "Fig3_shape_recovered_by_observed_benchmark",
+            "method": label,
+            "metric": "high_SSRD_P90_change",
+            "value": r["P90_change_last_minus_first"],
+            "interpretation": "Positive value indicates potential increases along VPD."
+        })
+        adv_rows.append({
+            "criterion": "Fig3_shape_recovered_by_observed_benchmark",
+            "method": label,
+            "metric": "high_SSRD_Pr_peak_minus_last",
+            "value": r["Pr_peak_minus_last"],
+            "interpretation": "Positive value indicates attainability declines after peak."
+        })
+        adv_rows.append({
+            "criterion": "observed_uncertainty",
+            "method": label,
+            "metric": "high_SSRD_mean_Pr_CI_width",
+            "value": r["mean_Pr_CI_width"],
+            "interpretation": "Wider CI indicates lower stability in observed matching benchmark."
+        })
+        adv_rows.append({
+            "criterion": "observed_common_support_coverage",
+            "method": label,
+            "metric": "high_SSRD_min_n_cities",
+            "value": r["min_n_cities"],
+            "interpretation": "Lower city support indicates common-support limitation."
+        })
+
+# Add raw-balanced composition sensitivity
+if obs12_limit is not None:
+    sub = obs12_limit[obs12_limit["SSRD_group"] == "high"]
+    if len(sub):
+        r = sub.iloc[0]
+        adv_rows.append({
+            "criterion": "observed_sample_composition_sensitivity",
+            "method": "observed_12bin",
+            "metric": "high_SSRD_mean_abs_raw_balanced_Pr_diff",
+            "value": r["mean_abs_Pr_raw_balanced_diff"],
+            "interpretation": "Observed curves change after soil-moisture balancing; ML fixes background variables directly."
+        })
+        adv_rows.append({
+            "criterion": "observed_sample_composition_sensitivity",
+            "method": "observed_12bin",
+            "metric": "high_SSRD_max_abs_raw_balanced_Pr_diff",
+            "value": r["max_abs_Pr_raw_balanced_diff"],
+            "interpretation": "Maximum bin-level composition effect in observed benchmark."
+        })
+
+adv = pd.DataFrame(adv_rows)
+adv.to_csv(os.path.join(OUTDIR, "method_advantage_quantification.csv"), index=False)
+
+print("\nMethod summary:")
+print(method_summary.to_string(index=False))
+
+print("\nObserved limitations:")
+print(limitations.to_string(index=False))
+
+print("\nAdvantage table:")
+print(adv.to_string(index=False))
+
+# ============================================================
+# 6. Plot observed limitation quantification
+# ============================================================
+
+fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.5), constrained_layout=True)
+
+# Panel 1: observed high-SSRD shape recovered but uncertainty
+shape_plot = adv[
+    (adv["method"].isin(["observed_12bin", "observed_40bin"])) &
+    (adv["metric"].isin(["high_SSRD_P90_change", "high_SSRD_Pr_peak_minus_last"]))
+].copy()
+
+metrics = ["high_SSRD_P90_change", "high_SSRD_Pr_peak_minus_last"]
+x = np.arange(len(metrics))
+width = 0.35
+
+for i, method in enumerate(["observed_12bin", "observed_40bin"]):
+    vals = []
+    for m in metrics:
+        tmp = shape_plot[(shape_plot["method"] == method) & (shape_plot["metric"] == m)]
+        vals.append(tmp["value"].iloc[0] if len(tmp) else np.nan)
+    axes[0].bar(x + (i - 0.5) * width, vals, width=width, label=method.replace("_", " "), color=[COL["balanced"], COL["raw"]][i])
+
+axes[0].axhline(0, color=COL["black"], lw=1)
+axes[0].set_xticks(x)
+axes[0].set_xticklabels(["P90 increase\n(last-first)", "Pr peak\nminus last"])
+axes[0].set_title("Observed benchmark recovers\nFig. 3 shape")
+axes[0].set_ylabel("Diagnostic value")
+axes[0].legend(frameon=False)
+axes[0].grid(axis="y", alpha=0.18)
+
+# Panel 2: CI width and city support for observed benchmark
+ci_vals = []
+cov_vals = []
+labels = []
+for method in ["observed_12bin", "observed_40bin"]:
+    tmp_ci = adv[(adv["method"] == method) & (adv["metric"] == "high_SSRD_mean_Pr_CI_width")]
+    tmp_cov = adv[(adv["method"] == method) & (adv["metric"] == "high_SSRD_min_n_cities")]
+    if len(tmp_ci) and len(tmp_cov):
+        ci_vals.append(tmp_ci["value"].iloc[0])
+        cov_vals.append(tmp_cov["value"].iloc[0])
+        labels.append(method.replace("observed_", ""))
+
+axes[1].bar(np.arange(len(labels)), ci_vals, color=COL["balanced"], alpha=0.85)
+axes[1].set_xticks(np.arange(len(labels)))
+axes[1].set_xticklabels(labels)
+axes[1].set_ylabel("Mean 95% CI width\nPr(Empirical HighCE)")
+axes[1].set_title("Observed benchmark has\nlarger uncertainty")
+axes[1].grid(axis="y", alpha=0.18)
+
+ax2 = axes[1].twinx()
+ax2.plot(np.arange(len(labels)), cov_vals, color=COL["raw"], marker="o", lw=2)
+ax2.set_ylabel("Minimum city support\n(high SSRD)")
+ax2.spines["top"].set_visible(False)
+
+# Panel 3: sample-composition sensitivity
+comp = adv[
+    adv["metric"].isin([
+        "high_SSRD_mean_abs_raw_balanced_Pr_diff",
+        "high_SSRD_max_abs_raw_balanced_Pr_diff"
+    ])
+].copy()
+
+if len(comp):
+    axes[2].bar(
+        np.arange(len(comp)),
+        comp["value"],
+        color=[COL["grey"], COL["balanced"]][:len(comp)]
+    )
+    axes[2].set_xticks(np.arange(len(comp)))
+    axes[2].set_xticklabels(["Mean |raw-balanced|", "Max |raw-balanced|"][:len(comp)], rotation=15, ha="right")
+    axes[2].set_ylabel("Difference in Pr(HighCE)")
+    axes[2].set_title("Observed curves are sensitive\nto moisture composition")
+    axes[2].grid(axis="y", alpha=0.18)
+
+fig.suptitle("Why the controlled counterfactual framework is needed beyond observation-only matching", fontsize=14)
+savefig(fig, "fig_method_advantage_observed_limitations")
+plt.show()
+
+# ============================================================
+# 7. Save summary JSON
+# ============================================================
+
+summary = {
+    "ml_fig3_file_used": ml_path,
+    "observed_files": {
+        "obs12_shape": OBS12_SHAPE if os.path.exists(OBS12_SHAPE) else None,
+        "obs12_limit": OBS12_LIMIT if os.path.exists(OBS12_LIMIT) else None,
+        "obs40_shape": OBS40_SHAPE if os.path.exists(OBS40_SHAPE) else None,
+    },
+    "main_interpretation": (
+        "The observed common-support benchmark recovers the qualitative Fig. 3 structure, "
+        "but its estimates show lower common-support coverage, wider uncertainty, and "
+        "sensitivity to soil-moisture composition and VPD binning. These quantified "
+        "limitations justify the use of the controlled model-based counterfactual framework "
+        "for stable global inference."
+    ),
+    "outputs": {
+        "method_advantage_curve_summary": "method_advantage_curve_summary.csv",
+        "observed_method_limitation_quantification": "observed_method_limitation_quantification.csv",
+        "method_advantage_quantification": "method_advantage_quantification.csv",
+        "figure": "fig_method_advantage_observed_limitations.png"
+    }
+}
+
+with open(os.path.join(OUTDIR, "method_advantage_summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2)
+
+print("\n✅ Method advantage quantification completed.")
+print("Outputs saved to:", OUTDIR)
+
+# ============================================================
+# Final observed common-support validation for Fig. 3, Fig. 4, Fig. 5
+#
+# Goals:
+#   Fig. 3:
+#     Reproduce potential-attainability separation using observed empirical CE:
+#       - P90 empirical CE along VPD gradient
+#       - Pr(Empirical HighCE) along VPD gradient
+#       - soil-moisture-balanced
+#       - 40 VPD bins with visualization smoothing
+#
+#   Fig. 4:
+#     Reproduce global rise in empirical P(active) and climatic decomposition:
+#       - annual global P(active)
+#       - low / moderate / high demand contributions
+#       - composition vs within-background activation component
+#
+#   Fig. 5:
+#     Reproduce city-level divergence in Pr(HighCE):
+#       - change under average conditions
+#       - change under high-demand conditions
+#
+#   HighCE threshold sensitivity:
+#     Test top 10%, 15%, 20%, 25%, 30% HighCE definitions.
+#     Evaluate whether Fig. 3 shape and Fig. 5 divergence remain stable.
+#
+# Input:
+#   exp4_common_support_empirical_CE_with_states.parquet
+#
+# Notes:
+#   - Fig. 4 does not depend on HighCE. It uses active cooling threshold Q60.
+#   - HighCE sensitivity applies to Fig. 3 and Fig. 5.
+#   - Lines in Fig. 3 are visualization-only 3-bin rolling means.
+#     All diagnostics are computed from unsmoothed bin estimates.
+# ============================================================
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr, wilcoxon
+
+# ============================================================
+# 0. Paths and settings
+# ============================================================
+
+EMP_CANDIDATES = [
+    "/content/drive/MyDrive/Second_research/MERRA/hybrid/revision_exp3_threshold_exp4_common_support/exp4_common_support_empirical_CE_with_states.parquet",
+    "/content/drive/MyDrive/Second_research/MERRA/hybrid/global_observed_analogue_fast_fig3/exp4_common_support_empirical_CE_with_states.parquet",
+    "/content/drive/MyDrive/Second_research/MERRA/hybrid/global_observed_analogue_empirical_CE_CI/global_observed_analogue_empirical_CE_with_states.parquet",
+]
+
+OUTDIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/final_observed_validation_fig3_fig4_fig5"
+os.makedirs(OUTDIR, exist_ok=True)
+
+# Core periods
+BASELINE_YEARS = list(range(2002, 2007))
+RECENT_YEARS   = [2019, 2022, 2025]
+
+# Columns
+CITY_COL = "city"
+YEAR_COL = "Year"
+VPD_COL = "VPD_kPa"
+SSRD_COL = "SSRD_MJm2"
+SM_COL = "SWVL1_m3m3"
+CE_COL = "empirical_CE"
+
+# Active cooling definition for Fig. 4
+ACTIVE_Q = 0.60
+
+# HighCE threshold sensitivity
+HIGHCE_Q_DEFAULT = 0.80
+HIGHCE_Q_LIST = [0.70, 0.75, 0.80, 0.85, 0.90]  # top 30%, 25%, 20%, 15%, 10%
+
+# Fig. 3 settings
+N_VPD_BINS = 40
+MIN_OBS_PER_CITY_BIN = 20
+MIN_OBS_PER_CITY_SM_BIN = 10
+MIN_CITY_PER_BIN = 12
+MIN_SM_STRATA_PER_CITY_BIN = 2
+SMOOTH_WINDOW = 3
+
+# Bootstrap over cities
+BOOT_N = 500
+RANDOM_STATE = 42
+
+DPI = 600
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 11,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 180,
+    "savefig.dpi": DPI,
+})
+
+COL = {
+    "low": "#1597A5",
+    "mid": "#FFC24B",
+    "high": "#F66F69",
+    "dark": "#0E606B",
+    "grey": "#8C8C8C",
+    "black": "#222222",
+    "coral": "#F66F69",
+    "active": "#0E606B",
+    "composition": "#FFC24B",
+    "within": "#F66F69",
+    "total": "#222222",
+}
+
+SSRD_ORDER = ["low", "mid", "high"]
+SSRD_LABEL = {
+    "low": "Low radiation",
+    "mid": "Medium radiation",
+    "high": "High radiation",
+}
+
+DEMAND_ORDER = ["low", "mid", "high"]
+DEMAND_LABEL = {
+    "low": "Low demand",
+    "mid": "Moderate demand",
+    "high": "High demand",
+}
+
+# ============================================================
+# 1. Helper functions
+# ============================================================
+
+def existing_path(paths):
+    for p in paths:
+        if os.path.exists(p):
+            return p
+    raise FileNotFoundError("No empirical CE file found:\n" + "\n".join(paths))
+
+
+def savefig(fig, name):
+    png = os.path.join(OUTDIR, f"{name}.png")
+    pdf = os.path.join(OUTDIR, f"{name}.pdf")
+    fig.savefig(png, dpi=DPI, bbox_inches="tight", facecolor="white")
+    fig.savefig(pdf, dpi=DPI, bbox_inches="tight", facecolor="white")
+    print("Saved:", png)
+
+
+def classify_period(y):
+    if y in BASELINE_YEARS:
+        return "early"
+    if y in RECENT_YEARS:
+        return "recent"
+    return "middle"
+
+
+def city_tercile_labels(s):
+    r = s.rank(method="average", pct=True)
+    out = pd.Series(index=s.index, dtype="object")
+    out[r <= 1/3] = "low"
+    out[(r > 1/3) & (r <= 2/3)] = "mid"
+    out[r > 2/3] = "high"
+    return out
+
+
+def global_vpd_bins(df, vpd_col, n_bins):
+    x = df[vpd_col].to_numpy(float)
+    x = x[np.isfinite(x)]
+    cuts = np.nanquantile(x, np.linspace(0, 1, n_bins + 1)[1:-1])
+    bins = np.searchsorted(cuts, df[vpd_col].to_numpy(float), side="right") + 1
+    return bins, cuts
+
+
+def classify_quad(x, y):
+    if not np.isfinite(x) or not np.isfinite(y):
+        return "missing"
+    if x >= 0 and y >= 0:
+        return "gain_both"
+    if x >= 0 and y < 0:
+        return "gain_avg_lose_extreme"
+    if x < 0 and y < 0:
+        return "lose_both"
+    return "lose_avg_gain_extreme"
+
+
+def add_smooth(df, y_col, window=3):
+    out = df.sort_values("VPD_mid").copy()
+    out[f"{y_col}_smooth"] = (
+        out[y_col]
+        .rolling(window=window, center=True, min_periods=1)
+        .mean()
+    )
+    return out
+
+
+def bootstrap_city_median_curve(city_bin, metric_col, boot_n=500, seed=42):
+    rng = np.random.default_rng(seed)
+    cities = np.array(sorted(city_bin[CITY_COL].unique()))
+    n_city = len(cities)
+    rows = []
+
+    keys = (
+        city_bin[["SSRD_group", "vpd_bin"]]
+        .drop_duplicates()
+        .sort_values(["SSRD_group", "vpd_bin"])
+    )
+
+    for _, key in keys.iterrows():
+        ssrd = key["SSRD_group"]
+        vb = int(key["vpd_bin"])
+
+        sub = city_bin[
+            (city_bin["SSRD_group"] == ssrd) &
+            (city_bin["vpd_bin"] == vb)
+        ].copy()
+
+        if sub[CITY_COL].nunique() < MIN_CITY_PER_BIN:
+            continue
+
+        vals_by_city = sub.set_index(CITY_COL)[metric_col].to_dict()
+        vals = np.array([vals_by_city.get(c, np.nan) for c in cities], dtype=float)
+
+        obs = np.nanmedian(vals)
+        boots = np.empty(boot_n)
+
+        for b in range(boot_n):
+            idx = rng.integers(0, n_city, n_city)
+            boots[b] = np.nanmedian(vals[idx])
+
+        rows.append({
+            "SSRD_group": ssrd,
+            "vpd_bin": vb,
+            "VPD_mid": sub["VPD_mid"].median(),
+            f"{metric_col}_med": obs,
+            f"{metric_col}_lo95": np.nanpercentile(boots, 2.5),
+            f"{metric_col}_hi95": np.nanpercentile(boots, 97.5),
+            "n_cities": sub[CITY_COL].nunique(),
+            "n_obs": sub["n_obs"].sum(),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def combine_fig3(p90_curve, pr_curve):
+    return p90_curve.merge(
+        pr_curve,
+        on=["SSRD_group", "vpd_bin", "VPD_mid", "n_cities", "n_obs"],
+        how="outer"
+    )
+
+
+def bootstrap_paired_delta(city_period, value_col, boot_n=500, seed=42):
+    wide = city_period.pivot(index=CITY_COL, columns="period", values=value_col)
+    wide = wide.dropna(subset=["early", "recent"]).copy()
+
+    if len(wide) == 0:
+        return None
+
+    e = wide["early"].to_numpy(float)
+    r = wide["recent"].to_numpy(float)
+    d = r - e
+    n = len(wide)
+
+    rng = np.random.default_rng(seed)
+    boot_e = np.empty(boot_n)
+    boot_r = np.empty(boot_n)
+    boot_d = np.empty(boot_n)
+
+    for b in range(boot_n):
+        idx = rng.integers(0, n, n)
+        boot_e[b] = np.nanmean(e[idx])
+        boot_r[b] = np.nanmean(r[idx])
+        boot_d[b] = np.nanmean(d[idx])
+
+    try:
+        _, p_w = wilcoxon(r, e)
+    except Exception:
+        p_w = np.nan
+
+    return {
+        "n_cities": int(n),
+        "early_mean": float(np.nanmean(e)),
+        "early_lo95": float(np.nanpercentile(boot_e, 2.5)),
+        "early_hi95": float(np.nanpercentile(boot_e, 97.5)),
+        "recent_mean": float(np.nanmean(r)),
+        "recent_lo95": float(np.nanpercentile(boot_r, 2.5)),
+        "recent_hi95": float(np.nanpercentile(boot_r, 97.5)),
+        "delta_mean": float(np.nanmean(d)),
+        "delta_lo95": float(np.nanpercentile(boot_d, 2.5)),
+        "delta_hi95": float(np.nanpercentile(boot_d, 97.5)),
+        "n_increase": int(np.sum(d > 0)),
+        "wilcoxon_p": float(p_w) if np.isfinite(p_w) else np.nan,
+    }
+
+
+def shape_diagnostics(fig3_df, label, high_q):
+    rows = []
+
+    for ssrd in SSRD_ORDER:
+        sub = fig3_df[fig3_df["SSRD_group"] == ssrd].sort_values("vpd_bin").copy()
+        if len(sub) < 3:
+            continue
+
+        first = sub.iloc[0]
+        last = sub.iloc[-1]
+        peak = sub.loc[sub["Pr_HighState_med"].idxmax()]
+
+        rows.append({
+            "curve_type": label,
+            "high_q": high_q,
+            "top_fraction": 1 - high_q,
+            "SSRD_group": ssrd,
+            "n_points": len(sub),
+            "VPD_first": first["VPD_mid"],
+            "VPD_last": last["VPD_mid"],
+            "P90_first": first["metric_p90_med"],
+            "P90_last": last["metric_p90_med"],
+            "P90_change_last_minus_first": last["metric_p90_med"] - first["metric_p90_med"],
+            "Pr_first": first["Pr_HighState_med"],
+            "Pr_last": last["Pr_HighState_med"],
+            "Pr_peak": peak["Pr_HighState_med"],
+            "Pr_peak_bin": int(peak["vpd_bin"]),
+            "Pr_peak_VPD": peak["VPD_mid"],
+            "Pr_peak_minus_last": peak["Pr_HighState_med"] - last["Pr_HighState_med"],
+            "Pr_nonmonotonic_or_plateau": (
+                peak["vpd_bin"] < last["vpd_bin"]
+                and (peak["Pr_HighState_med"] - last["Pr_HighState_med"]) > 0.005
+            ),
+            "mean_P90_CI_width": np.nanmean(sub["metric_p90_hi95"] - sub["metric_p90_lo95"]),
+            "mean_Pr_CI_width": np.nanmean(sub["Pr_HighState_hi95"] - sub["Pr_HighState_lo95"]),
+            "min_n_cities": sub["n_cities"].min(),
+            "median_n_cities": sub["n_cities"].median(),
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# 2. Load observed common-support empirical CE
+# ============================================================
+
+EMP_FP = existing_path(EMP_CANDIDATES)
+print("Using empirical CE file:", EMP_FP)
+
+emp = pd.read_parquet(EMP_FP)
+print("Loaded:", emp.shape)
+print("Columns:", emp.columns.tolist())
+
+required = [CITY_COL, YEAR_COL, VPD_COL, SSRD_COL, SM_COL, CE_COL]
+missing = [c for c in required if c not in emp.columns]
+if missing:
+    raise ValueError(f"Missing required columns: {missing}")
+
+emp = emp.dropna(subset=required).copy()
+
+for c in [YEAR_COL, VPD_COL, SSRD_COL, SM_COL, CE_COL]:
+    emp[c] = pd.to_numeric(emp[c], errors="coerce")
+
+emp = emp[
+    np.isfinite(emp[YEAR_COL]) &
+    np.isfinite(emp[VPD_COL]) &
+    np.isfinite(emp[SSRD_COL]) &
+    np.isfinite(emp[SM_COL]) &
+    np.isfinite(emp[CE_COL])
+].copy()
+
+emp[YEAR_COL] = emp[YEAR_COL].astype(int)
+emp["period"] = emp[YEAR_COL].apply(classify_period)
+
+print("After finite filter:", emp.shape)
+print("Cities:", emp[CITY_COL].nunique())
+print("Years:", emp[YEAR_COL].min(), emp[YEAR_COL].max())
+
+# Core group labels
+emp["SSRD_group"] = emp.groupby(CITY_COL)[SSRD_COL].transform(city_tercile_labels)
+emp["SM_group"] = emp.groupby(CITY_COL)[SM_COL].transform(city_tercile_labels)
+
+# Global absolute VPD bins for Fig. 3
+emp["vpd_bin"], vpd_cuts = global_vpd_bins(emp, VPD_COL, N_VPD_BINS)
+
+# Baseline-fixed demand groups for Fig. 4
+base_emp = emp[emp[YEAR_COL].isin(BASELINE_YEARS)].copy()
+demand_cuts = np.nanquantile(base_emp[VPD_COL], [1/3, 2/3])
+
+emp["demand_level"] = np.searchsorted(
+    demand_cuts,
+    emp[VPD_COL].to_numpy(float),
+    side="right"
+) + 1
+
+demand_map = {1: "low", 2: "mid", 3: "high"}
+emp["demand_group"] = emp["demand_level"].map(demand_map)
+
+with open(os.path.join(OUTDIR, "bin_definitions.json"), "w", encoding="utf-8") as f:
+    json.dump(
+        {
+            "vpd_cuts_for_fig3_40bins": vpd_cuts.tolist(),
+            "baseline_vpd_cuts_for_fig4_demand": demand_cuts.tolist(),
+            "N_VPD_BINS": N_VPD_BINS,
+            "ACTIVE_Q": ACTIVE_Q,
+            "HIGHCE_Q_LIST": HIGHCE_Q_LIST,
+        },
+        f,
+        indent=2
+    )
+
+# ============================================================
+# 3. Define active cooling for Fig. 4
+#    active = empirical CE > city-specific baseline-summer Q60
+# ============================================================
+
+active_thr = (
+    emp[emp[YEAR_COL].isin(BASELINE_YEARS)]
+    .groupby(CITY_COL)[CE_COL]
+    .quantile(ACTIVE_Q)
+    .rename("active_thr_final")
+    .reset_index()
+)
+
+emp = emp.merge(active_thr, on=CITY_COL, how="left")
+emp["Emp_active_final"] = (emp[CE_COL] > emp["active_thr_final"]).astype(int)
+
+# ============================================================
+# 4. Function to compute HighCE-dependent Fig. 3 and Fig. 5
+# ============================================================
+
+def add_highce_state(data, high_q):
+    d = data.copy()
+    thr = (
+        d.groupby(CITY_COL)[CE_COL]
+        .quantile(high_q)
+        .rename("highce_thr")
+        .reset_index()
+    )
+    d = d.merge(thr, on=CITY_COL, how="left")
+    d["Emp_HighCE_final"] = (d[CE_COL] >= d["highce_thr"]).astype(int)
+    return d
+
+
+def compute_moisture_balanced_fig3(data, high_col):
+    # City × SSRD × VPD × SM
+    city_sm_bin = (
+        data.groupby([CITY_COL, "SSRD_group", "vpd_bin", "SM_group"])
+        .agg(
+            VPD_mid=(VPD_COL, "median"),
+            metric_p90=(CE_COL, lambda x: np.nanquantile(x, 0.90)),
+            Pr_HighState=(high_col, "mean"),
+            n_obs=(high_col, "size"),
+            SM_median=(SM_COL, "median")
+        )
+        .reset_index()
+    )
+
+    city_sm_bin = city_sm_bin[city_sm_bin["n_obs"] >= MIN_OBS_PER_CITY_SM_BIN].copy()
+
+    sm_support = (
+        city_sm_bin.groupby([CITY_COL, "SSRD_group", "vpd_bin"])
+        .agg(
+            n_sm_strata=("SM_group", "nunique"),
+            total_obs=("n_obs", "sum")
+        )
+        .reset_index()
+    )
+
+    city_sm_bin = city_sm_bin.merge(
+        sm_support,
+        on=[CITY_COL, "SSRD_group", "vpd_bin"],
+        how="left"
+    )
+
+    city_sm_bin = city_sm_bin[
+        city_sm_bin["n_sm_strata"] >= MIN_SM_STRATA_PER_CITY_BIN
+    ].copy()
+
+    # Equal-weight soil moisture strata inside each city × SSRD × VPD bin
+    balanced_city_bin = (
+        city_sm_bin.groupby([CITY_COL, "SSRD_group", "vpd_bin"])
+        .agg(
+            VPD_mid=("VPD_mid", "median"),
+            metric_p90=("metric_p90", "mean"),
+            Pr_HighState=("Pr_HighState", "mean"),
+            n_obs=("total_obs", "max"),
+            n_sm_strata=("n_sm_strata", "max"),
+            SM_median=("SM_median", "median")
+        )
+        .reset_index()
+    )
+
+    balanced_city_bin = balanced_city_bin[
+        balanced_city_bin["n_obs"] >= MIN_OBS_PER_CITY_BIN
+    ].copy()
+
+    p90_curve = bootstrap_city_median_curve(
+        balanced_city_bin,
+        "metric_p90",
+        BOOT_N,
+        RANDOM_STATE + 10
+    )
+
+    pr_curve = bootstrap_city_median_curve(
+        balanced_city_bin,
+        "Pr_HighState",
+        BOOT_N,
+        RANDOM_STATE + 11
+    )
+
+    fig3 = combine_fig3(p90_curve, pr_curve)
+
+    return city_sm_bin, balanced_city_bin, fig3
+
+
+def compute_fig5_divergence(data, high_col):
+    city_avg = (
+        data[data["period"].isin(["early", "recent"])]
+        .groupby([CITY_COL, "period"])
+        .agg(PrHigh_avg=(high_col, "mean"))
+        .reset_index()
+    )
+
+    city_ext = (
+        data[
+            (data["demand_group"] == "high") &
+            (data["period"].isin(["early", "recent"]))
+        ]
+        .groupby([CITY_COL, "period"])
+        .agg(PrHigh_extreme=(high_col, "mean"))
+        .reset_index()
+    )
+
+    cd = city_avg.merge(city_ext, on=[CITY_COL, "period"], how="outer")
+
+    wide = cd.pivot(index=CITY_COL, columns="period")
+    wide.columns = [f"{a}_{b}" for a, b in wide.columns]
+    wide = wide.reset_index()
+
+    needed = [
+        "PrHigh_avg_early", "PrHigh_avg_recent",
+        "PrHigh_extreme_early", "PrHigh_extreme_recent"
+    ]
+
+    for c in needed:
+        if c not in wide.columns:
+            wide[c] = np.nan
+
+    wide["d_avg"] = wide["PrHigh_avg_recent"] - wide["PrHigh_avg_early"]
+    wide["d_extreme"] = wide["PrHigh_extreme_recent"] - wide["PrHigh_extreme_early"]
+    wide["div_type"] = [
+        classify_quad(x, y)
+        for x, y in zip(wide["d_avg"], wide["d_extreme"])
+    ]
+
+    valid = wide.dropna(subset=["d_avg", "d_extreme"]).copy()
+
+    if len(valid) > 5:
+        r, p = spearmanr(valid["d_avg"], valid["d_extreme"])
+    else:
+        r, p = np.nan, np.nan
+
+    counts = valid["div_type"].value_counts()
+
+    summary = pd.DataFrame([{
+        "n_cities": len(valid),
+        "spearman_r": r,
+        "spearman_p": p,
+        "gain_both": int(counts.get("gain_both", 0)),
+        "gain_avg_lose_extreme": int(counts.get("gain_avg_lose_extreme", 0)),
+        "lose_both": int(counts.get("lose_both", 0)),
+        "lose_avg_gain_extreme": int(counts.get("lose_avg_gain_extreme", 0)),
+    }])
+
+    return valid, summary
+
+
+# ============================================================
+# 5. Run HighCE sensitivity for Fig. 3 and Fig. 5
+# ============================================================
+
+fig3_sensitivity_tables = []
+fig3_shape_rows = []
+fig5_sensitivity_rows = []
+default_data = None
+default_fig3 = None
+default_fig5 = None
+default_fig5_summary = None
+
+for high_q in HIGHCE_Q_LIST:
+    print(f"\nProcessing HighCE threshold Q{int(high_q*100)}...")
+
+    d_high = add_highce_state(emp, high_q)
+
+    city_sm_bin, balanced_city_bin, fig3 = compute_moisture_balanced_fig3(
+        d_high,
+        "Emp_HighCE_final"
+    )
+
+    fig3["high_q"] = high_q
+    fig3["top_fraction"] = 1 - high_q
+
+    diag = shape_diagnostics(
+        fig3,
+        label="moisture_balanced_observed_40bin",
+        high_q=high_q
+    )
+
+    fig3_sensitivity_tables.append(fig3)
+    fig3_shape_rows.append(diag)
+
+    fig5, fig5_summary = compute_fig5_divergence(
+        d_high,
+        "Emp_HighCE_final"
+    )
+
+    fig5_summary["high_q"] = high_q
+    fig5_summary["top_fraction"] = 1 - high_q
+    fig5_sensitivity_rows.append(fig5_summary)
+
+    # Save default detailed files
+    if abs(high_q - HIGHCE_Q_DEFAULT) < 1e-9:
+        default_data = d_high.copy()
+        default_fig3 = fig3.copy()
+        default_fig5 = fig5.copy()
+        default_fig5_summary = fig5_summary.copy()
+
+        city_sm_bin.to_csv(os.path.join(OUTDIR, "fig3_default_city_sm_bins.csv"), index=False)
+        balanced_city_bin.to_csv(os.path.join(OUTDIR, "fig3_default_moisture_balanced_city_bins.csv"), index=False)
+
+fig3_all = pd.concat(fig3_sensitivity_tables, ignore_index=True)
+fig3_shape = pd.concat(fig3_shape_rows, ignore_index=True)
+fig5_sens = pd.concat(fig5_sensitivity_rows, ignore_index=True)
+
+fig3_all.to_csv(os.path.join(OUTDIR, "fig3_highce_threshold_sensitivity_curves.csv"), index=False)
+fig3_shape.to_csv(os.path.join(OUTDIR, "fig3_highce_threshold_sensitivity_shape.csv"), index=False)
+fig5_sens.to_csv(os.path.join(OUTDIR, "fig5_highce_threshold_sensitivity.csv"), index=False)
+
+default_fig3.to_csv(os.path.join(OUTDIR, "fig3_default_Q80_moisture_balanced_curves.csv"), index=False)
+default_fig5.to_csv(os.path.join(OUTDIR, "fig5_default_Q80_city_divergence.csv"), index=False)
+default_fig5_summary.to_csv(os.path.join(OUTDIR, "fig5_default_Q80_city_divergence_summary.csv"), index=False)
+
+print("\nFig. 3 HighCE threshold sensitivity:")
+print(fig3_shape.to_string(index=False))
+
+print("\nFig. 5 HighCE threshold sensitivity:")
+print(fig5_sens.to_string(index=False))
+
+# ============================================================
+# 6. Fig. 4: empirical P(active) and decomposition
+# ============================================================
+
+print("\nComputing Fig. 4 observed P(active) and decomposition...")
+
+# City-year total
+cy_total = (
+    emp.groupby([CITY_COL, YEAR_COL])
+    .size()
+    .rename("n_total")
+    .reset_index()
+)
+
+# City-year demand group
+cyd = (
+    emp.groupby([CITY_COL, YEAR_COL, "demand_group"])
+    .agg(
+        n_bg=("Emp_active_final", "size"),
+        p_active_bg=("Emp_active_final", "mean")
+    )
+    .reset_index()
+)
+
+cyd = cyd.merge(cy_total, on=[CITY_COL, YEAR_COL], how="left")
+cyd["p_bg"] = cyd["n_bg"] / cyd["n_total"]
+cyd["contrib"] = cyd["p_bg"] * cyd["p_active_bg"]
+
+# Add missing city-year-demand rows to make decomposition complete
+cities_years = cy_total[[CITY_COL, YEAR_COL]].drop_duplicates()
+demand_df = pd.DataFrame({"demand_group": DEMAND_ORDER})
+grid = cities_years.merge(demand_df, how="cross")
+
+cyd = grid.merge(
+    cyd,
+    on=[CITY_COL, YEAR_COL, "demand_group"],
+    how="left"
+)
+
+cyd = cyd.merge(cy_total, on=[CITY_COL, YEAR_COL], how="left", suffixes=("", "_total2"))
+
+cyd["n_bg"] = cyd["n_bg"].fillna(0)
+cyd["p_bg"] = cyd["p_bg"].fillna(0)
+cyd["p_active_bg"] = cyd["p_active_bg"].fillna(0)
+cyd["contrib"] = cyd["p_bg"] * cyd["p_active_bg"]
+
+# Global P(active), based on city-year mean
+city_year_active = (
+    emp.groupby([CITY_COL, YEAR_COL])
+    .agg(
+        P_active=("Emp_active_final", "mean"),
+        n_obs=("Emp_active_final", "size")
+    )
+    .reset_index()
+)
+
+global_year_active = (
+    city_year_active.groupby(YEAR_COL)
+    .agg(
+        P_active_city_mean=("P_active", "mean"),
+        P_active_city_median=("P_active", "median"),
+        n_cities=(CITY_COL, "nunique"),
+        n_obs=("n_obs", "sum")
+    )
+    .reset_index()
+)
+
+# Demand-level activation probability and contribution
+global_demand_year = (
+    cyd.groupby([YEAR_COL, "demand_group"])
+    .agg(
+        p_bg_city_mean=("p_bg", "mean"),
+        p_active_bg_city_mean=("p_active_bg", "mean"),
+        contrib_city_mean=("contrib", "mean"),
+        n_cities=(CITY_COL, "nunique")
+    )
+    .reset_index()
+)
+
+# Baseline city-demand means
+base_cyd = cyd[cyd[YEAR_COL].isin(BASELINE_YEARS)].copy()
+
+city_demand_base = (
+    base_cyd.groupby([CITY_COL, "demand_group"])
+    .agg(
+        p_bg_base=("p_bg", "mean"),
+        p_active_base=("p_active_bg", "mean")
+    )
+    .reset_index()
+)
+
+# Fill missing baselines using global demand baseline means
+global_demand_base = (
+    city_demand_base.groupby("demand_group")
+    .agg(
+        p_bg_base_global=("p_bg_base", "mean"),
+        p_active_base_global=("p_active_base", "mean")
+    )
+    .reset_index()
+)
+
+cyd2 = cyd.merge(city_demand_base, on=[CITY_COL, "demand_group"], how="left")
+cyd2 = cyd2.merge(global_demand_base, on="demand_group", how="left")
+
+cyd2["p_bg_base"] = cyd2["p_bg_base"].fillna(cyd2["p_bg_base_global"])
+cyd2["p_active_base"] = cyd2["p_active_base"].fillna(cyd2["p_active_base_global"])
+
+# Decomposition:
+# Total change ≈ sum[(p_bg_y - p_bg_base) * p_active_base]
+#             + sum[p_bg_y * (p_active_y - p_active_base)]
+cyd2["composition_component"] = (cyd2["p_bg"] - cyd2["p_bg_base"]) * cyd2["p_active_base"]
+cyd2["within_activation_component"] = cyd2["p_bg"] * (cyd2["p_active_bg"] - cyd2["p_active_base"])
+cyd2["sum_component"] = cyd2["composition_component"] + cyd2["within_activation_component"]
+
+city_year_decomp = (
+    cyd2.groupby([CITY_COL, YEAR_COL])
+    .agg(
+        composition_component=("composition_component", "sum"),
+        within_activation_component=("within_activation_component", "sum"),
+        sum_component=("sum_component", "sum"),
+        P_active_decomp=("contrib", "sum")
+    )
+    .reset_index()
+)
+
+global_decomp = (
+    city_year_decomp.groupby(YEAR_COL)
+    .agg(
+        composition_component=("composition_component", "mean"),
+        within_activation_component=("within_activation_component", "mean"),
+        sum_component=("sum_component", "mean"),
+        P_active_decomp=("P_active_decomp", "mean")
+    )
+    .reset_index()
+)
+
+# Early-recent P(active) CI
+city_year_active["period"] = city_year_active[YEAR_COL].apply(classify_period)
+
+city_period_active = (
+    city_year_active[city_year_active["period"].isin(["early", "recent"])]
+    .groupby([CITY_COL, "period"])
+    .agg(
+        P_active=("P_active", "mean"),
+        n_years=(YEAR_COL, "nunique")
+    )
+    .reset_index()
+)
+
+pactive_ci = bootstrap_paired_delta(
+    city_period_active,
+    "P_active",
+    BOOT_N,
+    RANDOM_STATE + 30
+)
+
+# Save Fig. 4 tables
+cyd.to_csv(os.path.join(OUTDIR, "fig4_city_year_demand_decomposition.csv"), index=False)
+global_year_active.to_csv(os.path.join(OUTDIR, "fig4_global_year_pactive.csv"), index=False)
+global_demand_year.to_csv(os.path.join(OUTDIR, "fig4_global_demand_year.csv"), index=False)
+global_decomp.to_csv(os.path.join(OUTDIR, "fig4_global_decomposition_components.csv"), index=False)
+city_period_active.to_csv(os.path.join(OUTDIR, "fig4_city_period_pactive.csv"), index=False)
+pd.DataFrame([pactive_ci]).to_csv(os.path.join(OUTDIR, "fig4_pactive_early_recent_CI.csv"), index=False)
+
+print("\nFig. 4 global P(active):")
+print(global_year_active.to_string(index=False))
+
+print("\nFig. 4 P(active) early-recent CI:")
+print(pactive_ci)
+
+# ============================================================
+# 7. Plot Fig. 3 observed validation
+# ============================================================
+
+fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.9), constrained_layout=True)
+
+plot_fig3 = default_fig3.copy()
+
+for ssrd in SSRD_ORDER:
+    sub = plot_fig3[plot_fig3["SSRD_group"] == ssrd].sort_values("VPD_mid").copy()
+    if sub.empty:
+        continue
+
+    sub = add_smooth(sub, "metric_p90_med", SMOOTH_WINDOW)
+    sub = add_smooth(sub, "Pr_HighState_med", SMOOTH_WINDOW)
+
+    color = COL[ssrd]
+
+    # Potential
+    axes[0].scatter(
+        sub["VPD_mid"],
+        sub["metric_p90_med"],
+        s=26,
+        color=color,
+        alpha=0.55
+    )
+    axes[0].plot(
+        sub["VPD_mid"],
+        sub["metric_p90_med_smooth"],
+        lw=2.4,
+        color=color,
+        label=SSRD_LABEL[ssrd]
+    )
+    axes[0].fill_between(
+        sub["VPD_mid"],
+        sub["metric_p90_lo95"],
+        sub["metric_p90_hi95"],
+        color=color,
+        alpha=0.12,
+        linewidth=0
+    )
+
+    # Attainability
+    axes[1].scatter(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med"],
+        s=26,
+        color=color,
+        alpha=0.55
+    )
+    axes[1].plot(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med_smooth"],
+        lw=2.4,
+        color=color,
+        label=SSRD_LABEL[ssrd]
+    )
+    axes[1].fill_between(
+        sub["VPD_mid"],
+        sub["Pr_HighState_lo95"],
+        sub["Pr_HighState_hi95"],
+        color=color,
+        alpha=0.12,
+        linewidth=0
+    )
+
+axes[0].set_xlabel("VPD (kPa)")
+axes[0].set_ylabel("P90 empirical CE")
+axes[0].set_title("Observed cooling potential\nmoisture-balanced")
+
+axes[1].set_xlabel("VPD (kPa)")
+axes[1].set_ylabel("Pr(Empirical HighCE)")
+axes[1].set_title("Observed cooling attainability\nmoisture-balanced")
+
+for ax in axes:
+    ax.grid(axis="y", alpha=0.18)
+    ax.legend(frameon=False)
+
+fig.suptitle(
+    "Observed common-support validation of Fig. 3",
+    fontsize=14
+)
+
+savefig(fig, "Fig3_observed_common_support_validation_Q80")
+plt.show()
+
+# ============================================================
+# 8. Plot Fig. 4 observed validation
+# ============================================================
+
+# Prepare data for plotting
+gy = global_year_active.sort_values(YEAR_COL)
+gd = global_demand_year.copy()
+gdec = global_decomp.sort_values(YEAR_COL)
+
+# Panel b stacked contribution
+contrib_wide = (
+    gd.pivot(index=YEAR_COL, columns="demand_group", values="contrib_city_mean")
+    .reindex(columns=DEMAND_ORDER)
+    .fillna(0)
+    .sort_index()
+)
+
+# Panel a demand points: P(active | demand)
+pact_wide = (
+    gd.pivot(index=YEAR_COL, columns="demand_group", values="p_active_bg_city_mean")
+    .reindex(columns=DEMAND_ORDER)
+    .sort_index()
+)
+
+fig, axes = plt.subplots(1, 3, figsize=(16.2, 4.8), constrained_layout=True)
+
+# (a) global P(active) + demand points
+axes[0].plot(
+    gy[YEAR_COL],
+    gy["P_active_city_mean"],
+    lw=2.5,
+    color=COL["active"],
+    marker="o",
+    label="Global mean"
+)
+
+for dg in DEMAND_ORDER:
+    if dg in pact_wide.columns:
+        axes[0].scatter(
+            pact_wide.index,
+            pact_wide[dg],
+            s=30,
+            color=COL[dg],
+            alpha=0.75,
+            label=DEMAND_LABEL[dg]
+        )
+
+axes[0].set_xlabel("Year")
+axes[0].set_ylabel("Empirical P(active)")
+axes[0].set_title("(a) Global active cooling probability")
+axes[0].grid(axis="y", alpha=0.18)
+axes[0].legend(frameon=False, fontsize=8)
+
+# Add early-recent CI text
+txt = (
+    f"Early: {pactive_ci['early_mean']:.3f}\n"
+    f"Recent: {pactive_ci['recent_mean']:.3f}\n"
+    f"Δ = {pactive_ci['delta_mean']:.3f} "
+    f"[{pactive_ci['delta_lo95']:.3f}, {pactive_ci['delta_hi95']:.3f}]"
+)
+axes[0].text(
+    0.03, 0.97,
+    txt,
+    transform=axes[0].transAxes,
+    ha="left",
+    va="top",
+    fontsize=8.8,
+    bbox=dict(facecolor="white", edgecolor="none", alpha=0.85)
+)
+
+# (b) stacked contributions
+axes[1].stackplot(
+    contrib_wide.index,
+    [contrib_wide[dg].values for dg in DEMAND_ORDER],
+    labels=[DEMAND_LABEL[dg] for dg in DEMAND_ORDER],
+    colors=[COL[dg] for dg in DEMAND_ORDER],
+    alpha=0.88
+)
+
+axes[1].set_xlabel("Year")
+axes[1].set_ylabel("Contribution to P(active)")
+axes[1].set_title("(b) Demand-background contributions")
+axes[1].grid(axis="y", alpha=0.18)
+axes[1].legend(frameon=False, fontsize=8, loc="upper left")
+
+# (c) decomposition components
+axes[2].scatter(
+    gdec[YEAR_COL],
+    gdec["composition_component"],
+    s=30,
+    color=COL["composition"],
+    alpha=0.85,
+    label="Demand-frequency change"
+)
+axes[2].scatter(
+    gdec[YEAR_COL],
+    gdec["within_activation_component"],
+    s=30,
+    color=COL["within"],
+    alpha=0.85,
+    label="Within-background activation"
+)
+axes[2].plot(
+    gdec[YEAR_COL],
+    gdec["sum_component"],
+    lw=2.5,
+    color=COL["total"],
+    marker="o",
+    label="Sum"
+)
+axes[2].axhline(0, color=COL["black"], lw=1)
+axes[2].set_xlabel("Year")
+axes[2].set_ylabel("Contribution relative to baseline")
+axes[2].set_title("(c) Decomposition of activation increase")
+axes[2].grid(axis="y", alpha=0.18)
+axes[2].legend(frameon=False, fontsize=8)
+
+fig.suptitle(
+    "Observed common-support validation of Fig. 4",
+    fontsize=14
+)
+
+savefig(fig, "Fig4_observed_common_support_validation")
+plt.show()
+
+# ============================================================
+# 9. Plot Fig. 5 observed validation
+# ============================================================
+
+valid_div = default_fig5.copy()
+r_div = default_fig5_summary["spearman_r"].iloc[0]
+p_div = default_fig5_summary["spearman_p"].iloc[0]
+
+fig, ax = plt.subplots(figsize=(6.5, 5.8))
+
+color_map = {
+    "gain_both": COL["dark"],
+    "gain_avg_lose_extreme": COL["mid"],
+    "lose_both": COL["grey"],
+    "lose_avg_gain_extreme": COL["high"],
+}
+
+for g, sub in valid_div.groupby("div_type"):
+    ax.scatter(
+        sub["d_avg"],
+        sub["d_extreme"],
+        s=58,
+        alpha=0.82,
+        color=color_map.get(g, COL["grey"]),
+        edgecolor="white",
+        linewidth=0.7,
+        label=g.replace("_", " ")
+    )
+
+ax.axhline(0, color=COL["black"], lw=1)
+ax.axvline(0, color=COL["black"], lw=1)
+
+ax.set_xlabel("Δ empirical Pr(HighCE), average warm season")
+ax.set_ylabel("Δ empirical Pr(HighCE), high-demand background")
+ax.set_title("Observed common-support validation of Fig. 5")
+
+txt = (
+    f"Spearman r = {r_div:.3f}\n"
+    f"P = {p_div:.2g}\n"
+    f"N = {len(valid_div)}"
+)
+
+ax.text(
+    0.02,
+    0.98,
+    txt,
+    transform=ax.transAxes,
+    ha="left",
+    va="top",
+    fontsize=9.5,
+    bbox=dict(facecolor="white", edgecolor="none", alpha=0.85)
+)
+
+ax.legend(frameon=False, fontsize=8, loc="lower right")
+ax.grid(alpha=0.15)
+
+savefig(fig, "Fig5_observed_common_support_validation_Q80")
+plt.show()
+
+# ============================================================
+# 10. Plot HighCE sensitivity summary
+# ============================================================
+
+# Focus on high radiation because it is the main Fig. 3 interpretation regime
+high_ssrd_shape = fig3_shape[fig3_shape["SSRD_group"] == "high"].copy()
+high_ssrd_shape = high_ssrd_shape.sort_values("top_fraction")
+
+fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.5), constrained_layout=True)
+
+# Fig 3 potential
+axes[0].plot(
+    high_ssrd_shape["top_fraction"],
+    high_ssrd_shape["P90_change_last_minus_first"],
+    marker="o",
+    lw=2.2,
+    color=COL["dark"]
+)
+axes[0].axhline(0, color=COL["black"], lw=1)
+axes[0].set_xlabel("HighCE top fraction")
+axes[0].set_ylabel("P90 empirical CE change\nhighest VPD − lowest VPD")
+axes[0].set_title("Fig. 3 potential stability")
+axes[0].grid(axis="y", alpha=0.18)
+
+# Fig 3 attainability
+axes[1].plot(
+    high_ssrd_shape["top_fraction"],
+    high_ssrd_shape["Pr_peak_minus_last"],
+    marker="o",
+    lw=2.2,
+    color=COL["high"]
+)
+axes[1].axhline(0, color=COL["black"], lw=1)
+axes[1].set_xlabel("HighCE top fraction")
+axes[1].set_ylabel("Pr(HighCE) peak − highest VPD")
+axes[1].set_title("Fig. 3 attainability-window stability")
+axes[1].grid(axis="y", alpha=0.18)
+
+# Fig 5 divergence
+fig5_sens_plot = fig5_sens.sort_values("top_fraction")
+axes[2].plot(
+    fig5_sens_plot["top_fraction"],
+    fig5_sens_plot["spearman_r"],
+    marker="o",
+    lw=2.2,
+    color=COL["dark"]
+)
+axes[2].axhline(0, color=COL["black"], lw=1)
+axes[2].set_xlabel("HighCE top fraction")
+axes[2].set_ylabel("Spearman r\nΔaverage vs Δhigh-demand")
+axes[2].set_title("Fig. 5 divergence stability")
+axes[2].grid(axis="y", alpha=0.18)
+
+fig.suptitle(
+    "HighCE threshold sensitivity of observed validations",
+    fontsize=14
+)
+
+savefig(fig, "HighCE_threshold_sensitivity_Fig3_Fig5_observed")
+plt.show()
+
+# ============================================================
+# 11. Save final summary
+# ============================================================
+
+summary = {
+    "input_file": EMP_FP,
+    "method": "Observed common-support empirical CE with soil-moisture-balanced Fig. 3",
+    "active_definition": f"Emp_active = empirical_CE > city baseline Q{int(ACTIVE_Q*100)}",
+    "HighCE_default": f"city-specific top {int((1-HIGHCE_Q_DEFAULT)*100)}%",
+    "HighCE_sensitivity": {
+        "quantiles": HIGHCE_Q_LIST,
+        "top_fractions": [1 - q for q in HIGHCE_Q_LIST],
+    },
+    "Fig3": {
+        "vpd_bins": N_VPD_BINS,
+        "soil_moisture_balanced": True,
+        "default_Q80_shape_high_SSRD": fig3_shape[
+            (fig3_shape["high_q"] == HIGHCE_Q_DEFAULT) &
+            (fig3_shape["SSRD_group"] == "high")
+        ].to_dict(orient="records"),
+    },
+    "Fig4": {
+        "baseline_demand_cuts": demand_cuts.tolist(),
+        "Pactive_CI": pactive_ci,
+    },
+    "Fig5": {
+        "default_Q80_summary": default_fig5_summary.to_dict(orient="records"),
+    },
+    "outputs": {
+        "Fig3_default": "Fig3_observed_common_support_validation_Q80.png/.pdf",
+        "Fig4_default": "Fig4_observed_common_support_validation.png/.pdf",
+        "Fig5_default": "Fig5_observed_common_support_validation_Q80.png/.pdf",
+        "HighCE_sensitivity": "HighCE_threshold_sensitivity_Fig3_Fig5_observed.png/.pdf",
+        "Fig3_sensitivity_table": "fig3_highce_threshold_sensitivity_shape.csv",
+        "Fig4_tables": [
+            "fig4_global_year_pactive.csv",
+            "fig4_global_demand_year.csv",
+            "fig4_global_decomposition_components.csv",
+            "fig4_pactive_early_recent_CI.csv",
+        ],
+        "Fig5_sensitivity_table": "fig5_highce_threshold_sensitivity.csv",
+    }
+}
+
+with open(os.path.join(OUTDIR, "final_observed_validation_summary.json"), "w", encoding="utf-8") as f:
+    json.dump(summary, f, indent=2)
+
+print("\n✅ Final observed validation completed.")
+print("Outputs saved to:", OUTDIR)
+print("\nKey outputs:")
+print(" - Fig3_observed_common_support_validation_Q80.png/.pdf")
+print(" - Fig4_observed_common_support_validation.png/.pdf")
+print(" - Fig5_observed_common_support_validation_Q80.png/.pdf")
+print(" - HighCE_threshold_sensitivity_Fig3_Fig5_observed.png/.pdf")
+print(" - fig3_highce_threshold_sensitivity_shape.csv")
+print(" - fig4_global_year_pactive.csv")
+print(" - fig4_global_demand_year.csv")
+print(" - fig4_global_decomposition_components.csv")
+print(" - fig4_pactive_early_recent_CI.csv")
+print(" - fig5_highce_threshold_sensitivity.csv")
+print(" - final_observed_validation_summary.json")
+
+# ============================================================
+# Plot threshold sensitivity and observation-only validation figures
+#
+# Input directory:
+#   /content/drive/MyDrive/Second_research/MERRA/hybrid/final_observed_validation_fig3_fig4_fig5
+#
+# Outputs:
+#   FigSX_threshold_sensitivity_HighCE.png/.pdf
+#   FigSY_observation_only_validation_Fig3_Fig4_Fig5.png/.pdf
+#
+# Notes:
+#   - Legends are placed outside the panels.
+#   - Fig. 3 lines use a centered 3-bin rolling mean for visualization only.
+#   - Statistical diagnostics are based on unsmoothed bin estimates.
+# ============================================================
+
+import os
+import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ============================================================
+# 0. Paths
+# ============================================================
+
+IN_DIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/final_observed_validation_fig3_fig4_fig5"
+
+OUT_DIR = os.path.join(IN_DIR, "publication_style_figures")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+FP_FIG3_SHAPE = os.path.join(IN_DIR, "fig3_highce_threshold_sensitivity_shape.csv")
+FP_FIG5_SENS  = os.path.join(IN_DIR, "fig5_highce_threshold_sensitivity.csv")
+
+FP_FIG3_DEFAULT = os.path.join(IN_DIR, "fig3_default_Q80_moisture_balanced_curves.csv")
+FP_FIG4_YEAR    = os.path.join(IN_DIR, "fig4_global_year_pactive.csv")
+FP_FIG4_DEMAND  = os.path.join(IN_DIR, "fig4_global_demand_year.csv")
+FP_FIG4_DECOMP  = os.path.join(IN_DIR, "fig4_global_decomposition_components.csv")
+FP_FIG4_CI      = os.path.join(IN_DIR, "fig4_pactive_early_recent_CI.csv")
+
+FP_FIG5_DEFAULT = os.path.join(IN_DIR, "fig5_default_Q80_city_divergence.csv")
+FP_FIG5_SUMMARY = os.path.join(IN_DIR, "fig5_default_Q80_city_divergence_summary.csv")
+
+DPI = 600
+
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 10.5,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "figure.dpi": 180,
+    "savefig.dpi": DPI,
+})
+
+COL = {
+    "low": "#1597A5",
+    "mid": "#FFC24B",
+    "high": "#F66F69",
+    "dark": "#0E606B",
+    "grey": "#8C8C8C",
+    "black": "#222222",
+    "lightgrey": "#D9D9D9",
+    "composition": "#FFC24B",
+    "within": "#F66F69",
+    "total": "#222222",
+}
+
+SSRD_ORDER = ["low", "mid", "high"]
+SSRD_LABEL = {
+    "low": "Low radiation",
+    "mid": "Medium radiation",
+    "high": "High radiation",
+}
+
+DEMAND_ORDER = ["low", "mid", "high"]
+DEMAND_LABEL = {
+    "low": "Low demand",
+    "mid": "Moderate demand",
+    "high": "High demand",
+}
+
+DIV_LABEL = {
+    "gain_both": "Gain under both",
+    "gain_avg_lose_extreme": "Gain average / lose high-demand",
+    "lose_both": "Lose under both",
+    "lose_avg_gain_extreme": "Lose average / gain high-demand",
+}
+
+DIV_COLOR = {
+    "gain_both": COL["dark"],
+    "gain_avg_lose_extreme": COL["mid"],
+    "lose_both": COL["grey"],
+    "lose_avg_gain_extreme": COL["high"],
+}
+
+# ============================================================
+# 1. Helper functions
+# ============================================================
+
+def savefig(fig, name):
+    png = os.path.join(OUT_DIR, f"{name}.png")
+    pdf = os.path.join(OUT_DIR, f"{name}.pdf")
+    fig.savefig(png, dpi=DPI, bbox_inches="tight", facecolor="white")
+    fig.savefig(pdf, dpi=DPI, bbox_inches="tight", facecolor="white")
+    print("Saved:", png)
+    print("Saved:", pdf)
+
+
+def add_smooth(df, x_col, y_col, window=3):
+    out = df.sort_values(x_col).copy()
+    out[f"{y_col}_smooth"] = (
+        out[y_col]
+        .rolling(window=window, center=True, min_periods=1)
+        .mean()
+    )
+    return out
+
+
+def outside_legend(ax, title=None, anchor=(1.02, 0.5), loc="center left", fontsize=9):
+    leg = ax.legend(
+        frameon=False,
+        title=title,
+        bbox_to_anchor=anchor,
+        loc=loc,
+        fontsize=fontsize,
+        borderaxespad=0.0
+    )
+    if leg and title:
+        leg.get_title().set_fontsize(fontsize)
+    return leg
+
+
+# ============================================================
+# 2. Load data
+# ============================================================
+
+fig3_shape = pd.read_csv(FP_FIG3_SHAPE)
+fig5_sens  = pd.read_csv(FP_FIG5_SENS)
+
+fig3_default = pd.read_csv(FP_FIG3_DEFAULT)
+fig4_year    = pd.read_csv(FP_FIG4_YEAR)
+fig4_demand  = pd.read_csv(FP_FIG4_DEMAND)
+fig4_decomp  = pd.read_csv(FP_FIG4_DECOMP)
+fig4_ci      = pd.read_csv(FP_FIG4_CI)
+fig5_default = pd.read_csv(FP_FIG5_DEFAULT)
+fig5_summary = pd.read_csv(FP_FIG5_SUMMARY)
+
+# Ensure numeric
+for df in [fig3_shape, fig5_sens, fig3_default, fig4_year, fig4_demand, fig4_decomp, fig5_default]:
+    for c in df.columns:
+        if c not in ["SSRD_group", "curve_type", "demand_group", "city", "div_type"]:
+            df[c] = pd.to_numeric(df[c], errors="ignore")
+
+# ============================================================
+# 3. Fig. Sx: HighCE threshold sensitivity
+# ============================================================
+
+fig, axes = plt.subplots(1, 3, figsize=(15.8, 4.8), constrained_layout=True)
+
+# ------------------------------------------------------------
+# (a) Fig. 3 potential stability:
+#     P90 empirical CE change along VPD under different HighCE thresholds
+# ------------------------------------------------------------
+
+for ssrd in SSRD_ORDER:
+    sub = fig3_shape[fig3_shape["SSRD_group"] == ssrd].sort_values("top_fraction")
+    if sub.empty:
+        continue
+
+    axes[0].plot(
+        sub["top_fraction"],
+        sub["P90_change_last_minus_first"],
+        marker="o",
+        lw=2.2,
+        color=COL[ssrd],
+        label=SSRD_LABEL[ssrd]
+    )
+
+axes[0].axhline(0, color=COL["black"], lw=1)
+axes[0].set_xlabel("HighCE top fraction")
+axes[0].set_ylabel("P90 empirical CE change\nhighest VPD − lowest VPD")
+axes[0].set_title("(a) Potential gradient")
+axes[0].grid(axis="y", alpha=0.18)
+outside_legend(axes[0], title="Radiation regime")
+
+# ------------------------------------------------------------
+# (b) Fig. 3 attainability-window stability:
+#     Pr(HighCE) peak-minus-highest-VPD
+# ------------------------------------------------------------
+
+for ssrd in SSRD_ORDER:
+    sub = fig3_shape[fig3_shape["SSRD_group"] == ssrd].sort_values("top_fraction")
+    if sub.empty:
+        continue
+
+    axes[1].plot(
+        sub["top_fraction"],
+        sub["Pr_peak_minus_last"],
+        marker="o",
+        lw=2.2,
+        color=COL[ssrd],
+        label=SSRD_LABEL[ssrd]
+    )
+
+axes[1].axhline(0, color=COL["black"], lw=1)
+axes[1].set_xlabel("HighCE top fraction")
+axes[1].set_ylabel("Pr(HighCE) peak − highest VPD")
+axes[1].set_title("(b) Attainability-window stability")
+axes[1].grid(axis="y", alpha=0.18)
+outside_legend(axes[1], title="Radiation regime")
+
+# ------------------------------------------------------------
+# (c) Fig. 5 city divergence stability:
+#     Spearman r under different HighCE thresholds
+# ------------------------------------------------------------
+
+sub = fig5_sens.sort_values("top_fraction")
+
+axes[2].plot(
+    sub["top_fraction"],
+    sub["spearman_r"],
+    marker="o",
+    lw=2.4,
+    color=COL["dark"],
+    label="Average vs high-demand divergence"
+)
+
+axes[2].axhline(0, color=COL["black"], lw=1)
+axes[2].set_xlabel("HighCE top fraction")
+axes[2].set_ylabel("Spearman r")
+axes[2].set_title("(c) City divergence stability")
+axes[2].grid(axis="y", alpha=0.18)
+outside_legend(axes[2], title=None)
+
+fig.suptitle(
+    "Fig. Sx. Sensitivity of observed validations to the HighCE threshold",
+    fontsize=14,
+    y=1.04
+)
+
+savefig(fig, "FigSX_threshold_sensitivity_HighCE")
+plt.show()
+
+# ============================================================
+# 4. Fig. Sy: Observation-only validation of Figs. 3–5
+# ============================================================
+
+fig = plt.figure(figsize=(16.5, 10.5), constrained_layout=True)
+gs = fig.add_gridspec(2, 3, height_ratios=[1, 1])
+
+ax31 = fig.add_subplot(gs[0, 0])  # Fig3 potential
+ax32 = fig.add_subplot(gs[0, 1])  # Fig3 attainability
+ax4  = fig.add_subplot(gs[0, 2])  # Fig4 Pactive
+ax41 = fig.add_subplot(gs[1, 0])  # Fig4 contribution
+ax42 = fig.add_subplot(gs[1, 1])  # Fig4 decomposition
+ax5  = fig.add_subplot(gs[1, 2])  # Fig5 divergence
+
+# ------------------------------------------------------------
+# Fig. 3 observed validation: potential and attainability
+# ------------------------------------------------------------
+
+for ssrd in SSRD_ORDER:
+    sub = fig3_default[fig3_default["SSRD_group"] == ssrd].sort_values("VPD_mid").copy()
+    if sub.empty:
+        continue
+
+    sub = add_smooth(sub, "VPD_mid", "metric_p90_med", window=3)
+    sub = add_smooth(sub, "VPD_mid", "Pr_HighState_med", window=3)
+
+    color = COL[ssrd]
+
+    # Potential
+    ax31.scatter(
+        sub["VPD_mid"],
+        sub["metric_p90_med"],
+        s=22,
+        color=color,
+        alpha=0.48
+    )
+    ax31.plot(
+        sub["VPD_mid"],
+        sub["metric_p90_med_smooth"],
+        lw=2.3,
+        color=color,
+        label=SSRD_LABEL[ssrd]
+    )
+    ax31.fill_between(
+        sub["VPD_mid"],
+        sub["metric_p90_lo95"],
+        sub["metric_p90_hi95"],
+        color=color,
+        alpha=0.11,
+        linewidth=0
+    )
+
+    # Attainability
+    ax32.scatter(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med"],
+        s=22,
+        color=color,
+        alpha=0.48
+    )
+    ax32.plot(
+        sub["VPD_mid"],
+        sub["Pr_HighState_med_smooth"],
+        lw=2.3,
+        color=color,
+        label=SSRD_LABEL[ssrd]
+    )
+    ax32.fill_between(
+        sub["VPD_mid"],
+        sub["Pr_HighState_lo95"],
+        sub["Pr_HighState_hi95"],
+        color=color,
+        alpha=0.11,
+        linewidth=0
+    )
+
+ax31.set_xlabel("VPD (kPa)")
+ax31.set_ylabel("P90 empirical CE")
+ax31.set_title("(a) Observed cooling potential")
+ax31.grid(axis="y", alpha=0.18)
+outside_legend(ax31, title="Radiation regime")
+
+ax32.set_xlabel("VPD (kPa)")
+ax32.set_ylabel("Pr(Empirical HighCE)")
+ax32.set_title("(b) Observed cooling attainability")
+ax32.grid(axis="y", alpha=0.18)
+outside_legend(ax32, title="Radiation regime")
+
+# ------------------------------------------------------------
+# Fig. 4a observed validation: annual P(active)
+# ------------------------------------------------------------
+
+ci = fig4_ci.iloc[0].to_dict()
+
+ax4.plot(
+    fig4_year["Year"],
+    fig4_year["P_active_city_mean"],
+    marker="o",
+    lw=2.4,
+    color=COL["dark"],
+    label="Global city mean"
+)
+
+ax4.set_xlabel("Year")
+ax4.set_ylabel("Empirical P(active)")
+ax4.set_title("(c) Global active cooling")
+ax4.grid(axis="y", alpha=0.18)
+
+txt = (
+    f"Early: {ci['early_mean']:.3f}\n"
+    f"Recent: {ci['recent_mean']:.3f}\n"
+    f"Δ = {ci['delta_mean']:.3f}\n"
+    f"95% CI [{ci['delta_lo95']:.3f}, {ci['delta_hi95']:.3f}]"
+)
+ax4.text(
+    0.03, 0.97,
+    txt,
+    transform=ax4.transAxes,
+    ha="left",
+    va="top",
+    fontsize=8.8,
+    bbox=dict(facecolor="white", edgecolor="none", alpha=0.85)
+)
+outside_legend(ax4, title=None)
+
+# ------------------------------------------------------------
+# Fig. 4b demand contribution stack
+# ------------------------------------------------------------
+
+contrib = (
+    fig4_demand
+    .pivot(index="Year", columns="demand_group", values="contrib_city_mean")
+    .reindex(columns=DEMAND_ORDER)
+    .fillna(0)
+    .sort_index()
+)
+
+ax41.stackplot(
+    contrib.index,
+    [contrib[dg].values for dg in DEMAND_ORDER],
+    labels=[DEMAND_LABEL[dg] for dg in DEMAND_ORDER],
+    colors=[COL[dg] for dg in DEMAND_ORDER],
+    alpha=0.88
+)
+
+ax41.set_xlabel("Year")
+ax41.set_ylabel("Contribution to P(active)")
+ax41.set_title("(d) Demand-background contributions")
+ax41.grid(axis="y", alpha=0.18)
+outside_legend(ax41, title="Demand level")
+
+# ------------------------------------------------------------
+# Fig. 4c decomposition components
+# ------------------------------------------------------------
+
+fig4_decomp = fig4_decomp.sort_values("Year")
+
+ax42.scatter(
+    fig4_decomp["Year"],
+    fig4_decomp["composition_component"],
+    s=32,
+    color=COL["composition"],
+    alpha=0.9,
+    label="Demand-frequency change"
+)
+ax42.scatter(
+    fig4_decomp["Year"],
+    fig4_decomp["within_activation_component"],
+    s=32,
+    color=COL["within"],
+    alpha=0.9,
+    label="Within-background activation"
+)
+ax42.plot(
+    fig4_decomp["Year"],
+    fig4_decomp["sum_component"],
+    marker="o",
+    lw=2.4,
+    color=COL["total"],
+    label="Sum"
+)
+
+ax42.axhline(0, color=COL["black"], lw=1)
+ax42.set_xlabel("Year")
+ax42.set_ylabel("Contribution relative to baseline")
+ax42.set_title("(e) Activation decomposition")
+ax42.grid(axis="y", alpha=0.18)
+outside_legend(ax42, title=None)
+
+# ------------------------------------------------------------
+# Fig. 5 observed validation: city divergence
+# ------------------------------------------------------------
+
+r = float(fig5_summary["spearman_r"].iloc[0])
+p = float(fig5_summary["spearman_p"].iloc[0])
+
+for div_type, sub in fig5_default.groupby("div_type"):
+    ax5.scatter(
+        sub["d_avg"],
+        sub["d_extreme"],
+        s=52,
+        alpha=0.82,
+        color=DIV_COLOR.get(div_type, COL["grey"]),
+        edgecolor="white",
+        linewidth=0.7,
+        label=DIV_LABEL.get(div_type, div_type)
+    )
+
+ax5.axhline(0, color=COL["black"], lw=1)
+ax5.axvline(0, color=COL["black"], lw=1)
+ax5.set_xlabel("Δ empirical Pr(HighCE), average")
+ax5.set_ylabel("Δ empirical Pr(HighCE), high demand")
+ax5.set_title("(f) City-level divergence")
+ax5.grid(alpha=0.15)
+
+ax5.text(
+    0.03, 0.97,
+    f"Spearman r = {r:.3f}\nP = {p:.2g}\nN = {len(fig5_default)}",
+    transform=ax5.transAxes,
+    ha="left",
+    va="top",
+    fontsize=8.8,
+    bbox=dict(facecolor="white", edgecolor="none", alpha=0.85)
+)
+outside_legend(ax5, title="City type", anchor=(1.02, 0.5), fontsize=8)
+
+fig.suptitle(
+    "Fig. Sy. Observation-only common-support validation of the main diagnostic results",
+    fontsize=15,
+    y=1.02
+)
+
+savefig(fig, "FigSY_observation_only_validation_Fig3_Fig4_Fig5")
+plt.show()
+
+print("\n✅ All publication-style figures saved to:")
+print(OUT_DIR)
