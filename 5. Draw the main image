@@ -1,0 +1,2255 @@
+import pandas as pd
+import numpy as np
+
+FP = "/content/drive/MyDrive/Second_research/MERRA/hybrid/fig1_revised_maintext/fig1_used_dataset.parquet"
+
+df = pd.read_parquet(FP)
+print("shape:", df.shape)
+print("columns:", df.columns.tolist())
+
+check_cols = [c for c in [
+    "EVI_baseline_used",
+    "dEVI_ref",
+    "cooling_efficiency_ERA5",
+    "cooling_efficiency_MERRA2",
+    "ce_era_plot",
+    "ce_mer_plot"
+] if c in df.columns]
+
+print("\ncheck_cols:", check_cols)
+
+if "EVI_baseline_used" in df.columns:
+    print("\nEVI_baseline_used unique:")
+    print(df["EVI_baseline_used"].dropna().unique()[:20])
+
+if "dEVI_ref" in df.columns:
+    print("\ndEVI_ref summary:")
+    print(df["dEVI_ref"].describe(percentiles=[0.05, 0.5, 0.95]))
+
+for c in ["cooling_efficiency_ERA5", "cooling_efficiency_MERRA2"]:
+    if c in df.columns:
+        print(f"\n{c} summary:")
+        print(df[c].describe(percentiles=[0.05, 0.5, 0.95]))
+
+print("\nhead:")
+print(df.head())
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Revised Fig. 1 for main text
+# From dual-source raw parquet -> two-member cooling efficiency
+# -> publication-quality Fig. 1
+#
+# INPUT:
+#   1) raw parquet with ERA5 + MERRA2hyb variables
+#   2) trained final model object: `final`
+#   3) training feature list: `feature_cols`
+#
+# OUTPUT:
+#   - fig1_revised_two_member.png
+#   - fig1_revised_two_member.pdf
+#   - fig1_revised_two_member.svg
+#   - fig1_global_summary.csv
+#   - fig1_city_summary.csv
+#   - fig1_used_dataset.parquet
+#
+# IMPORTANT:
+#   This script assumes you already have:
+#     - final        : trained regression model
+#     - feature_cols : feature names used during training
+#
+#   If not, load them first before running this script.
+# ============================================================
+
+import os
+import json
+import pickle
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 0) USER SETTINGS
+# ============================================================
+DATA_FP = "/content/drive/MyDrive/Second_research/MERRA/hybrid/GlobalUrbanCooling_dataset_v2_ERA5_plus_MERRA2hybrid.parquet"
+OUTDIR  = "/content/drive/MyDrive/Second_research/MERRA/hybrid/fig1_revised_maintext"
+os.makedirs(OUTDIR, exist_ok=True)
+
+# Optional:
+# If your model / feature list are saved as files, set these paths.
+# Otherwise keep them as None and make sure `final` and `feature_cols`
+# already exist in memory.
+MODEL_FP = None
+FEATURES_FP = None   # e.g., a json list or txt list
+
+CITY_COL = "city"
+DATE_COL = "date"
+LST_COL  = "LST"
+EVI_COL  = "EVI"
+
+# If you only want core urban pixels:
+USE_CORE_ONLY = True
+CORE_COL = "is_core_ntl"
+
+# How many cities to show in panel (b)
+N_TAIL = 20
+
+# Efficient floor for cooling_efficiency = cooling_strength / EVI
+EVI_EPS = 0.02
+
+# Winsorization for display only
+WINSOR_Q = (0.2, 99.8)
+
+# Figure exporting
+DPI = 600
+FIG_W = 11.8
+FIG_H = 14.2
+
+# Colors (soft but clean; inspired by high-contrast scientific palette)
+C_ERA_FILL  = "#6FA8DC"
+C_ERA_LINE  = "#2F6E9E"
+C_MER_FILL  = "#F6B3C7"
+C_MER_LINE  = "#B95C7A"
+C_ENS_LINE  = "#3F3F46"
+C_RANGE     = "#D9D9E3"
+C_GRID      = "#E6E8EF"
+C_TEXT      = "#222222"
+
+# ============================================================
+# 1) LOAD MODEL / FEATURE LIST IF NEEDED
+# ============================================================
+if "final" not in globals():
+    if MODEL_FP is None:
+        raise ValueError(
+            "❌ `final` model not found in memory and MODEL_FP is None.\n"
+            "Please either load your trained model into variable `final`,\n"
+            "or provide MODEL_FP."
+        )
+    with open(MODEL_FP, "rb") as f:
+        final = pickle.load(f)
+
+if "feature_cols" not in globals():
+    if FEATURES_FP is None:
+        raise ValueError(
+            "❌ `feature_cols` not found in memory and FEATURES_FP is None.\n"
+            "Please either define `feature_cols`, or provide FEATURES_FP."
+        )
+    if FEATURES_FP.endswith(".json"):
+        with open(FEATURES_FP, "r", encoding="utf-8") as f:
+            feature_cols = json.load(f)
+    else:
+        with open(FEATURES_FP, "r", encoding="utf-8") as f:
+            feature_cols = [x.strip() for x in f.readlines() if x.strip()]
+
+print("✅ Model ready:", type(final))
+print("✅ feature_cols:", feature_cols)
+
+# ============================================================
+# 2) READ RAW DATA
+# ============================================================
+df = pd.read_parquet(DATA_FP).copy()
+print("Loaded raw parquet:", df.shape)
+
+if DATE_COL in df.columns:
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+
+# basic filter
+need_basic = [CITY_COL, DATE_COL, LST_COL, EVI_COL]
+missing_basic = [c for c in need_basic if c not in df.columns]
+if missing_basic:
+    raise ValueError(f"❌ Missing required columns: {missing_basic}")
+
+df = df.dropna(subset=[CITY_COL, DATE_COL, LST_COL, EVI_COL]).reset_index(drop=True)
+
+if USE_CORE_ONLY and CORE_COL in df.columns:
+    df = df[df[CORE_COL] == 1].reset_index(drop=True)
+
+print("After basic filtering:", df.shape)
+print("Cities:", df[CITY_COL].nunique())
+
+# ============================================================
+# 3) BUILD ERA5 / MERRA FEATURE TABLES
+# ============================================================
+# Original training features (based on your earlier code)
+# likely:
+# ["EVI","LAI","DEM","LC","DIST_WATER_km","T2M_C","TD_C","VPD_kPa","WIND10M_MS","SSRD_MJm2","TP_mm","SWVL1_m3m3","STL1_C"]
+#
+# In this dual-source parquet:
+# - ERA5 vars use original names
+# - MERRA vars use prefix MERRA2hyb_
+
+CLIM_VARS = ["T2M_C","TD_C","VPD_kPa","WIND10M_MS","SSRD_MJm2","TP_mm","SWVL1_m3m3","STL1_C"]
+
+def build_feature_frame(df_in: pd.DataFrame, source: str, feature_cols: list):
+    """
+    source = 'ERA5' or 'MERRA2'
+    Returns a DataFrame with exactly the training feature columns.
+    """
+    X = pd.DataFrame(index=df_in.index)
+
+    for c in feature_cols:
+        if c in CLIM_VARS:
+            if source == "ERA5":
+                src_col = c
+            elif source == "MERRA2":
+                src_col = f"MERRA2hyb_{c}"
+            else:
+                raise ValueError("source must be 'ERA5' or 'MERRA2'")
+        else:
+            src_col = c
+
+        if src_col not in df_in.columns:
+            raise ValueError(f"❌ Required source column not found for {source}: {src_col}")
+
+        X[c] = pd.to_numeric(df_in[src_col], errors="coerce")
+
+    return X
+
+X_era = build_feature_frame(df, "ERA5", feature_cols)
+X_mer = build_feature_frame(df, "MERRA2", feature_cols)
+
+# ============================================================
+# 4) FILL MISSING FEATURES (same logic as your previous workflow)
+# ============================================================
+# We use training-like robust fill:
+# - numeric median within available rows
+# - if still missing, overall median fallback
+# No row dropping here, to keep same observation base.
+
+def fill_features(X: pd.DataFrame):
+    Xf = X.copy()
+    med = {}
+    for c in Xf.columns:
+        v = pd.to_numeric(Xf[c], errors="coerce")
+        m = float(np.nanmedian(v)) if np.isfinite(v).sum() > 0 else 0.0
+        med[c] = m
+        Xf[c] = v.fillna(m)
+    return Xf, med
+
+X_era_f, med_era = fill_features(X_era)
+X_mer_f, med_mer = fill_features(X_mer)
+
+# ============================================================
+# 5) GENERIC MODEL PREDICT WRAPPER
+# ============================================================
+def predict_model(model, X: pd.DataFrame) -> np.ndarray:
+    """
+    Supports common sklearn / xgboost / catboost APIs.
+    """
+    # xgboost sklearn API / sklearn API
+    if hasattr(model, "predict"):
+        try:
+            y = model.predict(X)
+            return np.asarray(y, dtype=float)
+        except Exception:
+            pass
+
+        try:
+            y = model.predict(X.to_numpy(dtype=float))
+            return np.asarray(y, dtype=float)
+        except Exception:
+            pass
+
+    # xgboost Booster
+    try:
+        import xgboost as xgb
+        if isinstance(model, xgb.Booster):
+            dmat = xgb.DMatrix(X)
+            y = model.predict(dmat)
+            return np.asarray(y, dtype=float)
+    except Exception:
+        pass
+
+    raise ValueError("❌ Unsupported model type or prediction failed.")
+
+# ============================================================
+# 6) COUNTERFACTUAL PREDICTION:
+#    cooling_strength = LST_pred(EVI=0) - LST_pred(observed)
+#    cooling_efficiency = cooling_strength / max(EVI, eps)
+#
+# This follows your earlier logic of computing cooling_strength_pred
+# and cooling_efficiency from the trained final model. :contentReference[oaicite:2]{index=2}
+# ============================================================
+# ============================================================
+# 6) COUNTERFACTUAL PREDICTION:
+#    revised logic:
+#    cooling_strength = LST_pred(EVI=0.05) - LST_pred(observed)
+#    cooling_efficiency = cooling_strength / (EVI - 0.05), only when dEVI >= 0.02
+# ============================================================
+
+EVI_BASELINE = 0.05
+MIN_DEVI = 0.02
+
+def compute_ce_for_source(df_in, X_full, source_name,
+                          evi_baseline=0.05,
+                          min_devi=0.02,
+                          add_shared_cols=False):
+    """
+    source_name = 'ERA5' or 'MERRA2'
+
+    Returns:
+      - source-specific prediction columns
+      - optionally shared cols:
+          dEVI_ref
+          EVI_baseline_used
+
+    Note:
+      shared cols should only be added ONCE to avoid duplicate names
+      when concatenating ERA5 and MERRA2 outputs.
+    """
+    X_obs = X_full.copy()
+    X_cf  = X_full.copy()
+
+    if "EVI" not in X_cf.columns:
+        raise ValueError("❌ EVI must be included in feature_cols for counterfactual prediction.")
+
+    # revised counterfactual baseline
+    X_cf["EVI"] = evi_baseline
+
+    pred_obs = predict_model(final, X_obs)
+    pred_cf  = predict_model(final, X_cf)
+
+    out = pd.DataFrame(index=df_in.index)
+
+    # keep old column naming for minimal downstream changes
+    out[f"LST_pred_{source_name}"] = np.asarray(pred_obs, dtype=float)
+    out[f"LST_pred_noEVI_{source_name}"] = np.asarray(pred_cf, dtype=float)
+    out[f"cooling_strength_pred_{source_name}"] = (
+        out[f"LST_pred_noEVI_{source_name}"].to_numpy(dtype=float)
+        - out[f"LST_pred_{source_name}"].to_numpy(dtype=float)
+    )
+
+    # revised denominator
+    dEVI = df_in["EVI"].to_numpy(dtype=float) - float(evi_baseline)
+
+    ce = np.where(
+        dEVI >= float(min_devi),
+        out[f"cooling_strength_pred_{source_name}"].to_numpy(dtype=float) / dEVI,
+        np.nan
+    )
+    out[f"cooling_efficiency_{source_name}"] = ce
+
+    # IMPORTANT: shared cols only once
+    if add_shared_cols:
+        out["dEVI_ref"] = dEVI
+        out["EVI_baseline_used"] = float(evi_baseline)
+
+    return out
+
+# ERA5 adds shared cols once; MERRA2 does not
+ce_era = compute_ce_for_source(
+    df, X_era_f, "ERA5",
+    evi_baseline=EVI_BASELINE,
+    min_devi=MIN_DEVI,
+    add_shared_cols=True
+)
+
+ce_mer = compute_ce_for_source(
+    df, X_mer_f, "MERRA2",
+    evi_baseline=EVI_BASELINE,
+    min_devi=MIN_DEVI,
+    add_shared_cols=False
+)
+
+# merge result table
+res = pd.concat(
+    [
+        df[[CITY_COL, DATE_COL, EVI_COL, LST_COL]].copy(),
+        ce_era,
+        ce_mer
+    ],
+    axis=1
+)
+
+# Optional display winsorization only for plotting stats
+def winsorize_series(s, q=(0.2, 99.8)):
+    x = pd.to_numeric(s, errors="coerce").to_numpy(dtype=float)
+    ok = np.isfinite(x)
+    if ok.sum() < 10:
+        return s
+    lo, hi = np.nanpercentile(x[ok], q)
+    return pd.Series(np.clip(x, lo, hi), index=s.index)
+
+res["ce_era_plot"] = winsorize_series(res["cooling_efficiency_ERA5"], q=WINSOR_Q)
+res["ce_mer_plot"] = winsorize_series(res["cooling_efficiency_MERRA2"], q=WINSOR_Q)
+
+# keep finite rows where both exist for strict comparison
+keep = np.isfinite(res["ce_era_plot"]) & np.isfinite(res["ce_mer_plot"])
+res = res.loc[keep].reset_index(drop=True)
+
+print("After CE computation:", res.shape)
+print("Columns:")
+print(res.columns.tolist())
+
+# save used dataset
+used_fp = os.path.join(OUTDIR, "fig1_used_dataset.parquet")
+res.to_parquet(used_fp, index=False)
+print("✅ Saved:", used_fp)
+
+# ============================================================
+# 7) GLOBAL SUMMARY
+# ============================================================
+def summary_stats(x):
+    x = pd.to_numeric(x, errors="coerce").to_numpy(dtype=float)
+    x = x[np.isfinite(x)]
+    return {
+        "n": int(len(x)),
+        "mean": float(np.mean(x)),
+        "median": float(np.median(x)),
+        "p10": float(np.percentile(x, 10)),
+        "p90": float(np.percentile(x, 90)),
+        "std": float(np.std(x)),
+    }
+
+sum_era = summary_stats(res["cooling_efficiency_ERA5"])
+sum_mer = summary_stats(res["cooling_efficiency_MERRA2"])
+
+global_summary = pd.DataFrame([
+    {"source": "ERA5", **sum_era},
+    {"source": "MERRA2hyb", **sum_mer},
+])
+global_summary.to_csv(os.path.join(OUTDIR, "fig1_global_summary.csv"), index=False)
+
+# ensemble summary
+ens = {
+    "mean_lo": min(sum_era["mean"], sum_mer["mean"]),
+    "mean_hi": max(sum_era["mean"], sum_mer["mean"]),
+    "median_lo": min(sum_era["median"], sum_mer["median"]),
+    "median_hi": max(sum_era["median"], sum_mer["median"]),
+    "p10_lo": min(sum_era["p10"], sum_mer["p10"]),
+    "p10_hi": max(sum_era["p10"], sum_mer["p10"]),
+    "p90_lo": min(sum_era["p90"], sum_mer["p90"]),
+    "p90_hi": max(sum_era["p90"], sum_mer["p90"]),
+}
+pd.DataFrame([ens]).to_csv(os.path.join(OUTDIR, "fig1_global_ensemble_summary.csv"), index=False)
+
+print("\nGlobal summary:")
+print(global_summary.round(3))
+print(pd.DataFrame([ens]).round(3))
+
+# ============================================================
+# 8) CITY SUMMARY
+# ============================================================
+def city_stats(g):
+    a = g["cooling_efficiency_ERA5"].to_numpy(dtype=float)
+    b = g["cooling_efficiency_MERRA2"].to_numpy(dtype=float)
+    a = a[np.isfinite(a)]
+    b = b[np.isfinite(b)]
+
+    return pd.Series({
+        "n_era": len(a),
+        "n_mer": len(b),
+        "median_era": np.median(a) if len(a) else np.nan,
+        "median_mer": np.median(b) if len(b) else np.nan,
+        "p10_era": np.percentile(a, 10) if len(a) else np.nan,
+        "p90_era": np.percentile(a, 90) if len(a) else np.nan,
+        "p10_mer": np.percentile(b, 10) if len(b) else np.nan,
+        "p90_mer": np.percentile(b, 90) if len(b) else np.nan,
+    })
+
+city_sum = res.groupby(CITY_COL, as_index=False).apply(city_stats).reset_index(drop=True)
+
+city_sum["median_ens"] = city_sum[["median_era", "median_mer"]].mean(axis=1)
+city_sum["median_lo"]  = city_sum[["median_era", "median_mer"]].min(axis=1)
+city_sum["median_hi"]  = city_sum[["median_era", "median_mer"]].max(axis=1)
+
+# within-city variability shown as average of the two member ranges
+city_sum["range_lo"] = city_sum[["p10_era", "p10_mer"]].mean(axis=1)
+city_sum["range_hi"] = city_sum[["p90_era", "p90_mer"]].mean(axis=1)
+
+# keep cities with enough data
+city_sum["n_min"] = city_sum[["n_era", "n_mer"]].min(axis=1)
+city_sum = city_sum[city_sum["n_min"] >= 30].copy()
+
+# rank by ensemble median
+city_sum = city_sum.sort_values("median_ens", ascending=True).reset_index(drop=True)
+bottom = city_sum.head(N_TAIL).copy()
+top    = city_sum.tail(N_TAIL).copy()
+
+city_plot = pd.concat([bottom, top], axis=0).copy()
+city_plot = city_plot.sort_values("median_ens", ascending=False).reset_index(drop=True)
+
+city_sum.to_csv(os.path.join(OUTDIR, "fig1_city_summary.csv"), index=False)
+
+# ============================================================
+# 9) PLOT SETTINGS
+# ============================================================
+plt.rcParams.update({
+    "font.family": "DejaVu Serif",
+    "font.size": 14,
+    "axes.labelsize": 17,
+    "axes.titlesize": 18,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 12,
+    "legend.fontsize": 13,
+    "axes.edgecolor": "#555555",
+    "axes.linewidth": 0.8,
+})
+
+def smooth_hist_density(x, bins=60, xr=None):
+    h, edges = np.histogram(x, bins=bins, range=xr, density=True)
+    mids = 0.5 * (edges[:-1] + edges[1:])
+    k = np.array([1, 4, 6, 4, 1], dtype=float)
+    k = k / k.sum()
+    hs = np.convolve(h, k, mode="same")
+    return mids, hs
+
+x1 = res["ce_era_plot"].to_numpy(dtype=float)
+x2 = res["ce_mer_plot"].to_numpy(dtype=float)
+x1 = x1[np.isfinite(x1)]
+x2 = x2[np.isfinite(x2)]
+
+xmin = np.nanpercentile(np.r_[x1, x2], 0.3)
+xmax = np.nanpercentile(np.r_[x1, x2], 99.7)
+
+# ============================================================
+# 10) DRAW FIGURE
+# ============================================================
+fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor="white")
+gs = fig.add_gridspec(
+    2, 1,
+    height_ratios=[1.02, 2.28],
+    hspace=0.20
+)
+
+# ---------------- Panel (a) ----------------
+ax1 = fig.add_subplot(gs[0, 0])
+ax1.set_facecolor("white")
+
+# histograms
+ax1.hist(
+    x1, bins=62, range=(xmin, xmax), density=True,
+    color=C_ERA_FILL, alpha=0.38, edgecolor="none"
+)
+ax1.hist(
+    x2, bins=62, range=(xmin, xmax), density=True,
+    color=C_MER_FILL, alpha=0.35, edgecolor="none"
+)
+
+m1, d1 = smooth_hist_density(x1, bins=62, xr=(xmin, xmax))
+m2, d2 = smooth_hist_density(x2, bins=62, xr=(xmin, xmax))
+
+ax1.plot(m1, d1, color=C_ERA_LINE, lw=2.6)
+ax1.plot(m2, d2, color=C_MER_LINE, lw=2.6, ls="--")
+
+ax1.axvline(sum_era["mean"], color=C_ERA_LINE, lw=1.3, ls=":")
+ax1.axvline(sum_mer["mean"], color=C_MER_LINE, lw=1.3, ls=":")
+
+ax1.set_xlim(xmin, xmax)
+ax1.set_ylabel("Density")
+ax1.set_xlabel("Cooling capacity (°C per unit EVI)")
+ax1.text(-0.08, 1.02, "(a)", transform=ax1.transAxes, fontsize=20, fontweight="bold")
+
+# clean grid
+ax1.grid(True, axis="y", color=C_GRID, lw=0.8)
+ax1.grid(False, axis="x")
+
+# concise stats box, moved to upper-left margin area
+txt = (
+    f"ERA5 mean = {sum_era['mean']:.2f}, median = {sum_era['median']:.2f}\n"
+    f"MERRA-2 mean = {sum_mer['mean']:.2f}, median = {sum_mer['median']:.2f}\n"
+    f"Ensemble P10 = {ens['p10_lo']:.2f}–{ens['p10_hi']:.2f}\n"
+    f"Ensemble P90 = {ens['p90_lo']:.2f}–{ens['p90_hi']:.2f}\n"
+    f"N = {len(res):,}"
+)
+ax1.text(
+    0.015, 0.97, txt,
+    transform=ax1.transAxes,
+    va="top", ha="left",
+    fontsize=12.5, color=C_TEXT,
+    bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="none", alpha=0.92)
+)
+
+legend_a = [
+    Patch(facecolor=C_ERA_FILL, edgecolor="none", alpha=0.38, label="ERA5 distribution"),
+    Patch(facecolor=C_MER_FILL, edgecolor="none", alpha=0.35, label="MERRA-2 distribution"),
+    Line2D([0],[0], color=C_ERA_LINE, lw=2.6, label="ERA5 density"),
+    Line2D([0],[0], color=C_MER_LINE, lw=2.6, ls="--", label="MERRA-2 density"),
+]
+ax1.legend(
+    handles=legend_a,
+    frameon=False,
+    ncol=2,
+    loc="upper right",
+    bbox_to_anchor=(0.995, 1.01)
+)
+
+# ---------------- Panel (b) ----------------
+ax2 = fig.add_subplot(gs[1, 0])
+ax2.set_facecolor("white")
+
+ypos = np.arange(len(city_plot))[::-1]
+
+# within-city variability range
+for i, (_, r) in enumerate(city_plot.iterrows()):
+    y = ypos[i]
+    ax2.hlines(
+        y=y,
+        xmin=r["range_lo"], xmax=r["range_hi"],
+        color=C_RANGE, lw=7.0, alpha=0.95, zorder=1
+    )
+
+# between-reanalysis city-median spread
+for i, (_, r) in enumerate(city_plot.iterrows()):
+    y = ypos[i]
+    ax2.hlines(
+        y=y,
+        xmin=r["median_lo"], xmax=r["median_hi"],
+        color=C_ENS_LINE, lw=2.4, alpha=0.95, zorder=2
+    )
+
+# points
+ax2.scatter(
+    city_plot["median_era"], ypos,
+    s=40, color=C_ERA_LINE, zorder=3
+)
+ax2.scatter(
+    city_plot["median_mer"], ypos,
+    s=42, facecolor=C_MER_LINE, edgecolor="white", linewidth=0.5, marker="s", zorder=3
+)
+ax2.scatter(
+    city_plot["median_ens"], ypos,
+    s=28, facecolor=C_ENS_LINE, edgecolor="white", linewidth=0.4, marker="D", zorder=4
+)
+
+ax2.set_yticks(ypos)
+ax2.set_yticklabels(city_plot[CITY_COL].tolist())
+ax2.set_xlabel("Cooling capacity (°C per unit EVI)")
+ax2.text(-0.08, 1.01, "(b)", transform=ax2.transAxes, fontsize=20, fontweight="bold")
+
+ax2.grid(True, axis="x", color=C_GRID, lw=0.8)
+ax2.grid(False, axis="y")
+
+legend_b = [
+    Line2D([0],[0], color=C_RANGE, lw=7, label="Within-city variability (mean P10–P90 across the two reanalyses)"),
+    Line2D([0],[0], color=C_ENS_LINE, lw=2.4, label="Reanalysis spread of city median"),
+    Line2D([0],[0], marker="o", color="none", markerfacecolor=C_ERA_LINE, markersize=8, label="ERA5 city median"),
+    Line2D([0],[0], marker="s", color="none", markerfacecolor=C_MER_LINE, markeredgecolor="white", markersize=8, label="MERRA-2 city median"),
+    Line2D([0],[0], marker="D", color="none", markerfacecolor=C_ENS_LINE, markeredgecolor="white", markersize=7, label="Ensemble median"),
+]
+ax2.legend(
+    handles=legend_b,
+    frameon=False,
+    loc="lower right",
+    bbox_to_anchor=(0.995, 0.01)
+)
+
+# panel title outside crowded area
+fig.suptitle(
+    "Global patterns of urban vegetation cooling capacity across two reanalysis forcings",
+    x=0.5, y=0.992, fontsize=20
+)
+
+# spine cleanup
+for ax in [ax1, ax2]:
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+plt.tight_layout(rect=[0.02, 0.02, 0.98, 0.98])
+
+# ============================================================
+# 11) SAVE
+# ============================================================
+png_fp = os.path.join(OUTDIR, "fig1_revised_two_member.png")
+pdf_fp = os.path.join(OUTDIR, "fig1_revised_two_member.pdf")
+svg_fp = os.path.join(OUTDIR, "fig1_revised_two_member.svg")
+
+fig.savefig(png_fp, dpi=DPI, bbox_inches="tight", facecolor="white")
+fig.savefig(pdf_fp, dpi=600, bbox_inches="tight", facecolor="white")
+fig.savefig(svg_fp, bbox_inches="tight", facecolor="white")
+
+plt.show()
+
+print("\n✅ Saved outputs:")
+print(" -", png_fp)
+print(" -", pdf_fp)
+print(" -", svg_fp)
+print(" -", os.path.join(OUTDIR, "fig1_global_summary.csv"))
+print(" -", os.path.join(OUTDIR, "fig1_city_summary.csv"))
+print(" -", used_fp)
+
+
+import os
+import pandas as pd
+
+RAW_FP = "/content/drive/MyDrive/Second_research/MERRA/hybrid/GlobalUrbanCooling_dataset_v2_ERA5_plus_MERRA2hybrid.parquet"
+RES_FP = "/content/drive/MyDrive/Second_research/MERRA/hybrid/fig1_revised_maintext/fig1_used_dataset.parquet"
+SAVE_FP = "/content/drive/MyDrive/Second_research/MERRA/hybrid/GlobalUrbanCooling_dataset_v2_dualCE_full.parquet"
+
+os.makedirs(os.path.dirname(SAVE_FP), exist_ok=True)
+
+# 1) read raw and result tables
+raw = pd.read_parquet(RAW_FP)
+res = pd.read_parquet(RES_FP)
+
+# 2) make sure date is datetime
+raw["date"] = pd.to_datetime(raw["date"], errors="coerce")
+res["date"] = pd.to_datetime(res["date"], errors="coerce")
+
+print("raw shape:", raw.shape)
+print("res shape:", res.shape)
+
+# 3) keep only the CE result columns we need from res
+res_keep = [
+    "city", "date",
+    "cooling_efficiency_ERA5",
+    "cooling_efficiency_MERRA2"
+]
+res_small = res[res_keep].copy()
+
+# 4) IMPORTANT:
+# because res comes from fig1_used_dataset.parquet, it may contain
+# multiple rows for the same city-date (different pixels).
+# For the full table used in Fig.2 workflow, we merge by full keys
+# to keep row-level consistency as much as possible.
+#
+# Since RAW also has many repeated city-date rows, merging only by city+date
+# would create a many-to-many explosion.
+#
+# So here we merge on city + date + EVI + LST if available.
+
+merge_keys = ["city", "date"]
+
+# use more precise keys to avoid row explosion
+if "EVI" in raw.columns and "EVI" in res.columns:
+    merge_keys.append("EVI")
+if "LST" in raw.columns and "LST" in res.columns:
+    merge_keys.append("LST")
+
+print("merge keys:", merge_keys)
+
+# rebuild res_small with merge keys
+res_keep_precise = merge_keys + ["cooling_efficiency_ERA5", "cooling_efficiency_MERRA2"]
+res_small = res[res_keep_precise].copy()
+
+# 5) merge
+full_df = raw.merge(res_small, on=merge_keys, how="left")
+
+print("merged shape:", full_df.shape)
+print("missing cooling_efficiency_ERA5:", full_df["cooling_efficiency_ERA5"].isna().mean())
+print("missing cooling_efficiency_MERRA2:", full_df["cooling_efficiency_MERRA2"].isna().mean())
+
+# 6) save
+full_df.to_parquet(SAVE_FP, index=False)
+print("✅ saved to:", SAVE_FP)
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Fig. 2 (minimal-change two-member version)
+# Based on the original ERA5 Fig.2 workflow
+# ============================================================
+
+import os
+import math
+import gc
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from matplotlib.gridspec import GridSpec
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import xgboost as xgb
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# 0) INPUT
+# ============================================================
+FULL_FP = "/content/drive/MyDrive/Second_research/MERRA/hybrid/GlobalUrbanCooling_dataset_v2_dualCE_full.parquet"
+OUTDIR  = "/content/drive/MyDrive/Second_research/MERRA/hybrid/fig2_revised_minchange"
+os.makedirs(OUTDIR, exist_ok=True)
+
+CITY = "city"
+DATE = "date"
+YEAR = "Year"
+MONTH = "Month"
+
+# original target / features in your ERA5 Fig.2
+Y = "cooling_efficiency"
+FEATURES = ['EVI','LAI','DEM','LC','DIST_WATER_km','T2M_C','TD_C','VPD_kPa',
+            'WIND10M_MS','SSRD_MJm2','TP_mm','SWVL1_m3m3','STL1_C']
+
+# original summer/background configs
+BASELINE_YEARS = (2002, 2006)
+TOPK_HOT_MONTHS = 3
+BG_Q = 3
+BG_TO_PLOT = [("T1","V1"), ("T2","V2"), ("T3","V3")]
+BG_NAME = {("T1","V1"):"Cool & humid", ("T2","V2"):"Intermediate", ("T3","V3"):"Hot & dry"}
+
+# curve bins
+N_BINS = 25
+MIN_CITY_PER_BIN = 15
+BOOT_N = 200
+RNG_SEED = 42
+
+# speed knob: keep exactly your original logic style
+ENABLE_CITY_SAMPLING = True
+MAX_ROWS_PER_CITY = 120000
+
+# threshold configs (follow your original threshold script)
+EVI  = "EVI"
+CE   = "cooling_efficiency"
+VPD  = "VPD_kPa"
+SSRD = "SSRD_MJm2"
+T2M  = "T2M_C"
+
+CE_Q_ACTIVE = 0.60
+N_BINS_VPD  = 10
+N_BINS_SSRD = 10
+N_BINS_EVI  = 20
+P0 = 0.50
+MIN_CITY_PER_CELL = 10
+MIN_SAMPLES_PER_EVI_BIN = 200
+PER_CITY_CAP = 120000
+THR_BOOT_N = 120
+CI_Q = (0.025, 0.975)
+
+# Fig.2a model settings
+IMP_SAMPLE_FRAC = 0.20    # keep small; enough for stable importance, lighter than full
+XGB_PARAMS = dict(
+    n_estimators=260,
+    max_depth=6,
+    learning_rate=0.06,
+    subsample=0.85,
+    colsample_bytree=0.85,
+    reg_alpha=0.15,
+    reg_lambda=1.0,
+    objective="reg:squarederror",
+    tree_method="hist",
+    n_jobs=4
+)
+
+# output figure
+DPI = 600
+FIG_W = 16.8
+FIG_H = 12.2
+
+# colors
+C_ERA = "#2C7FB8"
+C_MER = "#C05A78"
+C_ERA_FILL = "#8DBFE0"
+C_MER_FILL = "#F3B6C3"
+C_ENS = "#2E2E2E"
+C_BAND = "#D9DEE8"
+C_GRID = "#E8ECF3"
+
+# ============================================================
+# 1) LOAD FULL DUAL-CE DATASET
+# ============================================================
+dataset_all = pd.read_parquet(FULL_FP).copy()
+dataset_all[DATE] = pd.to_datetime(dataset_all[DATE], errors="coerce")
+
+# add Year / Month if not present
+if YEAR not in dataset_all.columns:
+    dataset_all[YEAR] = dataset_all[DATE].dt.year.astype(np.int16)
+if MONTH not in dataset_all.columns:
+    dataset_all[MONTH] = dataset_all[DATE].dt.month.astype(np.int8)
+
+req_common = [CITY, DATE, YEAR, MONTH, "EVI", "LAI", "DEM", "LC", "DIST_WATER_km"]
+req_era = ["T2M_C","TD_C","VPD_kPa","WIND10M_MS","SSRD_MJm2","TP_mm","SWVL1_m3m3","STL1_C","cooling_efficiency_ERA5"]
+req_mer = [f"MERRA2hyb_{c}" for c in ["T2M_C","TD_C","VPD_kPa","WIND10M_MS","SSRD_MJm2","TP_mm","SWVL1_m3m3","STL1_C"]] + ["cooling_efficiency_MERRA2"]
+
+missing = [c for c in req_common + req_era + req_mer if c not in dataset_all.columns]
+if missing:
+    raise ValueError(f"Missing required columns: {missing[:20]} (total={len(missing)})")
+
+# ============================================================
+# 2) BUILD TWO DATASET VIEWS
+#    This is the key minimal-change layer
+# ============================================================
+dataset_era = dataset_all[req_common + req_era].copy()
+dataset_era = dataset_era.rename(columns={"cooling_efficiency_ERA5": "cooling_efficiency"})
+
+dataset_mer = dataset_all[req_common + req_mer].copy()
+dataset_mer = dataset_mer.rename(columns={
+    "MERRA2hyb_T2M_C": "T2M_C",
+    "MERRA2hyb_TD_C": "TD_C",
+    "MERRA2hyb_VPD_kPa": "VPD_kPa",
+    "MERRA2hyb_WIND10M_MS": "WIND10M_MS",
+    "MERRA2hyb_SSRD_MJm2": "SSRD_MJm2",
+    "MERRA2hyb_TP_mm": "TP_mm",
+    "MERRA2hyb_SWVL1_m3m3": "SWVL1_m3m3",
+    "MERRA2hyb_STL1_C": "STL1_C",
+    "cooling_efficiency_MERRA2": "cooling_efficiency"
+})
+
+del dataset_all
+gc.collect()
+
+# ============================================================
+# 3) ORIGINAL-STYLE HELPERS
+# ============================================================
+def prepare_dataset(dataset):
+    df0 = dataset.copy()
+    need = [CITY, DATE, Y] + FEATURES + [YEAR, MONTH]
+    miss = [c for c in need if c not in df0.columns]
+    if miss:
+        raise ValueError(f"dataset missing columns: {miss}")
+
+    df0 = df0.dropna(subset=[CITY, DATE, Y]).copy()
+
+    # optional city-level cap, exactly in the spirit of your original script
+    if ENABLE_CITY_SAMPLING:
+        rng = np.random.default_rng(RNG_SEED)
+        parts = []
+        for _, sub in df0.groupby(CITY, observed=True):
+            if len(sub) > MAX_ROWS_PER_CITY:
+                idx = rng.choice(sub.index.to_numpy(), size=MAX_ROWS_PER_CITY, replace=False)
+                parts.append(df0.loc[idx].copy())
+            else:
+                parts.append(sub.copy())
+        df0 = pd.concat(parts, axis=0, ignore_index=True)
+
+    # define city-specific summer by baseline hottest months using T2M_C
+    base = df0[(df0[YEAR] >= BASELINE_YEARS[0]) & (df0[YEAR] <= BASELINE_YEARS[1])].copy()
+    mm = (
+        base.groupby([CITY, MONTH], observed=True)["T2M_C"]
+            .median()
+            .reset_index()
+            .sort_values([CITY, "T2M_C"], ascending=[True, False])
+    )
+    mm["rk"] = mm.groupby(CITY, observed=True).cumcount() + 1
+    hot = mm[mm["rk"] <= TOPK_HOT_MONTHS][[CITY, MONTH]].copy()
+    hot["is_summer"] = 1
+
+    df0 = df0.merge(hot, on=[CITY, MONTH], how="left")
+    df0["is_summer"] = df0["is_summer"].fillna(0).astype(np.int8)
+    df = df0[df0["is_summer"] == 1].copy()
+
+    # background bins from summer T2M × VPD terciles
+    tb = df["T2M_C"].to_numpy(dtype=float)
+    vb = df["VPD_kPa"].to_numpy(dtype=float)
+    t1, t2 = np.nanpercentile(tb[np.isfinite(tb)], [33.333, 66.666])
+    v1, v2 = np.nanpercentile(vb[np.isfinite(vb)], [33.333, 66.666])
+
+    def t_bin(x):
+        if x <= t1: return "T1"
+        if x <= t2: return "T2"
+        return "T3"
+
+    def v_bin(x):
+        if x <= v1: return "V1"
+        if x <= v2: return "V2"
+        return "V3"
+
+    df["BG"] = [f"{t_bin(t)}_{v_bin(v)}" for t, v in zip(df["T2M_C"].to_numpy(), df["VPD_kPa"].to_numpy())]
+    return df.reset_index(drop=True)
+
+def build_curve_city_bootstrap(df_bg, xcol, ycol="cooling_efficiency",
+                               n_bins=25, min_city_per_bin=15, boot_n=200, rng_seed=42):
+    d = df_bg[[CITY, xcol, ycol]].copy().replace([np.inf, -np.inf], np.nan).dropna()
+    if len(d) < 500:
+        return None, None
+
+    # qcut to bins
+    d["bin"] = pd.qcut(d[xcol], q=n_bins, duplicates="drop")
+    mids = d.groupby("bin", observed=True)[xcol].median().to_numpy()
+
+    # city-bin medians
+    city_bin = (
+        d.groupby([CITY, "bin"], observed=True)[ycol]
+         .median()
+         .reset_index()
+    )
+
+    # overall median per bin
+    grp = city_bin.groupby("bin", observed=True)[ycol]
+    value = grp.median()
+    n_city = grp.count()
+
+    piv = city_bin.pivot_table(index="bin", columns=CITY, values=ycol, aggfunc="median")
+    bins = np.arange(len(piv.index))
+    if len(bins) < 5:
+        return None, None
+
+    cities = piv.columns.astype(str).to_numpy()
+    arr = piv.to_numpy(dtype=float)
+
+    rng = np.random.default_rng(rng_seed)
+    boots = np.full((boot_n, len(bins)), np.nan, dtype=float)
+    for b in range(boot_n):
+        samp = rng.integers(0, len(cities), size=len(cities))
+        boots[b, :] = np.nanmedian(arr[:, samp], axis=1)
+
+    lo = np.nanpercentile(boots, 2.5, axis=0)
+    hi = np.nanpercentile(boots, 97.5, axis=0)
+
+    out = pd.DataFrame({
+        "bin_id": bins,
+        "x_mid": np.array([mids[i] if i < len(mids) else np.nan for i in bins], dtype=float),
+        "value": value.to_numpy(dtype=float),
+        "lo": lo,
+        "hi": hi,
+        "n_city": n_city.to_numpy(dtype=float)
+    })
+    out = out[out["n_city"] >= min_city_per_bin].copy().sort_values("x_mid").reset_index(drop=True)
+    return out, city_bin
+
+def run_curves_threevars(dataset, source_name):
+    df = prepare_dataset(dataset)
+    response = {}
+    for bg in sorted(df["BG"].unique()):
+        sub_bg = df[df["BG"] == bg].copy()
+        for xcol in ["EVI", "VPD_kPa", "SSRD_MJm2"]:
+            curve_df, _ = build_curve_city_bootstrap(
+                sub_bg, xcol=xcol, ycol="cooling_efficiency",
+                n_bins=N_BINS, min_city_per_bin=MIN_CITY_PER_BIN,
+                boot_n=BOOT_N, rng_seed=RNG_SEED
+            )
+            if curve_df is not None:
+                curve_df["BG"] = bg
+                curve_df["xcol"] = xcol
+                curve_df["source"] = source_name
+                response[(bg, xcol)] = curve_df
+    return response
+
+def fit_importance(dataset, source_name, seed=42):
+    df = dataset[[CITY, DATE, Y] + FEATURES].copy()
+    df = df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
+
+    # light sample
+    if 0 < IMP_SAMPLE_FRAC < 1:
+        rng = np.random.default_rng(seed)
+        n_take = max(1000, int(len(df) * IMP_SAMPLE_FRAC))
+        n_take = min(n_take, len(df))
+        idx = rng.choice(df.index.to_numpy(), size=n_take, replace=False)
+        df = df.loc[idx].copy().reset_index(drop=True)
+
+    uniq_dates = np.array(sorted(pd.to_datetime(df[DATE]).dt.normalize().unique()))
+    if len(uniq_dates) < 5:
+        raise ValueError(f"Too few unique dates for {source_name}: {len(uniq_dates)}")
+
+    cut_idx = int(len(uniq_dates) * 0.8)
+    cut_idx = min(max(cut_idx, 1), len(uniq_dates) - 1)
+    cut_date = uniq_dates[cut_idx]
+
+    train_mask = pd.to_datetime(df[DATE]).dt.normalize() < cut_date
+    test_mask  = ~train_mask
+
+    X_train = df.loc[train_mask, FEATURES].to_numpy(dtype=np.float32)
+    y_train = df.loc[train_mask, Y].to_numpy(dtype=np.float32)
+    X_test  = df.loc[test_mask, FEATURES].to_numpy(dtype=np.float32)
+    y_test  = df.loc[test_mask, Y].to_numpy(dtype=np.float32)
+
+    if len(X_train) == 0 or len(X_test) == 0:
+        raise ValueError(
+            f"{source_name}: empty train/test split. "
+            f"train={len(X_train)}, test={len(X_test)}"
+        )
+
+    model = xgb.XGBRegressor(random_state=seed, **XGB_PARAMS)
+    model.fit(X_train, y_train)
+    pred = model.predict(X_test)
+
+    # ---- compatibility-safe metrics ----
+    mse = mean_squared_error(y_test, pred)
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_test, pred))
+    r2 = float(r2_score(y_test, pred))
+
+    booster = model.get_booster()
+    score = booster.get_score(importance_type="gain")
+    imp = pd.DataFrame({
+        "feature": FEATURES,
+        "gain": [score.get(f"f{i}", 0.0) for i in range(len(FEATURES))]
+    })
+
+    gain_sum = imp["gain"].sum()
+    if gain_sum > 0:
+        imp["gain_norm"] = imp["gain"] / gain_sum
+    else:
+        imp["gain_norm"] = 0.0
+
+    imp["source"] = source_name
+
+    metrics = {"rmse": rmse, "mae": mae, "r2": r2}
+    return imp, metrics
+
+def run_threshold(dataset, source_name):
+    df = dataset.copy()
+    need_cols = [CITY, DATE, EVI, CE, VPD, SSRD, T2M, YEAR, MONTH]
+    df = df[need_cols].dropna().copy()
+    df[DATE] = pd.to_datetime(df[DATE], errors="coerce")
+
+    # per-city cap
+    rng = np.random.default_rng(RNG_SEED)
+    parts = []
+    for _, sub in df.groupby(CITY, observed=True):
+        if len(sub) > PER_CITY_CAP:
+            idx = rng.choice(sub.index.to_numpy(), size=PER_CITY_CAP, replace=False)
+            parts.append(df.loc[idx].copy())
+        else:
+            parts.append(sub.copy())
+    df = pd.concat(parts, axis=0, ignore_index=True)
+
+    # city-specific summer months
+    base = df[(df[YEAR] >= BASELINE_YEARS[0]) & (df[YEAR] <= BASELINE_YEARS[1])].copy()
+    mm = (
+        base.groupby([CITY, MONTH], observed=True)[T2M]
+            .median()
+            .reset_index()
+            .sort_values([CITY, T2M], ascending=[True, False])
+    )
+    mm["rk"] = mm.groupby(CITY, observed=True).cumcount() + 1
+    hot = mm[mm["rk"] <= TOPK_HOT_MONTHS][[CITY, MONTH]].copy()
+    hot["is_summer"] = 1
+
+    df = df.merge(hot, on=[CITY, MONTH], how="left")
+    df["is_summer"] = df["is_summer"].fillna(0).astype(np.int8)
+    summer = df[df["is_summer"] == 1].copy()
+
+    base_s = summer[(summer[YEAR] >= BASELINE_YEARS[0]) & (summer[YEAR] <= BASELINE_YEARS[1])].copy()
+    thr = base_s.groupby(CITY, observed=True)[CE].quantile(CE_Q_ACTIVE).rename("CE_thr").reset_index()
+    summer = summer.merge(thr, on=CITY, how="left")
+    summer["active"] = (summer[CE] > summer["CE_thr"]).astype(np.int8)
+
+    # grid bins from summer distribution
+    summer["b_vpd"]  = pd.qcut(summer[VPD], q=N_BINS_VPD, duplicates="drop", labels=False)
+    summer["b_ssrd"] = pd.qcut(summer[SSRD], q=N_BINS_SSRD, duplicates="drop", labels=False)
+    summer["evi_bin"] = pd.qcut(summer[EVI], q=N_BINS_EVI, duplicates="drop", labels=False)
+    summer = summer.dropna(subset=["b_vpd","b_ssrd","evi_bin"]).copy()
+
+    # mids
+    vpd_mids = summer.groupby("b_vpd", observed=True)[VPD].median().sort_index().to_numpy()
+    ssrd_mids = summer.groupby("b_ssrd", observed=True)[SSRD].median().sort_index().to_numpy()
+
+    def compute_threshold_grid(sub_df, p0=0.50):
+        out_rows = []
+        for (bv, bs), sub in sub_df.groupby(["b_vpd", "b_ssrd"], observed=True):
+            n_city = sub[CITY].nunique()
+            if n_city < MIN_CITY_PER_CELL:
+                continue
+
+            prof = (
+                sub.groupby("evi_bin", observed=True)
+                   .agg(
+                       EVI_mid=(EVI, "median"),
+                       p_active=("active", "mean"),
+                       n=("active", "size")
+                   )
+                   .reset_index()
+                   .sort_values("EVI_mid")
+            )
+            prof = prof[prof["n"] >= MIN_SAMPLES_PER_EVI_BIN].copy()
+            if len(prof) < 3:
+                continue
+
+            thr = np.nan
+            hit = np.where(prof["p_active"].to_numpy(dtype=float) >= p0)[0]
+            if len(hit):
+                j = hit[0]
+                if j == 0:
+                    thr = float(prof.iloc[j]["EVI_mid"])
+                else:
+                    x0, y0 = float(prof.iloc[j-1]["EVI_mid"]), float(prof.iloc[j-1]["p_active"])
+                    x1, y1 = float(prof.iloc[j]["EVI_mid"]),  float(prof.iloc[j]["p_active"])
+                    thr = x1 if y1 == y0 else x0 + (p0 - y0) * (x1 - x0) / (y1 - y0)
+
+            out_rows.append({
+                "b_vpd": int(bv),
+                "b_ssrd": int(bs),
+                "VPD_mid": float(vpd_mids[int(bv)]),
+                "SSRD_mid": float(ssrd_mids[int(bs)]),
+                "evi_thr": thr,
+                "n_city": int(n_city),
+                "n_rows": int(len(sub)),
+                "source": source_name
+            })
+        return pd.DataFrame(out_rows)
+
+    grid = compute_threshold_grid(summer, p0=P0)
+    return grid
+
+# ============================================================
+# 4) RUN ORIGINAL WORKFLOW TWICE
+# ============================================================
+print("Running ERA5...")
+imp_era, met_era = fit_importance(dataset_era, "ERA5", seed=42)
+curves_era = run_curves_threevars(dataset_era, "ERA5")
+thr_era = run_threshold(dataset_era, "ERA5")
+
+print("Running MERRA-2...")
+imp_mer, met_mer = fit_importance(dataset_mer, "MERRA2", seed=43)
+curves_mer = run_curves_threevars(dataset_mer, "MERRA2")
+thr_mer = run_threshold(dataset_mer, "MERRA2")
+
+# ============================================================
+# 5) COMBINE RESULTS (ensemble layer only)
+# ============================================================
+# 2a importance
+imp = imp_era.merge(imp_mer, on="feature", suffixes=("_era", "_mer"))
+imp["gain_ens"] = imp[["gain_norm_era","gain_norm_mer"]].mean(axis=1)
+imp["gain_lo"] = imp[["gain_norm_era","gain_norm_mer"]].min(axis=1)
+imp["gain_hi"] = imp[["gain_norm_era","gain_norm_mer"]].max(axis=1)
+imp = imp.sort_values("gain_ens", ascending=True).reset_index(drop=True)
+imp.to_csv(os.path.join(OUTDIR, "fig2a_feature_importance_dual.csv"), index=False)
+
+# 2b-d curves
+curve_rows = []
+for bg_pair in BG_TO_PLOT:
+    bg = f"{bg_pair[0]}_{bg_pair[1]}"
+    for xcol in ["EVI","VPD_kPa","SSRD_MJm2"]:
+        a = curves_era.get((bg, xcol), None)
+        b = curves_mer.get((bg, xcol), None)
+        if a is None or b is None:
+            continue
+
+        n = min(len(a), len(b))
+        a = a.iloc[:n].copy().reset_index(drop=True)
+        b = b.iloc[:n].copy().reset_index(drop=True)
+
+        out = pd.DataFrame({
+            "BG": bg,
+            "xcol": xcol,
+            "x_mid": (a["x_mid"].to_numpy(dtype=float) + b["x_mid"].to_numpy(dtype=float))/2.0,
+            "value_era": a["value"].to_numpy(dtype=float),
+            "value_mer": b["value"].to_numpy(dtype=float),
+            "value_ens": (a["value"].to_numpy(dtype=float) + b["value"].to_numpy(dtype=float))/2.0,
+            "lo_ens": np.minimum(a["value"].to_numpy(dtype=float), b["value"].to_numpy(dtype=float)),
+            "hi_ens": np.maximum(a["value"].to_numpy(dtype=float), b["value"].to_numpy(dtype=float)),
+        })
+        curve_rows.append(out)
+
+curve_ens = pd.concat(curve_rows, axis=0, ignore_index=True)
+curve_ens.to_csv(os.path.join(OUTDIR, "fig2bcd_curves_dual.csv"), index=False)
+
+# 2e threshold
+thr = thr_era.merge(
+    thr_mer[["b_vpd","b_ssrd","evi_thr"]].rename(columns={"evi_thr":"evi_thr_mer"}),
+    on=["b_vpd","b_ssrd"], how="inner"
+)
+thr = thr.rename(columns={"evi_thr":"evi_thr_era"})
+thr["evi_thr_ens"] = thr[["evi_thr_era","evi_thr_mer"]].mean(axis=1)
+thr["evi_thr_lo"] = thr[["evi_thr_era","evi_thr_mer"]].min(axis=1)
+thr["evi_thr_hi"] = thr[["evi_thr_era","evi_thr_mer"]].max(axis=1)
+thr.to_csv(os.path.join(OUTDIR, "fig2e_threshold_dual.csv"), index=False)
+
+# ============================================================
+# 6) PLOT FIGURE
+# ============================================================
+plt.rcParams.update({
+    "font.family": "DejaVu Serif",
+    "font.size": 12,
+    "axes.titlesize": 15,
+    "axes.labelsize": 13,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "legend.fontsize": 10.8,
+    "axes.edgecolor": "#666666",
+    "axes.linewidth": 0.8,
+})
+
+fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor="white")
+gs = GridSpec(
+    3, 4, figure=fig,
+    height_ratios=[1.05, 1.0, 1.15],
+    width_ratios=[1.20, 1.0, 1.0, 1.08],
+    left=0.06, right=0.88, top=0.96, bottom=0.07,
+    wspace=0.36, hspace=0.42
+)
+
+# (a) importance
+ax_a = fig.add_subplot(gs[:, 0])
+lab_map = {
+    "DIST_WATER_km":"Dist. water", "WIND10M_MS":"Wind", "SSRD_MJm2":"SSRD",
+    "SWVL1_m3m3":"Soil moisture", "STL1_C":"Soil temp.", "VPD_kPa":"VPD",
+    "T2M_C":"Air temp.", "TD_C":"Dew point", "LC":"Land cover",
+    "DEM":"Elevation", "EVI":"EVI", "LAI":"LAI", "TP_mm":"Precip."
+}
+imp["label"] = imp["feature"].map(lab_map).fillna(imp["feature"])
+yy = np.arange(len(imp))
+
+ax_a.barh(yy, imp["gain_ens"], color=C_BAND, edgecolor="none", height=0.70, zorder=1)
+for i, r in imp.iterrows():
+    ax_a.hlines(i, r["gain_lo"], r["gain_hi"], color=C_ENS, lw=2.0, zorder=2)
+ax_a.scatter(imp["gain_norm_era"], yy, color=C_ERA, s=28, zorder=3, label="ERA5")
+ax_a.scatter(imp["gain_norm_mer"], yy, color=C_MER, s=28, marker="s", zorder=3, label="MERRA-2")
+
+ax_a.set_yticks(yy)
+ax_a.set_yticklabels(imp["label"])
+ax_a.set_xlabel("Normalized gain importance")
+ax_a.set_title("(a) Predictor importance", loc="left")
+ax_a.grid(True, axis="x", color=C_GRID, lw=0.8)
+ax_a.spines["top"].set_visible(False)
+ax_a.spines["right"].set_visible(False)
+
+ax_a.text(
+    0.02, 0.02,
+    f"ERA5: RMSE={met_era['rmse']:.2f}, MAE={met_era['mae']:.2f}, R²={met_era['r2']:.2f}\n"
+    f"MERRA-2: RMSE={met_mer['rmse']:.2f}, MAE={met_mer['mae']:.2f}, R²={met_mer['r2']:.2f}",
+    transform=ax_a.transAxes, ha="left", va="bottom", fontsize=10.0,
+    bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.9)
+)
+
+# (b)(c)(d) one background per row
+axes_map = {
+    "EVI": fig.add_subplot(gs[0, 1:3]),
+    "VPD_kPa": fig.add_subplot(gs[1, 1:3]),
+    "SSRD_MJm2": fig.add_subplot(gs[2, 1:3]),
+}
+titles = {
+    "EVI": "(b) Cooling capacity vs EVI",
+    "VPD_kPa": "(c) Cooling capacity vs VPD",
+    "SSRD_MJm2": "(d) Cooling capacity vs SSRD",
+}
+xlabels = {
+    "EVI": "EVI",
+    "VPD_kPa": "VPD (kPa)",
+    "SSRD_MJm2": "SSRD (MJ m$^{-2}$)",
+}
+plot_bg = {
+    "EVI": "T2_V2",
+    "VPD_kPa": "T2_V2",
+    "SSRD_MJm2": "T2_V2",
+}
+
+for xcol, ax in axes_map.items():
+    sub = curve_ens[(curve_ens["xcol"] == xcol) & (curve_ens["BG"] == plot_bg[xcol])].copy()
+    ax.fill_between(sub["x_mid"], sub["lo_ens"], sub["hi_ens"], color=C_BAND, alpha=0.9, zorder=1)
+    ax.plot(sub["x_mid"], sub["value_ens"], color=C_ENS, lw=2.4, zorder=3)
+    ax.plot(sub["x_mid"], sub["value_era"], color=C_ERA, lw=1.4, zorder=2)
+    ax.plot(sub["x_mid"], sub["value_mer"], color=C_MER, lw=1.4, ls="--", zorder=2)
+
+    ax.set_title(titles[xcol], loc="left")
+    ax.set_xlabel(xlabels[xcol])
+    ax.set_ylabel("Cooling capacity (°C per unit EVI)")
+    ax.grid(True, axis="y", color=C_GRID, lw=0.8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+axes_map["EVI"].legend(
+    handles=[
+        Patch(facecolor=C_BAND, edgecolor="none", label="ERA5–MERRA range"),
+        Line2D([0],[0], color=C_ENS, lw=2.4, label="Ensemble mean"),
+        Line2D([0],[0], color=C_ERA, lw=1.4, label="ERA5"),
+        Line2D([0],[0], color=C_MER, lw=1.4, ls="--", label="MERRA-2"),
+    ],
+    frameon=False, loc="upper left", bbox_to_anchor=(1.02, 1.02)
+)
+
+# (e) threshold heatmap
+ax_e = fig.add_subplot(gs[:, 3])
+
+v_vals = np.sort(thr["VPD_mid"].unique())
+s_vals = np.sort(thr["SSRD_mid"].unique())
+Z = np.full((len(s_vals), len(v_vals)), np.nan)
+
+for _, r in thr.iterrows():
+    iv = np.where(v_vals == r["VPD_mid"])[0]
+    isr = np.where(s_vals == r["SSRD_mid"])[0]
+    if len(iv) and len(isr):
+        Z[isr[0], iv[0]] = r["evi_thr_ens"]
+
+Xg, Yg = np.meshgrid(v_vals, s_vals)
+cf = ax_e.contourf(Xg, Yg, Z, levels=12, cmap="coolwarm")
+
+try:
+    cs = ax_e.contour(Xg, Yg, Z, levels=[0.16, 0.27, 0.38], colors="k", linewidths=1.0)
+    ax_e.clabel(cs, inline=True, fontsize=8.8, fmt="%.2f")
+except Exception:
+    pass
+
+ax_e.set_title("(e) EVI activation threshold\nfor P(active)=0.50", loc="left")
+ax_e.set_xlabel("VPD (kPa)")
+ax_e.set_ylabel("SSRD (MJ m$^{-2}$)")
+ax_e.spines["top"].set_visible(False)
+ax_e.spines["right"].set_visible(False)
+
+cbar = fig.colorbar(cf, ax=ax_e, fraction=0.05, pad=0.04)
+cbar.set_label("Threshold EVI")
+
+fig.suptitle(
+    "Climate-conditioned and nonlinear controls on vegetation cooling capacity",
+    y=0.992, fontsize=18
+)
+
+png_fp = os.path.join(OUTDIR, "fig2_two_member_minchange.png")
+pdf_fp = os.path.join(OUTDIR, "fig2_two_member_minchange.pdf")
+svg_fp = os.path.join(OUTDIR, "fig2_two_member_minchange.svg")
+
+fig.savefig(png_fp, dpi=DPI, bbox_inches="tight", facecolor="white")
+fig.savefig(pdf_fp, dpi=600, bbox_inches="tight", facecolor="white")
+fig.savefig(svg_fp, bbox_inches="tight", facecolor="white")
+plt.show()
+
+print("Saved:")
+print(png_fp)
+print(pdf_fp)
+print(svg_fp)
+print(os.path.join(OUTDIR, "fig2a_feature_importance_dual.csv"))
+print(os.path.join(OUTDIR, "fig2bcd_curves_dual.csv"))
+print(os.path.join(OUTDIR, "fig2e_threshold_dual.csv"))
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Fig. 2 re-plot only
+# New layout:
+# Row 1: a | b
+# Row 2: c | d
+# Row 3: e (full width)
+# No recalculation
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+from matplotlib.gridspec import GridSpec
+
+# =========================
+# 0) paths
+# =========================
+OUTDIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/fig2_revised_minchange"
+IMP_FP = os.path.join(OUTDIR, "fig2a_feature_importance_dual.csv")
+CURVE_FP = os.path.join(OUTDIR, "fig2bcd_curves_dual.csv")
+THR_FP = os.path.join(OUTDIR, "fig2e_threshold_dual.csv")
+
+SAVE_PNG = os.path.join(OUTDIR, "fig2_two_member_relayout_ab_cd_e.png")
+SAVE_PDF = os.path.join(OUTDIR, "fig2_two_member_relayout_ab_cd_e.pdf")
+SAVE_SVG = os.path.join(OUTDIR, "fig2_two_member_relayout_ab_cd_e.svg")
+
+# 如果你有实际 metrics，可填入；没有就保持 None
+ERA_RMSE = None
+ERA_MAE  = None
+ERA_R2   = None
+MER_RMSE = None
+MER_MAE  = None
+MER_R2   = None
+
+PLOT_BG = "T2_V2"
+
+# =========================
+# 1) figure settings
+# =========================
+DPI = 600
+FIG_W = 25
+FIG_H = 40   # 整体拉长
+
+C_ERA = "#2C7FB8"
+C_MER = "#C05A78"
+C_ENS = "#2E2E2E"
+C_BAND = "#D9DEE8"
+C_GRID = "#E8ECF3"
+
+LAB_MAP = {
+    "DIST_WATER_km":"Dist. water",
+    "WIND10M_MS":"Wind",
+    "SSRD_MJm2":"SSRD",
+    "SWVL1_m3m3":"Soil moisture",
+    "STL1_C":"Soil temp.",
+    "VPD_kPa":"VPD",
+    "T2M_C":"Air temp.",
+    "TD_C":"Dew point",
+    "LC":"Land cover",
+    "DEM":"Elevation",
+    "EVI":"EVI",
+    "LAI":"LAI",
+    "TP_mm":"Precip."
+}
+
+# =========================
+# 2) load outputs
+# =========================
+imp = pd.read_csv(IMP_FP)
+curve_ens = pd.read_csv(CURVE_FP)
+thr = pd.read_csv(THR_FP)
+
+imp["label"] = imp["feature"].map(LAB_MAP).fillna(imp["feature"])
+imp = imp.sort_values("gain_ens", ascending=True).reset_index(drop=True)
+
+# =========================
+# 3) style
+# =========================
+plt.rcParams.update({
+    "font.family": "DejaVu Serif",
+    "font.size": 14,
+    "axes.titlesize": 20,
+    "axes.labelsize": 18,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 12.5,
+    "legend.fontsize": 15,
+    "axes.edgecolor": "#666666",
+    "axes.linewidth": 0.8,
+})
+
+fig = plt.figure(figsize=(FIG_W, FIG_H), facecolor="white")
+
+# 两列三行布局；最后一行 e 横跨两列
+gs = GridSpec(
+    3, 2, figure=fig,
+    height_ratios=[1.10, 1.05, 1.30],
+    width_ratios=[1.08, 1.00],
+    left=0.07, right=0.88, top=0.95, bottom=0.08,
+    wspace=0.42,
+    hspace=0.62
+)
+
+# =========================
+# 4) panel (a)
+# =========================
+ax_a = fig.add_subplot(gs[0, 0])
+
+yy = np.arange(len(imp))
+ax_a.barh(yy, imp["gain_ens"], color=C_BAND, edgecolor="none", height=0.64, zorder=1)
+
+for i, r in imp.iterrows():
+    ax_a.hlines(i, r["gain_lo"], r["gain_hi"], color=C_ENS, lw=2.0, zorder=2)
+
+ax_a.scatter(imp["gain_norm_era"], yy, color=C_ERA, s=28, zorder=3)
+ax_a.scatter(imp["gain_norm_mer"], yy, color=C_MER, s=28, marker="s", zorder=3)
+
+ax_a.set_yticks(yy)
+ax_a.set_yticklabels(imp["label"])
+ax_a.set_xlabel("Normalized gain importance", labelpad=8)
+ax_a.set_title("(a) Predictor importance", loc="left", pad=10)
+ax_a.grid(True, axis="x", color=C_GRID, lw=0.8)
+ax_a.spines["top"].set_visible(False)
+ax_a.spines["right"].set_visible(False)
+
+# a 的图例放右边空白区，不压 b
+ax_a.legend(
+    handles=[
+        Patch(facecolor=C_BAND, edgecolor="none", label="Ensemble mean"),
+        Line2D([0],[0], color=C_ENS, lw=2.0, label="ERA5–MERRA spread"),
+        Line2D([0],[0], marker="o", color="none", markerfacecolor=C_ERA, markersize=7, label="ERA5"),
+        Line2D([0],[0], marker="s", color="none", markerfacecolor=C_MER, markersize=7, label="MERRA-2"),
+    ],
+    frameon=False,
+    loc="upper left",
+    bbox_to_anchor=(1.02, 1.00),
+    borderaxespad=0.0
+)
+
+# =========================
+# 5) panel (b)
+# =========================
+ax_b = fig.add_subplot(gs[0, 1])
+
+sub = curve_ens[(curve_ens["xcol"] == "EVI") & (curve_ens["BG"] == PLOT_BG)].copy().sort_values("x_mid")
+ax_b.fill_between(sub["x_mid"], sub["lo_ens"], sub["hi_ens"], color=C_BAND, alpha=0.90, zorder=1)
+ax_b.plot(sub["x_mid"], sub["value_ens"], color=C_ENS, lw=2.4, zorder=3)
+ax_b.plot(sub["x_mid"], sub["value_era"], color=C_ERA, lw=1.5, zorder=2)
+ax_b.plot(sub["x_mid"], sub["value_mer"], color=C_MER, lw=1.5, ls="--", zorder=2)
+
+ax_b.set_title("(b) Cooling capacity vs EVI", loc="left", pad=10)
+ax_b.set_xlabel("EVI", labelpad=8)
+ax_b.set_ylabel("Cooling capacity\n(°C per unit EVI)", labelpad=10)
+ax_b.grid(True, axis="y", color=C_GRID, lw=0.8)
+ax_b.spines["top"].set_visible(False)
+ax_b.spines["right"].set_visible(False)
+
+# b 的图例放外侧右上
+ax_b.legend(
+    handles=[
+        Patch(facecolor=C_BAND, edgecolor="none", label="ERA5–MERRA range"),
+        Line2D([0],[0], color=C_ENS, lw=2.4, label="Ensemble mean"),
+        Line2D([0],[0], color=C_ERA, lw=1.5, label="ERA5"),
+        Line2D([0],[0], color=C_MER, lw=1.5, ls="--", label="MERRA-2"),
+    ],
+    frameon=False,
+    loc="upper left",
+    bbox_to_anchor=(1.02, 1.00),
+    borderaxespad=0.0
+)
+
+# =========================
+# 6) panel (c)
+# =========================
+ax_c = fig.add_subplot(gs[1, 0])
+
+sub = curve_ens[(curve_ens["xcol"] == "VPD_kPa") & (curve_ens["BG"] == PLOT_BG)].copy().sort_values("x_mid")
+ax_c.fill_between(sub["x_mid"], sub["lo_ens"], sub["hi_ens"], color=C_BAND, alpha=0.90, zorder=1)
+ax_c.plot(sub["x_mid"], sub["value_ens"], color=C_ENS, lw=2.4, zorder=3)
+ax_c.plot(sub["x_mid"], sub["value_era"], color=C_ERA, lw=1.5, zorder=2)
+ax_c.plot(sub["x_mid"], sub["value_mer"], color=C_MER, lw=1.5, ls="--", zorder=2)
+
+ax_c.set_title("(c) Cooling capacity vs VPD", loc="left", pad=10)
+ax_c.set_xlabel("VPD (kPa)", labelpad=8)
+ax_c.set_ylabel("Cooling capacity\n(°C per unit EVI)", labelpad=10)
+ax_c.grid(True, axis="y", color=C_GRID, lw=0.8)
+ax_c.spines["top"].set_visible(False)
+ax_c.spines["right"].set_visible(False)
+
+# =========================
+# 7) panel (d)
+# =========================
+ax_d = fig.add_subplot(gs[1, 1])
+
+sub = curve_ens[(curve_ens["xcol"] == "SSRD_MJm2") & (curve_ens["BG"] == PLOT_BG)].copy().sort_values("x_mid")
+ax_d.fill_between(sub["x_mid"], sub["lo_ens"], sub["hi_ens"], color=C_BAND, alpha=0.90, zorder=1)
+ax_d.plot(sub["x_mid"], sub["value_ens"], color=C_ENS, lw=2.4, zorder=3)
+ax_d.plot(sub["x_mid"], sub["value_era"], color=C_ERA, lw=1.5, zorder=2)
+ax_d.plot(sub["x_mid"], sub["value_mer"], color=C_MER, lw=1.5, ls="--", zorder=2)
+
+ax_d.set_title("(d) Cooling capacity vs SSRD", loc="left", pad=10)
+ax_d.set_xlabel("SSRD (MJ m$^{-2}$)", labelpad=8)
+ax_d.set_ylabel("Cooling capacity\n(°C per unit EVI)", labelpad=10)
+ax_d.grid(True, axis="y", color=C_GRID, lw=0.8)
+ax_d.spines["top"].set_visible(False)
+ax_d.spines["right"].set_visible(False)
+
+# =========================
+# 8) panel (e)
+# =========================
+ax_e = fig.add_subplot(gs[2, :])
+
+v_vals = np.sort(thr["VPD_mid"].unique())
+s_vals = np.sort(thr["SSRD_mid"].unique())
+Z = np.full((len(s_vals), len(v_vals)), np.nan)
+
+for _, r in thr.iterrows():
+    iv = np.where(v_vals == r["VPD_mid"])[0]
+    isr = np.where(s_vals == r["SSRD_mid"])[0]
+    if len(iv) and len(isr):
+        Z[isr[0], iv[0]] = r["evi_thr_ens"]
+
+Xg, Yg = np.meshgrid(v_vals, s_vals)
+cf = ax_e.contourf(Xg, Yg, Z, levels=12, cmap="coolwarm")
+
+try:
+    cs = ax_e.contour(Xg, Yg, Z, levels=[0.16, 0.27, 0.38], colors="k", linewidths=0.95)
+    ax_e.clabel(cs, inline=True, fontsize=8.5, fmt="%.2f")
+except Exception:
+    pass
+
+ax_e.set_title("(e) EVI activation threshold for P(active)=0.50", loc="left", pad=10)
+ax_e.set_xlabel("VPD (kPa)", labelpad=8)
+ax_e.set_ylabel("SSRD (MJ m$^{-2}$)", labelpad=10)
+ax_e.spines["top"].set_visible(False)
+ax_e.spines["right"].set_visible(False)
+
+# e 的 colorbar 单独留在右边
+cbar = fig.colorbar(cf, ax=ax_e, fraction=0.022, pad=0.03)
+cbar.set_label("Threshold EVI")
+
+# =========================
+# 9) figure-level text
+# =========================
+fig.suptitle(
+    "Climate-conditioned and nonlinear controls on vegetation cooling capacity",
+    y=0.975, fontsize=18
+)
+
+metric_lines = []
+if None not in [ERA_RMSE, ERA_MAE, ERA_R2]:
+    metric_lines.append(f"ERA5 model: RMSE = {ERA_RMSE:.2f}, MAE = {ERA_MAE:.2f}, R² = {ERA_R2:.2f}")
+if None not in [MER_RMSE, MER_MAE, MER_R2]:
+    metric_lines.append(f"MERRA-2 model: RMSE = {MER_RMSE:.2f}, MAE = {MER_MAE:.2f}, R² = {MER_R2:.2f}")
+
+if metric_lines:
+    fig.text(
+        0.07, 0.03,
+        "   |   ".join(metric_lines),
+        ha="left", va="bottom", fontsize=10.5
+    )
+
+# =========================
+# 10) save
+# =========================
+fig.savefig(SAVE_PNG, dpi=DPI, bbox_inches="tight", facecolor="white")
+fig.savefig(SAVE_PDF, dpi=600, bbox_inches="tight", facecolor="white")
+fig.savefig(SAVE_SVG, bbox_inches="tight", facecolor="white")
+
+plt.show()
+
+print("Saved:")
+print(SAVE_PNG)
+print(SAVE_PDF)
+print(SAVE_SVG)
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Fig. 3 (corrected version)
+# Key fix:
+#   VPD bins are computed WITHIN each SSRD group,
+#   not globally across all summer samples.
+# ============================================================
+
+import os
+import json
+import gc
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+# ============================================================
+# 0) Config
+# ============================================================
+FULL_FP = "/content/drive/MyDrive/Second_research/MERRA/hybrid/GlobalUrbanCooling_dataset_v2_dualCE_full.parquet"
+OUTDIR  = "/content/drive/MyDrive/Second_research/MERRA/hybrid/fig3_revised_maintext_groupwiseVPD"
+os.makedirs(OUTDIR, exist_ok=True)
+
+TARGET_CE = "cooling_efficiency"
+COL_CITY  = "city"
+COL_DATE  = "date"
+COL_T2M   = "T2M_C"
+COL_VPD   = "VPD_kPa"
+COL_SSRD  = "SSRD_MJm2"
+
+BASELINE_Y0, BASELINE_Y1 = 2002, 2006
+HOTTEST_N_MONTHS = 2
+HIGH_Q_CITY = 0.80
+VPD_BINS = 18
+CE_Q = 0.90
+
+DPI = 600
+FIG_W = 14.5
+FIG_H = 6.4
+
+# colors: match your old figure style more closely
+COLORS = {
+    "low":  "#F1A3B5",   # pink
+    "mid":  "#8EC5EB",   # light blue
+    "high": "#2C7FB8"    # deep blue
+}
+LINECOL = {
+    "low":  "#D97C93",
+    "mid":  "#79B7E3",
+    "high": "#2C7FB8"
+}
+NAME_MAP = {"low":"SSRD_low", "mid":"SSRD_mid", "high":"SSRD_high"}
+
+# ============================================================
+# 1) Load data
+# ============================================================
+df_all = pd.read_parquet(FULL_FP).copy()
+df_all[COL_DATE] = pd.to_datetime(df_all[COL_DATE], errors="coerce")
+df_all["year"] = df_all[COL_DATE].dt.year.astype("Int16")
+df_all["month"] = df_all[COL_DATE].dt.month.astype("Int8")
+
+need_cols = [
+    COL_CITY, COL_DATE, "year", "month",
+    "cooling_efficiency_ERA5", "cooling_efficiency_MERRA2",
+    "T2M_C", "VPD_kPa", "SSRD_MJm2",
+    "MERRA2hyb_T2M_C", "MERRA2hyb_VPD_kPa", "MERRA2hyb_SSRD_MJm2"
+]
+miss = [c for c in need_cols if c not in df_all.columns]
+if miss:
+    raise ValueError(f"Missing required columns: {miss}")
+
+common_cols = [COL_CITY, COL_DATE, "year", "month"]
+
+df_era = df_all[common_cols + [
+    "cooling_efficiency_ERA5", "T2M_C", "VPD_kPa", "SSRD_MJm2"
+]].copy().rename(columns={"cooling_efficiency_ERA5": TARGET_CE})
+
+df_mer = df_all[common_cols + [
+    "cooling_efficiency_MERRA2",
+    "MERRA2hyb_T2M_C", "MERRA2hyb_VPD_kPa", "MERRA2hyb_SSRD_MJm2"
+]].copy().rename(columns={
+    "cooling_efficiency_MERRA2": TARGET_CE,
+    "MERRA2hyb_T2M_C": COL_T2M,
+    "MERRA2hyb_VPD_kPa": COL_VPD,
+    "MERRA2hyb_SSRD_MJm2": COL_SSRD
+})
+
+del df_all
+gc.collect()
+
+# ============================================================
+# 2) Helper functions
+# ============================================================
+def define_city_summer(df):
+    base = df[(df["year"] >= BASELINE_Y0) & (df["year"] <= BASELINE_Y1)].copy()
+
+    mm = (
+        base.groupby([COL_CITY, "month"], as_index=False)[COL_T2M]
+            .mean()
+            .sort_values([COL_CITY, COL_T2M], ascending=[True, False])
+    )
+    mm["rk"] = mm.groupby(COL_CITY).cumcount() + 1
+    hot = mm[mm["rk"] <= HOTTEST_N_MONTHS][[COL_CITY, "month"]].copy()
+    hot["is_summer"] = 1
+
+    out = df.merge(hot, on=[COL_CITY, "month"], how="left")
+    out["is_summer"] = out["is_summer"].fillna(0).astype(int)
+    return out[out["is_summer"] == 1].copy()
+
+def add_highce_flag(df_s):
+    thr = (
+        df_s.groupby(COL_CITY)[TARGET_CE]
+            .quantile(HIGH_Q_CITY)
+            .rename("thr_highce")
+            .reset_index()
+    )
+    out = df_s.merge(thr, on=COL_CITY, how="left")
+    out["HighCE"] = (out[TARGET_CE] >= out["thr_highce"]).astype(int)
+    return out
+
+def add_ssrd_group(df_s):
+    q1, q2 = df_s[COL_SSRD].quantile([1/3, 2/3]).to_list()
+
+    def lab(v):
+        if v <= q1:
+            return "low"
+        elif v <= q2:
+            return "mid"
+        else:
+            return "high"
+
+    out = df_s.copy()
+    out["SSRD_group"] = out[COL_SSRD].map(lab)
+    return out
+
+def summarize_window_metrics_groupwise_vpd(df_s):
+    """
+    Critical fix:
+    qcut VPD separately WITHIN each SSRD group
+    """
+    rows = []
+
+    for g, sub in df_s.groupby("SSRD_group"):
+        sub = sub.copy()
+        sub["vpd_bin"] = pd.qcut(sub[COL_VPD], q=VPD_BINS, duplicates="drop")
+
+        tmp = (
+            sub.groupby("vpd_bin", observed=True)
+               .agg(
+                   CE_p90=(TARGET_CE, lambda x: float(np.quantile(x, CE_Q))),
+                   Pr_HighCE=("HighCE", "mean"),
+                   n=(TARGET_CE, "size"),
+                   VPD_mid=(COL_VPD, "median")
+               )
+               .reset_index()
+               .sort_values("VPD_mid")
+        )
+        tmp["SSRD_group"] = g
+        tmp["bin_id"] = np.arange(len(tmp))
+        rows.append(tmp)
+
+    out = pd.concat(rows, axis=0, ignore_index=True)
+    return out
+
+def run_fig3_core(df_in, source_name):
+    d = df_in.copy()
+    d = d.replace([np.inf, -np.inf], np.nan).dropna(subset=[COL_CITY, COL_DATE, TARGET_CE, COL_T2M, COL_VPD, COL_SSRD]).copy()
+
+    d_s = define_city_summer(d)
+    d_s = add_highce_flag(d_s)
+    d_s = add_ssrd_group(d_s)
+    out = summarize_window_metrics_groupwise_vpd(d_s)
+    out["source"] = source_name
+
+    print(f"{source_name}: summer rows = {len(d_s):,}, cities = {d_s[COL_CITY].nunique()}, output rows = {len(out)}")
+    print(out.groupby("SSRD_group").size())
+
+    return out, d_s
+
+# ============================================================
+# 3) Run ERA5 / MERRA2
+# ============================================================
+res_era, df_s_era = run_fig3_core(df_era, "ERA5")
+res_mer, df_s_mer = run_fig3_core(df_mer, "MERRA2")
+
+res_era.to_csv(os.path.join(OUTDIR, "fig3_metrics_ERA5.csv"), index=False)
+res_mer.to_csv(os.path.join(OUTDIR, "fig3_metrics_MERRA2.csv"), index=False)
+
+# ============================================================
+# 4) Ensemble combine
+# ============================================================
+ens = res_era.merge(
+    res_mer[["SSRD_group", "bin_id", "CE_p90", "Pr_HighCE", "VPD_mid"]],
+    on=["SSRD_group", "bin_id"],
+    suffixes=("_era", "_mer"),
+    how="inner"
+)
+
+print("ensemble rows:", len(ens))
+print(ens.groupby("SSRD_group").size())
+
+if ens.empty:
+    raise ValueError("Ensemble table is empty after merge.")
+
+ens["VPD_mid"] = (ens["VPD_mid_era"] + ens["VPD_mid_mer"]) / 2.0
+
+ens["CE_p90_ens"] = (ens["CE_p90_era"] + ens["CE_p90_mer"]) / 2.0
+ens["CE_p90_lo"]  = np.minimum(ens["CE_p90_era"], ens["CE_p90_mer"])
+ens["CE_p90_hi"]  = np.maximum(ens["CE_p90_era"], ens["CE_p90_mer"])
+
+ens["Pr_HighCE_ens"] = (ens["Pr_HighCE_era"] + ens["Pr_HighCE_mer"]) / 2.0
+ens["Pr_HighCE_lo"]  = np.minimum(ens["Pr_HighCE_era"], ens["Pr_HighCE_mer"])
+ens["Pr_HighCE_hi"]  = np.maximum(ens["Pr_HighCE_era"], ens["Pr_HighCE_mer"])
+
+ens.to_csv(os.path.join(OUTDIR, "fig3_metrics_ensemble.csv"), index=False)
+
+# ============================================================
+# 5) Plot
+# ============================================================
+plt.rcParams.update({
+    "font.family": "DejaVu Serif",
+    "font.size": 12,
+    "axes.titlesize": 15,
+    "axes.labelsize": 13,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "legend.fontsize": 10.8,
+    "axes.edgecolor": "#666666",
+    "axes.linewidth": 0.8,
+})
+
+fig, ax = plt.subplots(
+    1, 2, figsize=(FIG_W, FIG_H),
+    gridspec_kw={"wspace": 0.32}
+)
+
+order = ["low", "mid", "high"]
+
+for g in order:
+    sub = ens[ens["SSRD_group"] == g].sort_values("VPD_mid").copy()
+    if sub.empty:
+        continue
+
+    # left: potential
+    ax[0].fill_between(
+        sub["VPD_mid"], sub["CE_p90_lo"], sub["CE_p90_hi"],
+        color=COLORS[g], alpha=0.18, linewidth=0
+    )
+    ax[0].plot(sub["VPD_mid"], sub["CE_p90_ens"], color=LINECOL[g], lw=2.2, marker="o", ms=3.5, label=NAME_MAP[g])
+    ax[0].plot(sub["VPD_mid"], sub["CE_p90_era"], color=LINECOL[g], lw=1.0, alpha=0.85)
+    ax[0].plot(sub["VPD_mid"], sub["CE_p90_mer"], color=LINECOL[g], lw=1.0, alpha=0.85, ls="--")
+
+    # right: attainability
+    ax[1].fill_between(
+        sub["VPD_mid"], sub["Pr_HighCE_lo"], sub["Pr_HighCE_hi"],
+        color=COLORS[g], alpha=0.18, linewidth=0
+    )
+    ax[1].plot(sub["VPD_mid"], sub["Pr_HighCE_ens"], color=LINECOL[g], lw=2.2, marker="o", ms=3.5, label=NAME_MAP[g])
+    ax[1].plot(sub["VPD_mid"], sub["Pr_HighCE_era"], color=LINECOL[g], lw=1.0, alpha=0.85)
+    ax[1].plot(sub["VPD_mid"], sub["Pr_HighCE_mer"], color=LINECOL[g], lw=1.0, alpha=0.85, ls="--")
+
+ax[0].set_title("(a) Potential: CE upper envelope (P90) vs VPD", loc="left", pad=10)
+ax[0].set_xlabel("VPD (kPa) [city-summer]")
+ax[0].set_ylabel("P90(cooling efficiency)")
+ax[0].grid(True, alpha=0.22)
+ax[0].spines["top"].set_visible(False)
+ax[0].spines["right"].set_visible(False)
+
+ax[1].set_title("(b) Attainability: Pr(HighCE) vs VPD", loc="left", pad=10)
+ax[1].set_xlabel("VPD (kPa) [city-summer]")
+ax[1].set_ylabel("Pr(HighCE)")
+ax[1].grid(True, alpha=0.22)
+ax[1].spines["top"].set_visible(False)
+ax[1].spines["right"].set_visible(False)
+
+# radiation legend
+ax[1].legend(
+    frameon=False,
+    loc="center left",
+    bbox_to_anchor=(1.02, 0.5),
+    title="Radiation regimes"
+)
+
+# style legend
+style_handles = [
+    Line2D([0],[0], color="black", lw=2.2, label="Ensemble mean"),
+    Line2D([0],[0], color="black", lw=1.0, label="ERA5"),
+    Line2D([0],[0], color="black", lw=1.0, ls="--", label="MERRA-2"),
+    Patch(facecolor="#CCCCCC", alpha=0.18, edgecolor="none", label="ERA5–MERRA range")
+]
+ax[0].legend(
+    handles=style_handles,
+    frameon=False,
+    loc="upper left",
+    bbox_to_anchor=(0.0, -0.20),
+    ncol=2
+)
+
+fig.suptitle(
+    "Climatic feasibility of high urban vegetation cooling efficiency",
+    y=0.98, fontsize=17
+)
+
+plt.tight_layout(rect=[0.02, 0.05, 0.95, 0.95])
+
+png_fp = os.path.join(OUTDIR, "fig3_two_member_groupwiseVPD.png")
+pdf_fp = os.path.join(OUTDIR, "fig3_two_member_groupwiseVPD.pdf")
+svg_fp = os.path.join(OUTDIR, "fig3_two_member_groupwiseVPD.svg")
+
+fig.savefig(png_fp, dpi=DPI, bbox_inches="tight", facecolor="white")
+fig.savefig(pdf_fp, dpi=600, bbox_inches="tight", facecolor="white")
+fig.savefig(svg_fp, bbox_inches="tight", facecolor="white")
+plt.show()
+
+print("Saved:")
+print(png_fp)
+print(pdf_fp)
+print(svg_fp)
+print(os.path.join(OUTDIR, "fig3_metrics_ERA5.csv"))
+print(os.path.join(OUTDIR, "fig3_metrics_MERRA2.csv"))
+print(os.path.join(OUTDIR, "fig3_metrics_ensemble.csv"))
+
+# methods log
+methods_log = {
+    "figure": "Fig. 3",
+    "summer_definition": {
+        "baseline_years": [BASELINE_Y0, BASELINE_Y1],
+        "hottest_months_N": HOTTEST_N_MONTHS,
+        "method": "city-specific hottest-N months by baseline mean T2M_C"
+    },
+    "HighCE_definition": {
+        "within_city_quantile": HIGH_Q_CITY,
+        "label": "HighCE = 1(CE >= city summer quantile)"
+    },
+    "window_metrics": {
+        "VPD_bins": VPD_BINS,
+        "group_by": "SSRD terciles within summer subset",
+        "VPD_binning": "within each SSRD group",
+        "CE_upper_quantile": CE_Q
+    }
+}
+with open(os.path.join(OUTDIR, "fig3_methods_log.json"), "w", encoding="utf-8") as f:
+    json.dump(methods_log, f, ensure_ascii=False, indent=2)
+
+# -*- coding: utf-8 -*-
+# ============================================================
+# Fig. 6 re-plot only (beautified quadrant-color version)
+# No recalculation
+# ============================================================
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch, Rectangle
+
+# =========================
+# 0) paths
+# =========================
+OUTDIR = "/content/drive/MyDrive/Second_research/MERRA/hybrid/fig4_5_6_revised_maintext"
+FP = os.path.join(OUTDIR, "fig6_city_divergence_ensemble.csv")
+
+SAVE_PNG = os.path.join(OUTDIR, "fig6_two_member_beautified.png")
+SAVE_PDF = os.path.join(OUTDIR, "fig6_two_member_beautified.pdf")
+SAVE_SVG = os.path.join(OUTDIR, "fig6_two_member_beautified.svg")
+
+# optional: annotate a few extreme cities
+ANNOTATE_TOP_N = 0
+
+# figure size
+DPI = 600
+FIG_W = 8.4
+FIG_H = 7.2
+
+# =========================
+# 1) colors
+# =========================
+# quadrant fills
+Q_FILL = {
+    "gain_both": "#D8F0D2",             # green
+    "gain_avg_loss_extreme": "#FCE1C7", # orange
+    "loss_both": "#F6D1D8",             # pink/red
+    "loss_avg_gain_extreme": "#D8E8FA", # blue
+}
+
+# point colors
+Q_POINT = {
+    "gain_both": "#4C9F50",
+    "gain_avg_loss_extreme": "#D98C2F",
+    "loss_both": "#C95A71",
+    "loss_avg_gain_extreme": "#4B83C3",
+    "missing": "#9A9A9A"
+}
+
+Q_LABEL = {
+    "gain_both": "Gain in both",
+    "gain_avg_loss_extreme": "Gain avg, loss extreme",
+    "loss_both": "Loss in both",
+    "loss_avg_gain_extreme": "Loss avg, gain extreme",
+    "missing": "Missing"
+}
+
+# =========================
+# 2) load
+# =========================
+df = pd.read_csv(FP)
+
+need = ["city", "dPr_ens", "dPr_tail_ens"]
+miss = [c for c in need if c not in df.columns]
+if miss:
+    raise ValueError(f"Missing required columns: {miss}")
+
+# if quadrant not already present, rebuild it
+def quadrant(x, y):
+    if pd.isna(x) or pd.isna(y):
+        return "missing"
+    if x >= 0 and y >= 0:
+        return "gain_both"
+    if x >= 0 and y < 0:
+        return "gain_avg_loss_extreme"
+    if x < 0 and y < 0:
+        return "loss_both"
+    return "loss_avg_gain_extreme"
+
+if "quadrant_ens" not in df.columns:
+    df["quadrant_ens"] = [quadrant(x, y) for x, y in zip(df["dPr_ens"], df["dPr_tail_ens"])]
+
+# keep finite points for plotting
+plot_df = df.dropna(subset=["dPr_ens", "dPr_tail_ens"]).copy()
+
+# =========================
+# 3) style
+# =========================
+plt.rcParams.update({
+    "font.family": "DejaVu Serif",
+    "font.size": 12,
+    "axes.titlesize": 16,
+    "axes.labelsize": 13,
+    "xtick.labelsize": 11,
+    "ytick.labelsize": 11,
+    "legend.fontsize": 10.8,
+    "axes.edgecolor": "#666666",
+    "axes.linewidth": 0.8,
+})
+
+fig, ax = plt.subplots(figsize=(FIG_W, FIG_H), facecolor="white")
+
+# =========================
+# 4) axis limits
+# =========================
+xmin = np.nanmin(plot_df["dPr_ens"])
+xmax = np.nanmax(plot_df["dPr_ens"])
+ymin = np.nanmin(plot_df["dPr_tail_ens"])
+ymax = np.nanmax(plot_df["dPr_tail_ens"])
+
+# add margins
+xpad = max(0.03, 0.08 * (xmax - xmin))
+ypad = max(0.03, 0.08 * (ymax - ymin))
+xmin -= xpad
+xmax += xpad
+ymin -= ypad
+ymax += ypad
+
+# keep symmetric-ish if wanted
+lim = max(abs(xmin), abs(xmax), abs(ymin), abs(ymax))
+xmin, xmax, ymin, ymax = -lim, lim, -lim, lim
+
+# =========================
+# 5) quadrant background
+# =========================
+# Q1: gain_both
+ax.add_patch(Rectangle((0, 0), xmax, ymax, facecolor=Q_FILL["gain_both"], alpha=0.32, edgecolor="none", zorder=0))
+# Q4: gain avg, loss extreme
+ax.add_patch(Rectangle((0, ymin), xmax, -ymin, facecolor=Q_FILL["gain_avg_loss_extreme"], alpha=0.32, edgecolor="none", zorder=0))
+# Q3: loss both
+ax.add_patch(Rectangle((xmin, ymin), -xmin, -ymin, facecolor=Q_FILL["loss_both"], alpha=0.30, edgecolor="none", zorder=0))
+# Q2: loss avg, gain extreme
+ax.add_patch(Rectangle((xmin, 0), -xmin, ymax, facecolor=Q_FILL["loss_avg_gain_extreme"], alpha=0.30, edgecolor="none", zorder=0))
+
+# =========================
+# 6) reference lines
+# =========================
+ax.axhline(0, color="#7F7F7F", lw=1.1, zorder=1)
+ax.axvline(0, color="#7F7F7F", lw=1.1, zorder=1)
+ax.plot([xmin, xmax], [xmin, xmax], ls="--", lw=1.5, color="#C73E3E", alpha=0.85, zorder=1)
+
+# =========================
+# 7) points by quadrant
+# =========================
+plot_order = ["gain_both", "gain_avg_loss_extreme", "loss_both", "loss_avg_gain_extreme"]
+
+for q in plot_order:
+    sub = plot_df[plot_df["quadrant_ens"] == q].copy()
+    if sub.empty:
+        continue
+    ax.scatter(
+        sub["dPr_ens"], sub["dPr_tail_ens"],
+        s=58,
+        color=Q_POINT[q],
+        edgecolor="white",
+        linewidth=0.7,
+        alpha=0.88,
+        zorder=3,
+        label=Q_LABEL[q]
+    )
+
+# =========================
+# 8) annotate extreme cities (optional)
+# =========================
+if ANNOTATE_TOP_N and "city" in plot_df.columns:
+    # choose cities farthest from origin
+    tmp = plot_df.copy()
+    tmp["r2"] = tmp["dPr_ens"]**2 + tmp["dPr_tail_ens"]**2
+    ann = tmp.sort_values("r2", ascending=False).head(ANNOTATE_TOP_N)
+
+    for _, r in ann.iterrows():
+        ax.text(
+            r["dPr_ens"], r["dPr_tail_ens"], str(r["city"]),
+            fontsize=9.5, ha="left", va="bottom", zorder=4
+        )
+
+# =========================
+# 9) quadrant counts
+# =========================
+qcount = plot_df["quadrant_ens"].value_counts().to_dict()
+
+def qn(name):
+    return qcount.get(name, 0)
+
+ax.text(0.98, 0.98, f"n = {qn('gain_both')}", transform=ax.transAxes,
+        ha="right", va="top", fontsize=10.5, color=Q_POINT["gain_both"])
+ax.text(0.98, 0.02, f"n = {qn('gain_avg_loss_extreme')}", transform=ax.transAxes,
+        ha="right", va="bottom", fontsize=10.5, color=Q_POINT["gain_avg_loss_extreme"])
+ax.text(0.02, 0.02, f"n = {qn('loss_both')}", transform=ax.transAxes,
+        ha="left", va="bottom", fontsize=10.5, color=Q_POINT["loss_both"])
+ax.text(0.02, 0.98, f"n = {qn('loss_avg_gain_extreme')}", transform=ax.transAxes,
+        ha="left", va="top", fontsize=10.5, color=Q_POINT["loss_avg_gain_extreme"])
+
+# =========================
+# 10) labels / layout
+# =========================
+ax.set_xlim(xmin, xmax)
+ax.set_ylim(ymin, ymax)
+
+ax.set_xlabel("ΔPr(HighCC): period B − period A")
+ax.set_ylabel("ΔPr(HighCC) in top 10% VPD tail: period B − period A")
+ax.set_title("Fig. 6 | Diverging city responses under average and extreme atmospheric demand", loc="left", pad=10)
+
+ax.grid(True, alpha=0.18)
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+
+legend_handles = [
+    Line2D([0],[0], marker="o", color="none", markerfacecolor=Q_POINT["gain_both"], markeredgecolor="white",
+           markersize=8, label=Q_LABEL["gain_both"]),
+    Line2D([0],[0], marker="o", color="none", markerfacecolor=Q_POINT["gain_avg_loss_extreme"], markeredgecolor="white",
+           markersize=8, label=Q_LABEL["gain_avg_loss_extreme"]),
+    Line2D([0],[0], marker="o", color="none", markerfacecolor=Q_POINT["loss_both"], markeredgecolor="white",
+           markersize=8, label=Q_LABEL["loss_both"]),
+    Line2D([0],[0], marker="o", color="none", markerfacecolor=Q_POINT["loss_avg_gain_extreme"], markeredgecolor="white",
+           markersize=8, label=Q_LABEL["loss_avg_gain_extreme"]),
+    Line2D([0],[0], color="#C73E3E", lw=1.5, ls="--", label="1:1 reference"),
+]
+
+ax.legend(
+    handles=legend_handles,
+    frameon=False,
+    loc="lower right"
+)
+
+fig.tight_layout()
+
+# =========================
+# 11) save
+# =========================
+fig.savefig(SAVE_PNG, dpi=DPI, bbox_inches="tight", facecolor="white")
+fig.savefig(SAVE_PDF, dpi=600, bbox_inches="tight", facecolor="white")
+fig.savefig(SAVE_SVG, bbox_inches="tight", facecolor="white")
+
+plt.show()
+
+print("Saved:")
+print(SAVE_PNG)
+print(SAVE_PDF)
+print(SAVE_SVG)
